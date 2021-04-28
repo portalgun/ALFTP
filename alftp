@@ -1,0 +1,506 @@
+#!/bin/bash
+#░░░░░░░▀░░█▀█░█░░░█▀▀░▀█▀░█▀█░░▀░░░░░░░
+#░░░░▀░░▀░░█▀█░█░░░█▀▀░░█░░█▀▀░░▀░░▀░░░░
+#░▀░░▀░░▀░░▀░▀░▀▀▀░▀░░░░▀░░▀░░░░▀░░▀░░▀░
+#A super script for mass ftp download via lftp
+#Copyright (C) 2016 David White
+#
+#This program is free software: you can redistribute it and/or modify
+#it under the terms of the GNU General Public License as published by
+#the Free Software Foundation, either version 3 of the License, or
+#(at your option) any later version.
+#
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#GNU General Public License for more details.
+#
+#You should have received a copy of the GNU General Public License
+#along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+########################################################################
+config=~/.config/alftp/alftp.conf
+configsrc=~/.config/alftp/alftp.src.conf
+########################################################################
+
+#TODO
+    #options
+    #Download operations
+    #filesize
+    #   cls -ls
+    #
+    #   sizesh=$(echo "$list" | awk '{print $4}') # 4th columnt = sisze
+    #   sizes=$(echo "$sizes" | numfnt --from=iec-i --padding=7
+    #   available=$(df $local_dl_dir | awk '{print $4}')
+    #   spcrequest=$(echo "$sizes" | paste -sd+ | bc)
+    #
+    #   echo "$list" | awk '{for(i=8;i<=NF;++i)print $i}' # 8th/end column = name
+    #checksum
+    #create config if non-existant
+    #showc showw
+
+########################################################################
+if [[ -z $config ]]; then
+    config=$HOME/.config/alftp/alftp.conf
+fi
+if [[ -z $config ]]; then
+    configsrc=$HOME/.config/afltp/alftp.src.conf
+fi
+if [[ -z $editor ]]; then
+    editor=$EDITOR
+fi
+help="::ALFTP v0.1::
+A super script for mass download via lftp
+Copyright (C) 2016 David White
+
+Config file located at $config
+
+Default action, given required fields:
+\tRead config file and gpg file variables
+\tLock the current session
+\tCheck for previous sessions download and prompt for its check/completion
+\tLogin to server, create a list of contents
+\tOpen default editor. Requires user to uncomment desired files (built with vi/vim usage in mind)
+\tDownload files/directories using lftp
+\tUnlock current session
+
+Usage: alftp [options <value> ...]
+
+Options:
+-h               (help) displays this info\
+--showc          display copyright
+--showw          display warranty
+
+-s  <url>        (server) server name
+-ld <directory>  (local directory) where you are downloading to
+-rd <directory>  (remote directory) where you are downloading from
+-u  <username>   (username) remote server username
+-p  <password>   (password) remote server password
+-P  <port>       (Port) ftp port
+
+-d    (data) checkout data dir instead of complete dir, doesn't delete anything
+-do   (download only) download, but don't remove symlink
+-q    (quiet) don't ask to confirm downloads (use with -a)
+-n    (new) new session only
+-ns   (new save (old)) new session and saves old previous download info for next time
+-o    (old) checks/finishes old download only
+-jl   (just login) login by lftp only
+-rl   (removelist) do not save list file, cannot check previous session in next session
+-rm   (remove) remove files from remote location once download is complete
+-fs   (filesize) print filesizes of marked files and retain list file
+-r    ((supress) record) do not append current download to record of download
+-cl   remove items from list and their symlinks
+-nu   (no unrar) do not extract
+"
+
+copyright="https://www.gnu.org/licenses/gpl-3.0.txt"
+warranty=" This program comes with ABSOLUTELY NO WARRANTY; for details type 'alftp showw'.
+                                                    This is free software, and you are welcome to redistribute it
+                                                    under certain conditions; type 'alftp showc' for details."
+
+config_template="
+
+"
+
+#new_only
+#print_fs
+#rm_remote
+#no_append
+
+################################################################################
+MAIN () {
+    INIT
+    ARGSA "$@" #PRIORITY FLAGS
+    ARGSB "$@" #OTHER FLAGS
+   
+    WELCOME
+    NEW_SESSION
+    COMPLETE
+}
+################################################################################
+INIT () {
+    if [[ ! -f $config ]]; then
+        echo "Config doesn\'t exist."
+        unset flag
+        while true; do
+            if [[ -z $flag ]]; then
+                read -p "Create config at $config? [y/n]: " -n1 opt
+            else
+                read -n1 opt
+            fi
+            case $opt in
+                y|Y)
+                    echo config_template > $config
+                    break
+                    ;;
+                n|N)
+                    break
+            esac
+            flag=1
+        done
+        unset flag
+        echo "Fill in options in config file, then run again."
+        exit 0
+    fi
+    source $config
+    USER=$(whoami)
+}
+
+#flags that ignore others
+ARGSA () {
+    for i in "$@"; do
+        case "$i" in
+            -h|--help|help)
+                printf "$help"
+                exit 0
+                ;;
+            --showc|showc)
+                printf "$copyright"
+                exit 0
+                ;;
+            --showw|showw)
+                printf "$warranty"
+                exit 0
+                ;;
+        esac
+    done
+}
+
+#
+ARGSB () {
+    for i in "$@"; do
+
+        if [ ! -z "$nextParam" ]; then
+            case "$i" in
+                -*)
+                    echo "Missing field for "$lastParam" or incorrect syntax for "$i""
+                    exit 0
+                    ;;
+            esac
+            case "$nextParam" in
+                l)
+                    listfile="$i"
+                    ;;
+                ld)
+                    local_dl_dir="$i"
+                    ;;
+                p)
+                    password="$i"
+                    ;;
+                P)
+                    port="$i"
+                    ;;
+                rd)
+                    remote_dl_dir="$i"
+                    ;;
+                s)
+                    server="$i"
+                    ;;
+                u)
+                    username="$i"
+                    ;;
+                [ia])
+                    lines=$(cat $configsrc | sed -n "/\[$i\]/,/\[\w*\]/p" | sed "/\[\w*\]/d" )
+                    source <(echo "$lines")
+                    destflag=1
+                    sourceflag=1
+            esac
+            nextParam=""
+            lastParam=""
+            continue
+        fi
+
+        case "$i" in
+            -a)
+                all_files=True
+                nextParam="a"
+                ;;
+            -q)
+                quiet=True
+                ;;
+            -u)
+                lastParam="$i"
+                nextParam="u"
+                ;;
+            -p)
+                lastParam="$i"
+                nextParam="p"
+                ;;
+            -P)
+                lastParam="$i"
+                nextParam="P"
+                ;;
+            -s)
+                lastParam="$i"
+                nextParam="s"
+                ;;
+
+            -ld)
+                lastParam="$i"
+                nextParam="ld"
+                sourcelfag=1
+                ;;
+            -rd)
+                lastParam="$i"
+                nextParam="rd"
+                destflag=1
+                ;;
+            -l)
+                lastParam="$i"
+                nextParam="l"
+                ;;
+            -i)
+                ind_files=True
+                nextParam="i"
+                ;;
+            -n)
+                new_only=True
+                ;;
+            -ns)
+                suspend_old=True
+                new_only=True
+                ;;
+            -o)
+                old_only=True
+                ;;
+            -fs)
+                print_fs=True
+                ;;
+            -jl)
+                just_login=True
+                lftp -p $port -u $username,$password $server
+                return 0
+                ;;
+            -rl)
+                rm_list=True
+                ;;
+            -rm)
+                rm_remote=True
+                ;;
+            -r)
+                no_append=True
+                ;;
+            -cl)
+                clean=True
+                ;;
+            -d)
+                data=True
+                ;;
+            -do)
+                norm=True
+                ;;
+            -nu)
+                nounrar=True
+                ;;
+        esac
+    done
+    if [[ -z $destflag ]]; then
+        echo "Please specify desitnation."
+        exit 0
+    fi
+    if [[ -z $sourceflag ]]; then
+        echo "Please specify source."
+        exit 0
+    fi
+    dirname="$remote_dl_dir"
+
+    if [[ -z $complete_dir ]] && [[ ! -z $data_dir ]]; then
+        data=true
+    fi
+    if [[ $data == True ]]; then
+        remote_dl_dir="$data_dir""$remote_dl_dir"
+    else
+        remote_dl_dir="$complete_dir""$remote_dl_dir"
+    fi
+
+    if [[ ! -z $keyfile ]]; then
+          set sftp:connect-program "ssh -a -x -i $keyfile"
+    fi
+}
+############################################################
+
+WELCOME () {
+ON=0
+prevsession=0
+touch $listfile
+if [[ -z $(command -v lftp) ]]; then
+    echo "lftp is not installed."
+    exit 1
+fi
+}
+
+CREATE_LIST () {
+    #DO NOT INDENT CONTENTS
+    oldfile="$listfile"_old
+    listfile2="$listfile"2
+    cp "$listfile" "$oldfile"
+    lftp -p $port -u $username,$password $server << EOF
+cd "$remote_dl_dir"
+cls -1 > "$listfile"
+cd "$data_dir""$dirname"
+cls -1 > "$listfile2"
+quit
+EOF
+}
+
+NEW_SESSION () {
+    if [[ $old_only != True ]] && [[ $just_login != True ]]; then
+
+        CREATE_LIST
+        if [[ $all_files == True ]]; then
+            if [[ $quiet != True ]]; then
+                $editor $listfile
+            fi
+        elif [[ $ind_files == True ]]; then
+            sed -i 's/^\([^#]\)/#\1/g' $listfile
+            $editor $listfile
+        fi
+
+        TYPE
+        if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]]; then
+            DOWNLD
+            while read -r line; do
+                if [[ -z $line ]]; then
+                    continue
+                fi
+                chmod 644 "$line"
+            done <<< "$LINESF"
+            while read -r line; do
+                if [[ -z $line ]]; then
+                    continue
+                fi
+                if [[ -z $nounrar ]]; then
+                    UNRAR_FUN "$line"
+                fi
+                find -path "$line" -type d -exec chmod -R 755 {} \;
+                find -path "$line" -type f -exec chmod 644  {} \;
+            done <<< "$LINESF"
+        fi
+    fi
+}
+
+#DETERMINE IF COMMNET, FILE, DIRECTORY
+TYPE () {
+        LIST=$(cat "$listfile" | grep -v -e "^#" | grep -v -e "^$" | sed 's|@$||')
+        LIST2=$(cat "$listfile2")
+
+        while read -r line; do
+            if [[ -z $line ]]; then
+                continue
+            fi
+            lined=$(echo "$LIST2" | grep -F "$line" | grep -e "\\/$" | sed 's|/$||' | sed 's|\s$|&SsS|') # last portion, handle trailing whitespace
+            linef=$(echo "$LIST2" | grep -F "$line" | grep -v -e "\\/$" | grep -v -e "^$" | sed 's|\s$|&SsS|')
+
+            if [[ ! -z $lined ]] && [[ -z $LINESD ]]; then
+                LINESD="$lined"
+            elif [[ ! -z $lined ]]; then
+                LINESD=$(echo -e "$LINESD\n$lined" )
+            fi
+
+            if [[ ! -z $linef ]] && [[ -z $LINESF ]]; then
+                LINESF="$linef"
+            elif [[ ! -z $linef ]]; then
+                LINESF=$(echo -e "$LINESF\n$linef")
+            fi
+        done <<< "$LIST"
+        rm "$listfile2"
+}
+
+#INITIATE SESSION AND DOWNLOAD
+DOWNLD () {
+#DO NOT INDENT CONTENTS
+lftp -p $port -u $username,$password $server << EOF
+cd "$remote_dl_dir"
+set ftp:ssl-allow no
+set mirror:use-pget-n 5
+set mirror:dereference yes
+set xfer:clobber yes
+$(DLDR)
+$(DLFL)
+EOF
+}
+
+#DOWNLOAD DIRECTORIES
+DLDR () {
+    while read -r line; do
+        #line=$(echo "$line" | sed 's|SsS$| |') # handle trailing whitespace and brackets
+        line=$(echo "$line" | sed 's|SsS$| |' | sed 's/\[/"\["/g') # handle trailing whitespace and brackets
+        if [[ -z $line ]]; then
+            continue
+        fi
+        if [[ $clean == True ]]; then
+            echo "rm -f \""$line"\"; !echo REMOVED: ""$line"""
+        elif [[ $norm == True ]]; then
+            echo "mirror -c -P5 --log=/home/$USER/tmp/log/synctorrents.log \""$line"\" "$local_dl_dir"/\""$line"\"; !echo COMPLETE: \""$line"\""
+        else
+            echo "mirror -c -P5 --log=/home/$USER/tmp/log/synctorrents.log \""$line"\" "$local_dl_dir"/\""$line"\" && rm -f \""$line"\""
+            echo "echo "COMPLETE: \""$line"\"""
+        fi
+    done <<< "$LINESD"
+}
+
+#DOWNLOAD FILES
+DLFL () {
+    #"
+    while read -r line; do
+        #line=$(echo "$line" | sed 's|SsS$| |') # handle trailing whitespace
+        line=$(echo "$line" | sed 's|SsS$| |' | sed 's/\[/"\["/g') # handle trailing whitespace and brackets
+        if [[ -z $line ]]; then
+            continue
+        fi
+        if [[ $clean == True ]]; then
+            echo "rm -f \""$line"\"; !echo REMOVED: \""$line"\""
+        elif [[ $norm == True ]]; then
+            echo "pget -n 5 \""$line"\" -o "$local_dl_dir"/\""$line"\"; !echo COMPLETE: \""$line"\""
+        else
+            echo "pget -n 5 \""$line"\" -o "$local_dl_dir"/\""$line"\" && rm -f \"""$line""\""
+            echo "echo "COMPLETE: \""$line"\"""
+        fi
+    done <<< "$LINESF"
+}
+
+COMPLETE () {
+    rm -f /tmp/synctorrent.lock
+    trap - SIGINT SIGTERM
+    if [[ $rm_list == True ]]; then
+        rm -f "$list_file"
+    fi
+    if [[ $suspend_old == True ]]; then
+        mv "$oldfile" "$listfile"
+    fi
+}
+
+
+function chkrmd () {
+    if [[ -d $1 ]]; then
+        rm -rf "$1/"
+    fi
+}
+
+function chkrmf () {
+    if [[ -e $1 ]] && [[ ! -z $(ls $1) ]]; then
+        rm "$1"
+    fi
+}
+
+UNRAR_FUN () {
+    pdir="$1"
+    ext='*.rar'
+    cdir=$(find "$pdir" -name "$ext" | xargs -I{} dirname {} | uniq | sort)
+    if [[ -z $cdir ]]; then
+        return 0
+    fi
+    while read -r line; do
+        cd "$line" && \
+        unrar e -n -r -or "$line" && sleep 1 && \
+        find "$line" -type f \( -regex ".*.rar$" -o -regex '.*.r[0-9]+$' \) -exec rm {} +
+        find "$line" -type f \( -name "*.sfv" -o -name "*.nfo" \) -exec rm {} +
+        find "$line" -type d -iname "sample" -exec rm -rf {} +
+        find "$line" -type d -iname "screens" -exec rm -rf {} +
+        find "$line" -type d -empty -delete
+
+    done <<< "$cdir"
+}
+
+############################################################
+MAIN "$@"

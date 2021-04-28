@@ -1,0 +1,20 @@
+# Current configuration options:
+# These all have a flag equivalent as well. See help pages
+#    complete_dir   - remote base directory that contains symlinks to data in 'data_dir' that is ready to download
+#    data_dir       - actual location of files that are being download (rather than symlinks
+#    remote_dl_dir  - directory to look in for files
+#    local_dl_dir   - directory to download to
+#    editor         - the editor you prefer to use
+#    listfile       - where to download list of available files to
+#    record         - list of everything that has been successfully downloaded
+#    errors         - where to log errors
+#    verify         - where to store xfer verify logs to verify data once downloaded
+#    server         - ssh server name
+#    username       - ssh username
+#    port           - ssh port
+#    password       - ssh password
+#    autoUncompress - (True|[unset]) automatically decompress files recursively. Currently only rar supported.
+#    norm           - (True|[unset]) do not remove symlinks when completed
+#    rm_remote      - (True|[unset]) remove files, not just symlinks, once completed
+#    rm_list        - (True|[unset]) remove list file once download is complete
+#    no_append      - (True|[unset]) do not append downloaded files to record
