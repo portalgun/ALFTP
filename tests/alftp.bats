@@ -69,6 +69,46 @@ stage() {
     [ "$output" = "from_profile 11" ]
 }
 
+@test "dl_dir_<profile> overrides the general dl_dir for that profile only" {
+    run stage 'local_dl_dir=/dl/@profile/new; local_dl_dir_TV=/mnt/media/TV
+               ARGSB -a TV; echo "$local_dl_dir"'
+    [ "$output" = "/mnt/media/TV" ]
+
+    run stage 'local_dl_dir=/dl/@profile/new; local_dl_dir_TV=/mnt/media/TV
+               ARGSB -a docs; echo "$local_dl_dir"'
+    [ "$output" = "/dl/docs/new" ]
+}
+
+@test "a per-profile dl_dir may itself use @profile" {
+    run stage 'local_dl_dir=/dl/@profile; local_dl_dir_TV=/mnt/@profile/hd
+               ARGSB -i TV; echo "$local_dl_dir"'
+    [ "$output" = "/mnt/TV/hd" ]
+}
+
+@test "remote_dl_dir_<profile> beats falling back to the profile name" {
+    run stage 'remote_dl_dir_TV=/srv/tv; ARGSB -a TV; echo "$remote_dl_dir"'
+    [ "$output" = "/srv/tv" ]
+}
+
+@test "a profile name that is not an identifier maps to the sanitised key" {
+    run stage 'local_dl_dir=/dl/@profile; local_dl_dir_tv_shows=/mnt/tv-shows
+               ARGSB -a tv-shows; echo "$local_dl_dir"'
+    [ "$output" = "/mnt/tv-shows" ]
+}
+
+@test "-ld still overrides a per-profile dl_dir" {
+    run stage 'local_dl_dir_TV=/mnt/media/TV; ARGSB -a TV
+               ARGSC -a TV -ld /cli; echo "$local_dl_dir"'
+    [ "$output" = "/cli" ]
+}
+
+@test "eval_local_config renames dl_dir_<profile> to local_dl_dir_<profile>" {
+    run stage 'hostname() { echo testhost; }; configsrc="$fixture"
+               eval_local_config
+               echo "[$local_dl_dir] [${local_dl_dir_TV:-}]"'
+    [ "$output" = "[/tmp/alftp-test/important] [/tmp/alftp-test/tv]" ]
+}
+
 @test "eval_local_config keeps local keys whose values contain a remote key name" {
     run stage 'hostname() { echo testhost; }; configsrc="$fixture"
                eval_local_config

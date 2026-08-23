@@ -60,6 +60,34 @@ $ alftp -a docs
 
 The configuration under '''[data]''' does not contain all variables listed in '''[docs]'''. Anything not listed will inherit defaults form 'alftp.conf'
 
+### Per-profile download directories
+`dl_dir` sets the download directory for every profile in the block, and `@profile` in it is
+replaced with the profile you asked for:
+
+``` bash
+dl_dir='~/Downloads/@profile'      # alftp -a docs  ->  ~/Downloads/docs
+```
+
+To send one profile somewhere else, add `dl_dir_<profile>`. It wins over the general `dl_dir` for
+that profile only, and everything else keeps using `dl_dir`:
+
+``` bash
+dl_dir='~/Downloads/@profile'      # alftp -a docs  ->  ~/Downloads/docs
+dl_dir_TV='/mnt/media/TV'          # alftp -a TV    ->  /mnt/media/TV
+dl_dir_films='/mnt/media/@profile' # alftp -a films ->  /mnt/media/films
+```
+
+As the last line shows, an override can use `@profile` itself. `-ld` on the command line still beats
+both.
+
+The suffix is part of a shell variable name, so a profile whose name is not a valid identifier maps
+to one that is — every character outside `A-Za-z0-9_` becomes `_`. Profile `tv-shows` is configured
+as `dl_dir_tv_shows`.
+
+`dl_dir_<profile>` sets the *local* directory, the same side `@profile` applies to. If you want to
+override where a profile is fetched *from*, use `remote_dl_dir_<profile>`, which takes precedence
+over the usual fallback of using the profile name as the remote directory.
+
 When using the -i flag, a list of available files to download will be displayed as commented lines.
 ``` 
 #file1

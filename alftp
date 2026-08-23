@@ -140,6 +140,7 @@ new_only=""; old_only=""; suspend_old=""; just_login=""
 clean=""; data=""; norm=""; nounrar=""; dry_run=""
 print_fs=""; rm_list=""; rm_remote=""; no_append=""
 sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
+profilevar=""; override=""
 LINESD=""; LINESF=""; oldfile=""; listfile2=""; dirname=""
 
 server=""; username=""; password=""; port=""; keyfile=""
@@ -221,11 +222,18 @@ ere_escape () {
     printf '%s' "$1" | sed 's/[][\.^$*+?(){}|]/\\\\&/g'
 }
 
+# A profile name becomes part of a variable name (dl_dir_<profile>), so map
+# anything that is not valid in an identifier to '_': profile "tv-shows" is
+# configured as dl_dir_tv_shows.
+profile_var_name () {
+    printf '%s' "${1//[^A-Za-z0-9_]/_}"
+}
+
 eval_local_config () {
     I=$(ere_escape "$(hostname)")'\\|*[A-Za-z0-9._]*\\]'
     local_config=$(awk -v awkvar="$I" 'BEGIN { RS="\n\n\\[" ; FS="\n"; OFS="\n"} $1 ~ awkvar {$1=""; print $0}' "$configsrc" | \
 	grep -vE "^(port|user|dataDir|watchDir|completeDir|pass|srcs)" | \
-	sed 's/^dl_dir=/local_dl_dir=/' \
+	sed -e 's/^dl_dir=/local_dl_dir=/' -e 's/^dl_dir_/local_dl_dir_/' \
     )
     eval "$local_config"
 }
@@ -263,12 +271,26 @@ ARGSB () {
             esac
             case "$nextParam" in
                 [ia])
+		    profilevar=$(profile_var_name "$i")
 
+		    # dl_dir_<profile> (renamed to local_dl_dir_<profile> when the
+		    # config is eval'd) beats the general dl_dir for this profile.
+		    # @profile is still substituted afterwards, so the override may
+		    # use it too.
+		    override="local_dl_dir_$profilevar"
+		    if [[ -n ${!override:-} ]]; then
+			local_dl_dir="${!override}"
+		    fi
 		    local_dl_dir=$(echo "$local_dl_dir" | sed "s/@profile/$i/g")
                     destflag=1
 
-		    # Picking a profile settles both ends: the profile's own
-		    # remote_dl_dir, or the profile name if it has none.
+		    # Picking a profile settles both ends: an explicit
+		    # remote_dl_dir_<profile>, the profile's own remote_dl_dir, or
+		    # the profile name if it has neither.
+		    override="remote_dl_dir_$profilevar"
+		    if [[ -n ${!override:-} ]]; then
+			remote_dl_dir="${!override}"
+		    fi
 		    if [[ -z $remote_dl_dir ]]; then
 			remote_dl_dir="$i"
 		    fi

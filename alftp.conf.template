@@ -18,4 +18,10 @@
 #    norm           - (True|[unset]) do not remove symlinks when completed
 #    rm_remote      - (True|[unset]) remove files, not just symlinks, once completed
 #    rm_list        - (True|[unset]) remove list file once download is complete
-#    no_append      - (True|[unset]) do not append downloaded files to record
+#    no_append      - (True|[unset]) do not append downloaded files to record#
+# In alftp.src.conf, a profile block may also set per-profile download
+# directories, which override the general dl_dir/local_dl_dir for one profile:
+#    dl_dir_<profile>        - local directory for that profile only
+#    remote_dl_dir_<profile> - remote directory for that profile only
+# The <profile> suffix is part of a variable name, so characters outside
+# A-Za-z0-9_ become '_' (profile "tv-shows" -> dl_dir_tv_shows). See README.md.
