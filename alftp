@@ -94,6 +94,8 @@ Options:
 -cl   remove items from list and their symlinks
 -nu   (no unrar) do not extract
 --dry-run (-dr) print what would be transferred without downloading anything
+--two-session   use one lftp login for the listing and a second for the
+                download, instead of doing both in a single session
 "
 
 copyright="https://www.gnu.org/licenses/gpl-3.0.txt"
@@ -141,6 +143,7 @@ clean=""; data=""; norm=""; nounrar=""; dry_run=""
 print_fs=""; rm_list=""; rm_remote=""; no_append=""
 sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
 LINESD=""; LINESF=""; oldfile=""; listfile2=""; dirname=""
+two_session=""; self=""; ARGV=()
 
 server=""; username=""; password=""; port=""; keyfile=""
 default_server=""; complete_dir=""; data_dir=""
@@ -150,6 +153,17 @@ record=""; errors=""; verify=""; autoUncompress=""
 
 ################################################################################
 MAIN () {
+    ARGV=("$@")
+    # Re-entry from the in-session helper (see SINGLE_SESSION): argv arrives in
+    # a NUL-delimited file so that nothing has to survive a round trip through
+    # the user's $SHELL, and re-parsing it reproduces this session's globals
+    # exactly -- they are all derived from the config plus argv.
+    if [[ -n ${ALFTP_ARGV:-} ]]; then
+        load_argv "$ALFTP_ARGV"
+        set -- "${ARGV[@]}"
+    fi
+    resolve_self
+
     INIT
     ARGSA "$@" #PRIORITY FLAGS
     eval_local_config
@@ -158,8 +172,26 @@ MAIN () {
     ARGSC "$@" #OTHER FLAGS
 
     WELCOME
+    if [[ -n ${ALFTP_EMIT_DL:-} ]]; then
+        EMIT_DL
+        return 0
+    fi
     NEW_SESSION
     COMPLETE
+}
+
+load_argv () {
+    ARGV=()
+    mapfile -t -d '' ARGV < "$1"
+}
+
+# The "!" helper line has to name this script by an absolute path: lftp runs it
+# through $SHELL from an unknown working directory.
+resolve_self () {
+    self=$(command -v -- "$0" 2>/dev/null) || self="$0"
+    if [[ $self != /* ]]; then
+        self="$PWD/${self#./}"
+    fi
 }
 ################################################################################
 INIT () {
@@ -404,6 +436,9 @@ ARGSC () {
             -dr|--dry-run)
                 dry_run=True
                 ;;
+            --two-session)
+                two_session=True
+                ;;
         esac
     done
     if [[ -z $destflag ]]; then
@@ -464,12 +499,43 @@ if ! touch "$listfile"; then
     echo "alftp: cannot write listfile \"$listfile\"." >&2
     exit 1
 fi
+# Derived here so the parent and the in-session helper agree on it.
+listfile2="$listfile"2
+}
+
+# Quote a value for lftp's own (shell-like) command parser.
+lftp_quote () {
+    quoted=$1
+    quoted=${quoted//\\/\\\\}
+    quoted=${quoted//\"/\\\"}
+    printf '"%s"' "$quoted"
+}
+
+# Quote a value for the $SHELL that lftp's "!" command hands the line to.
+sh_quote () {
+    printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
+# The credentials live in the (0600, mktemp'd) script rather than on lftp's
+# command line, so they no longer show up in ps output.
+open_cmd () {
+    printf 'open'
+    if [[ -n $username ]]; then
+        printf ' --user %s --password %s' \
+            "$(lftp_quote "$username")" "$(lftp_quote "$password")"
+    fi
+    if [[ -n $port ]]; then
+        printf ' -p %s' "$(lftp_quote "$port")"
+    fi
+    printf ' %s\n' "$(lftp_quote "$server")"
 }
 
 # Every lftp session is generated into a temp script first, so that what was
 # actually sent to lftp can be inspected when something goes wrong (the file is
 # kept on failure, or whenever ALFTP_DEBUG is set) instead of only existing
-# inside a here-doc.
+# inside a here-doc. -f (rather than stdin) is what lets the session shell out
+# to an interactive editor: the helper it spawns inherits lftp's stdin, which
+# is still the terminal.
 run_lftp_script () {
     scriptfile="$1"
     rc=0
@@ -477,7 +543,7 @@ run_lftp_script () {
         echo "alftp: lftp commands in $scriptfile" >&2
     fi
     export LC_ALL=C.UTF-8
-    lftp -p "$port" -u "$username,$password" "$server" < "$scriptfile" || rc=$?
+    lftp -f "$scriptfile" || rc=$?
     if [[ $rc -ne 0 ]]; then
         echo "alftp: lftp exited $rc; the commands sent are in $scriptfile" >&2
     elif [[ -z ${ALFTP_DEBUG:-} ]]; then
@@ -488,12 +554,12 @@ run_lftp_script () {
 
 CREATE_LIST () {
     oldfile="$listfile"_old
-    listfile2="$listfile"2
     cp "$listfile" "$oldfile"
 
     scriptfile=$(mktemp "${TMPDIR:-/tmp}/alftp.list.XXXXXX")
     #DO NOT INDENT CONTENTS
     cat > "$scriptfile" << EOF
+$(open_cmd)
 $(set_opts)
 cd "$remote_dl_dir"
 cls -1 > "$listfile"
@@ -504,53 +570,129 @@ EOF
     run_lftp_script "$scriptfile"
 }
 
+# Listing, file selection and download in one login. lftp lists into
+# $listfile, shells out to this same script (which runs the editor and turns
+# the selection into mirror/pget commands), then sources what it wrote -- so
+# the connection opened for the listing is the one that does the transfer.
+SINGLE_SESSION () {
+    oldfile="$listfile"_old
+    cp "$listfile" "$oldfile"
+
+    emitfile=$(mktemp "${TMPDIR:-/tmp}/alftp.emit.XXXXXX")
+    argvfile=$(mktemp "${TMPDIR:-/tmp}/alftp.argv.XXXXXX")
+    if [[ ${#ARGV[@]} -gt 0 ]]; then
+        printf '%s\0' "${ARGV[@]}" > "$argvfile"
+    else
+        : > "$argvfile"
+    fi
+
+    scriptfile=$(mktemp "${TMPDIR:-/tmp}/alftp.session.XXXXXX")
+    #DO NOT INDENT CONTENTS
+    cat > "$scriptfile" << EOF
+$(open_cmd)
+set net:idle never
+$(set_opts)
+cd "$remote_dl_dir"
+cls -1 > "$listfile"
+cd "$data_dir""$dirname"
+cls -1 > "$listfile2"
+cd "$remote_dl_dir"
+!env ALFTP_EMIT_DL=$(sh_quote "$emitfile") ALFTP_ARGV=$(sh_quote "$argvfile") bash $(sh_quote "$self")
+source "$emitfile"
+quit
+EOF
+    run_lftp_script "$scriptfile"
+    rc=$?
+    if [[ -n ${ALFTP_DEBUG:-} ]]; then
+        echo "alftp: download commands in $emitfile, argv in $argvfile" >&2
+    else
+        rm -f "$emitfile" "$argvfile"
+    fi
+    return $rc
+}
+
+# Runs inside the lftp session, spawned by the "!" line above.
+EMIT_DL () {
+    EDIT_LIST
+    TYPE
+    { DLDR; DLFL; } > "$ALFTP_EMIT_DL"
+}
+
 NEW_SESSION () {
     if [[ $just_login == True ]]; then
-	lftp -p $port -u $username,$password $server
+	# Interactive session, so the open command (and with it the credentials)
+	# comes from a temp rc file instead of the command line, keeping the
+	# password out of ps output like the generated sessions do.
+	openrc=$(mktemp "${TMPDIR:-/tmp}/alftp.open.XXXXXX")
+	open_cmd > "$openrc"
+	lftp --rcfile "$openrc"
+	rm -f "$openrc"
 	exitflag=True
     elif [[ $old_only != True ]] && [[ $just_login != True ]]; then
 
-        CREATE_LIST
-        if [[ $all_files == True ]]; then
-            if [[ $quiet != True ]]; then
-                $editor $listfile
+        if [[ $two_session == True ]]; then
+            CREATE_LIST
+            EDIT_LIST
+            TYPE
+            if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]]; then
+                DOWNLD
+                POST_PROCESS
             fi
-        elif [[ $ind_files == True ]]; then
-            sed -i 's/^\([^#]\)/#\1/g' $listfile
-            $editor $listfile
+        else
+            SINGLE_SESSION
+            # The selection was made by the helper inside the session; re-run
+            # TYPE here against the same (edited) list to recover what was
+            # downloaded, so post-processing knows what to work on.
+            TYPE
+            POST_PROCESS
         fi
-
-        TYPE
-        if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]]; then
-            DOWNLD
-            if [[ $dry_run != True ]]; then
-                # Downloaded content lands under $local_dl_dir, and the SsS
-                # sentinel stands in for a trailing space in the name.
-                while read -r line; do
-                    if [[ -z $line ]]; then
-                        continue
-                    fi
-                    line=$(echo "$line" | sed 's|SsS$| |')
-                    chmod 644 "$local_dl_dir/$line"
-                done <<< "$LINESF"
-                while read -r line; do
-                    if [[ -z $line ]]; then
-                        continue
-                    fi
-                    line=$(echo "$line" | sed 's|SsS$| |')
-                    target="$local_dl_dir/$line"
-                    if [[ ! -e $target ]]; then
-                        continue
-                    fi
-                    if [[ -z $nounrar ]]; then
-                        UNRAR_FUN "$target"
-                    fi
-                    find "$target" -type d -exec chmod 777 {} \;
-                    find "$target" -type f -exec chmod 644  {} \;
-                done <<< "$LINESD"
-            fi
-        fi
+        rm -f "$listfile2"
     fi
+}
+
+# Let the user pick entries out of the listing. Shared by both paths: in the
+# single-session path this runs inside the lftp session, via EMIT_DL.
+EDIT_LIST () {
+    if [[ $all_files == True ]]; then
+        if [[ $quiet != True ]]; then
+            $editor "$listfile"
+        fi
+    elif [[ $ind_files == True ]]; then
+        sed -i 's/^\([^#]\)/#\1/g' "$listfile"
+        $editor "$listfile"
+    fi
+}
+
+POST_PROCESS () {
+    if [[ $dry_run == True ]]; then
+        return 0
+    fi
+    # Downloaded content lands under $local_dl_dir, and the SsS sentinel
+    # stands in for a trailing space in the name.
+    while read -r line; do
+        if [[ -z $line ]]; then
+            continue
+        fi
+        line=$(echo "$line" | sed 's|SsS$| |')
+        if [[ -e "$local_dl_dir/$line" ]]; then
+            chmod 644 "$local_dl_dir/$line"
+        fi
+    done <<< "$LINESF"
+    while read -r line; do
+        if [[ -z $line ]]; then
+            continue
+        fi
+        line=$(echo "$line" | sed 's|SsS$| |')
+        target="$local_dl_dir/$line"
+        if [[ ! -e $target ]]; then
+            continue
+        fi
+        if [[ -z $nounrar ]]; then
+            UNRAR_FUN "$target"
+        fi
+        find "$target" -type d -exec chmod 777 {} \;
+        find "$target" -type f -exec chmod 644  {} \;
+    done <<< "$LINESD"
 }
 
 #DETERMINE IF COMMNET, FILE, DIRECTORY
@@ -578,7 +720,6 @@ TYPE () {
                 LINESF=$(echo -e "$LINESF\n$linef")
             fi
         done <<< "$LIST"
-        rm "$listfile2"
 }
 
 #INITIATE SESSION AND DOWNLOAD
@@ -586,6 +727,7 @@ DOWNLD () {
 scriptfile=$(mktemp "${TMPDIR:-/tmp}/alftp.dl.XXXXXX")
 #DO NOT INDENT CONTENTS
 cat > "$scriptfile" << EOF
+$(open_cmd)
 cd "$remote_dl_dir"
 $(set_opts)
 $(DLDR)
