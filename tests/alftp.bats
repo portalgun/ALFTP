@@ -109,6 +109,49 @@ stage() {
     [ "$output" = "[/tmp/alftp-test/important] [/tmp/alftp-test/tv]" ]
 }
 
+@test "--two-session selects the two-login path" {
+    run stage 'ARGSC -ld /l -rd d --two-session; echo "two=$two_session"'
+    [ "$output" = "two=True" ]
+}
+
+@test "open_cmd quotes credentials for lftp and omits them when there is no user" {
+    run stage 'username="us\"er"; password="pa,ss:word"; port=2121
+               server=example.com; open_cmd
+               username=""; open_cmd'
+    [ "${lines[0]}" = 'open --user "us\"er" --password "pa,ss:word" -p "2121" "example.com"' ]
+    [ "${lines[1]}" = 'open -p "2121" "example.com"' ]
+}
+
+@test "sh_quote survives a single quote" {
+    run stage 'sh_quote "it'"'"'s here"'
+    [ "$output" = "'it'\\''s here'" ]
+}
+
+@test "the single-session script lists, shells out and sources what the helper wrote" {
+    run stage 'run_lftp_script() { cat "$1"; }   # capture instead of running lftp
+               server=example.com; username=u; password=p; port=21
+               remote_dl_dir=/complete/docs; data_dir=/data/; dirname=docs
+               listfile=/tmp/alftp-test-list; listfile2=/tmp/alftp-test-list2
+               self=/usr/local/bin/alftp; ARGV=(-i docs)
+               SINGLE_SESSION'
+    [ "$status" -eq 0 ]
+    # one login for the whole run: a single open, then listing, helper, download
+    [ "$(grep -c "^open " <<< "$output")" -eq 1 ]
+    [[ "$output" == *"set net:idle never"* ]]          # survive the editor pause
+    [[ "$output" == *'cls -1 > "/tmp/alftp-test-list"'* ]]
+    [[ "$output" == *"!env ALFTP_EMIT_DL="*"ALFTP_ARGV="*"bash '/usr/local/bin/alftp'"* ]]
+    [[ "$output" == *'source "'* ]]
+}
+
+@test "the helper stage re-parses argv from a file and reproduces the globals" {
+    argvfile=$(mktemp)
+    printf '%s\0' -ld /l -rd docs --dry-run > "$argvfile"
+    run bash -c 'ALFTP_LIB=1 source "$1"; load_argv "$2"; ARGSC "${ARGV[@]}"
+                 echo "$local_dl_dir $remote_dl_dir $dry_run"' _ "$ALFTP" "$argvfile"
+    rm -f "$argvfile"
+    [ "$output" = "/l docs True" ]
+}
+
 @test "eval_local_config keeps local keys whose values contain a remote key name" {
     run stage 'hostname() { echo testhost; }; configsrc="$fixture"
                eval_local_config

@@ -109,6 +109,23 @@ $ alftp -a docs --dry-run
 Directories are listed via `lftp mirror --dry-run`, files are printed rather than fetched, nothing
 is removed from the remote, and no post-processing (unrar, permissions) runs.
 
+## HOW A RUN CONNECTS
+By default a run is a single lftp login. The one session lists the remote directory, shells out to
+`$EDITOR` so you can pick what you want (lftp's `!` hands the editor the terminal), and then sources
+the mirror/pget commands that selection produced — all without dropping the connection. `net:idle`
+is set to `never` so the link survives however long you spend in the editor.
+
+If that misbehaves against your server, `--two-session` restores the previous behaviour: one login
+to build the list, a second to download.
+
+Note that "one login" is not "one TCP connection" — FTP opens a separate data connection per
+transfer, and `mirror -P5` / `pget -n 5` deliberately open several. Servers also enforce their own
+idle timeout (proftpd's `TimeoutIdle` defaults to 10 minutes), and lftp will quietly reconnect if
+yours fires while the editor is open.
+
+Credentials are written into the generated session script (created by `mktemp`, mode 0600) instead
+of being passed as `lftp -u user,pass`, so they no longer appear in `ps` output.
+
 ## DEVELOPMENT
 There is no build step. Before committing:
 ``` bash

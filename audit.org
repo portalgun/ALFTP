@@ -81,10 +81,14 @@ working-tree version of =alftp=.
 * Security Concerns
 
   - *Password exposure via process list*: ~lftp -p $port -u
-    $username,$password $server~ (alftp:391, 472) puts the plaintext password
-    on the command line, visible to any local user via ~ps~/~/proc~. Combined
-    with the config file storing ~password=~ in plaintext
-    (alftp.conf.template), there's no path to a non-plaintext credential today
+    $username,$password $server~ put the plaintext password on the command
+    line, visible to any local user via ~ps~/~/proc~. *Fixed*: every session
+    now starts with an ~open --user ... --password ...~ line inside the
+    generated script, and ~-jl~ passes the same line via ~lftp --rcfile~, so
+    nothing lands in ~ps~. The password does briefly exist in a ~mktemp~ file
+    (mode 0600) instead.
+    Still open: the config file stores ~password=~ in plaintext
+    (alftp.conf.template), so there's no path to a non-plaintext credential
     despite the help text implying gpg-backed secrets were intended.
     Consider: lftp's ~.netrc~ support, prompting interactively when password
     is unset, or actually implementing the gpg-file idea from the help text.
