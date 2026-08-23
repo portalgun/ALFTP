@@ -19,10 +19,11 @@
 #along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 ########################################################################
-config=~/.config/alftp/alftp.conf
-configsrc=~/.config/alftp/alftp.src.conf
-########################################################################
 
+#new_only
+#print_fs
+#rm_remote
+#no_append
 #TODO
     #options
     #Download operations
@@ -40,29 +41,26 @@ configsrc=~/.config/alftp/alftp.src.conf
     #showc showw
 
 ########################################################################
-if [[ -z $config ]]; then
-    config=$HOME/.config/alftp/alftp.conf
-fi
-if [[ -z $config ]]; then
-    configsrc=$HOME/.config/afltp/alftp.src.conf
-fi
-if [[ -z $editor ]]; then
-    editor=$EDITOR
-fi
+
+# Unset variables are always a bug in this script (every optional flag/config
+# key is given an explicit default below), so fail loudly on them.
+set -u
+
+## VARIABLES
 help="::ALFTP v0.1::
 A super script for mass download via lftp
 Copyright (C) 2016 David White
 
-Config file located at $config
+Config file located at ~/.config/alftp.conf
 
 Default action, given required fields:
-\tRead config file and gpg file variables
-\tLock the current session
-\tCheck for previous sessions download and prompt for its check/completion
-\tLogin to server, create a list of contents
-\tOpen default editor. Requires user to uncomment desired files (built with vi/vim usage in mind)
-\tDownload files/directories using lftp
-\tUnlock current session
+    Read config file and gpg file variables
+    Lock the current session
+    Check for previous sessions download and prompt for its check/completion
+    Login to server, create a list of contents
+    Open default editor. Requires user to uncomment desired files (built with vi/vim usage in mind)
+    Download files/directories using lftp
+    Unlock current session
 
 Usage: alftp [options <value> ...]
 
@@ -77,6 +75,10 @@ Options:
 -u  <username>   (username) remote server username
 -p  <password>   (password) remote server password
 -P  <port>       (Port) ftp port
+-l  <file>       (list) file to write/read the remote listing to
+
+-i
+-a
 
 -d    (data) checkout data dir instead of complete dir, doesn't delete anything
 -do   (download only) download, but don't remove symlink
@@ -91,6 +93,7 @@ Options:
 -r    ((supress) record) do not append current download to record of download
 -cl   remove items from list and their symlinks
 -nu   (no unrar) do not extract
+--dry-run (-dr) print what would be transferred without downloading anything
 "
 
 copyright="https://www.gnu.org/licenses/gpl-3.0.txt"
@@ -98,21 +101,62 @@ warranty=" This program comes with ABSOLUTELY NO WARRANTY; for details type 'alf
                                                     This is free software, and you are welcome to redistribute it
                                                     under certain conditions; type 'alftp showc' for details."
 
-config_template="
+config_template='# alftp configuration
+# Every key below has a command line flag equivalent; see `alftp -h`.
+# Per-profile overrides live in ~/.config/alftp/alftp.src.conf.
 
-"
+# Where to download to
+local_dl_dir="$HOME/Downloads"
 
-#new_only
-#print_fs
-#rm_remote
-#no_append
+# Where the listing of available files is written
+listfile="$HOME/.cache/alftp/alftp.list"
+
+# Where lftp mirror writes its transfer log
+logfile="$HOME/.cache/alftp/alftp.log"
+
+# Editor used to pick files out of the listing (defaults to $EDITOR, then vi)
+#editor=vim
+
+# Remote defaults. Usually set per profile in alftp.src.conf instead.
+#server=example.com
+#username=user
+#password=secret
+#port=21
+#complete_dir=
+#data_dir=
+#remote_dl_dir=
+'
+
+config=$HOME/.config/alftp/alftp.conf
+configsrc=$HOME/.config/alftp/alftp.src.conf
+editor=${EDITOR:-vi}
+
+## DEFAULTS
+# Every optional flag and config key is initialised here, before the config
+# file is sourced (so the config still wins), so that `set -u` above flags
+# genuine typos instead of tripping over options that simply weren't given.
+all_files=""; ind_files=""; quiet=""
+new_only=""; old_only=""; suspend_old=""; just_login=""
+clean=""; data=""; norm=""; nounrar=""; dry_run=""
+print_fs=""; rm_list=""; rm_remote=""; no_append=""
+sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
+LINESD=""; LINESF=""; oldfile=""; listfile2=""; dirname=""
+
+server=""; username=""; password=""; port=""; keyfile=""
+default_server=""; complete_dir=""; data_dir=""
+remote_dl_dir=""; local_dl_dir=""; listfile=""; logfile=""
+record=""; errors=""; verify=""; autoUncompress=""
+
 
 ################################################################################
 MAIN () {
     INIT
     ARGSA "$@" #PRIORITY FLAGS
-    ARGSB "$@" #OTHER FLAGS
-   
+    eval_local_config
+    eval_remote_config
+    ARGSB "$@" #CONFIG FLAGS
+    ARGSC "$@" #OTHER FLAGS
+
     WELCOME
     NEW_SESSION
     COMPLETE
@@ -120,8 +164,8 @@ MAIN () {
 ################################################################################
 INIT () {
     if [[ ! -f $config ]]; then
-        echo "Config doesn\'t exist."
-        unset flag
+        echo "Config doesn't exist."
+        flag=""
         while true; do
             if [[ -z $flag ]]; then
                 read -p "Create config at $config? [y/n]: " -n1 opt
@@ -130,7 +174,11 @@ INIT () {
             fi
             case $opt in
                 y|Y)
-                    echo config_template > $config
+                    if ! mkdir -p "$(dirname "$config")"; then
+                        echo "Could not create $(dirname "$config")." >&2
+                        exit 1
+                    fi
+                    printf '%s' "$config_template" > "$config"
                     break
                     ;;
                 n|N)
@@ -138,11 +186,11 @@ INIT () {
             esac
             flag=1
         done
-        unset flag
+        flag=""
         echo "Fill in options in config file, then run again."
         exit 0
     fi
-    source $config
+    source "$config"
     USER=$(whoami)
 }
 
@@ -151,25 +199,100 @@ ARGSA () {
     for i in "$@"; do
         case "$i" in
             -h|--help|help)
-                printf "$help"
+                printf '%s\n' "$help"
                 exit 0
                 ;;
             --showc|showc)
-                printf "$copyright"
+                printf '%s\n' "$copyright"
                 exit 0
                 ;;
             --showw|showw)
-                printf "$warranty"
+                printf '%s\n' "$warranty"
                 exit 0
                 ;;
         esac
     done
 }
 
-#
+# Escape ERE metacharacters so hostnames/server names containing '.', '-' etc.
+# match literally. Backslashes are doubled because awk -v processes escape
+# sequences in the value it is handed.
+ere_escape () {
+    printf '%s' "$1" | sed 's/[][\.^$*+?(){}|]/\\\\&/g'
+}
+
+eval_local_config () {
+    I=$(ere_escape "$(hostname)")'\\|*[A-Za-z0-9._]*\\]'
+    local_config=$(awk -v awkvar="$I" 'BEGIN { RS="\n\n\\[" ; FS="\n"; OFS="\n"} $1 ~ awkvar {$1=""; print $0}' "$configsrc" | \
+	grep -vE "^(port|user|dataDir|watchDir|completeDir|pass|srcs)" | \
+	sed 's/^dl_dir=/local_dl_dir=/' \
+    )
+    eval "$local_config"
+}
+
+eval_remote_config () {
+    #I='srcs *=.*'"$i"
+
+    def=$(grep -E '^[[:space:]]*default_server=' "$configsrc" | tail -n 1)
+    if [[ -n $def ]]; then
+        eval "$def"
+    fi
+    if [[ -n $default_server ]]; then
+        I='\\|'"$(ere_escape "$default_server")"'\\]'
+    fi
+    #remote_config=$(awk -v awkvar="$I" 'BEGIN { RS="\n\n\\[" ; FS="\n"; OFS="\n"} $0 ~ awkvar {print $0}' "$configsrc" | \
+    remote_config=$(awk -v awkvar="$I" 'BEGIN { RS="\n\n\\[" ; FS="\n"; OFS="\n"} $0 ~ awkvar {print $0}' "$configsrc" | \
+	grep -vE "^srcs" | \
+	sed 's/^dl_dir=/remote_dl_dir=/' | \
+	sed '1 s/|\(.*\)]/name=\1/'
+    )
+    #echo "$remote_config"
+    eval "$remote_config"
+
+}
+
 ARGSB () {
     for i in "$@"; do
+        if [ ! -z "$nextParam" ]; then
+            case "$i" in
+                -*)
+                    nextParam=""
+                    #echo "Missing field for "$lastParam" or incorrect syntax for "$i""
+                    #exit 0
+                    ;;
+            esac
+            case "$nextParam" in
+                [ia])
 
+		    local_dl_dir=$(echo "$local_dl_dir" | sed "s/@profile/$i/g")
+                    destflag=1
+
+		    # Picking a profile settles both ends: the profile's own
+		    # remote_dl_dir, or the profile name if it has none.
+		    if [[ -z $remote_dl_dir ]]; then
+			remote_dl_dir="$i"
+		    fi
+		    sourceflag=1
+
+                    ;;
+            esac
+        fi
+        case "$i" in
+            -a)
+                all_files=True
+                nextParam="a"
+                ;;
+            -i)
+                ind_files=True
+                nextParam="i"
+                ;;
+        esac
+    done
+}
+
+ARGSC () {
+    nextParam=""
+    for i in "$@"; do
         if [ ! -z "$nextParam" ]; then
             case "$i" in
                 -*)
@@ -199,11 +322,6 @@ ARGSB () {
                 u)
                     username="$i"
                     ;;
-                [ia])
-                    lines=$(cat $configsrc | sed -n "/\[$i\]/,/\[\w*\]/p" | sed "/\[\w*\]/d" )
-                    source <(echo "$lines")
-                    destflag=1
-                    sourceflag=1
             esac
             nextParam=""
             lastParam=""
@@ -211,10 +329,6 @@ ARGSB () {
         fi
 
         case "$i" in
-            -a)
-                all_files=True
-                nextParam="a"
-                ;;
             -q)
                 quiet=True
                 ;;
@@ -238,20 +352,16 @@ ARGSB () {
             -ld)
                 lastParam="$i"
                 nextParam="ld"
-                sourcelfag=1
+                destflag=1
                 ;;
             -rd)
                 lastParam="$i"
                 nextParam="rd"
-                destflag=1
+                sourceflag=1
                 ;;
             -l)
                 lastParam="$i"
                 nextParam="l"
-                ;;
-            -i)
-                ind_files=True
-                nextParam="i"
                 ;;
             -n)
                 new_only=True
@@ -268,7 +378,6 @@ ARGSB () {
                 ;;
             -jl)
                 just_login=True
-                lftp -p $port -u $username,$password $server
                 return 0
                 ;;
             -rl)
@@ -292,6 +401,9 @@ ARGSB () {
             -nu)
                 nounrar=True
                 ;;
+            -dr|--dry-run)
+                dry_run=True
+                ;;
         esac
     done
     if [[ -z $destflag ]]; then
@@ -305,9 +417,9 @@ ARGSB () {
     dirname="$remote_dl_dir"
 
     if [[ -z $complete_dir ]] && [[ ! -z $data_dir ]]; then
-        data=true
+        data=True
     fi
-    if [[ $data == True ]]; then
+    if [[ ${data,,} == true ]]; then
         remote_dl_dir="$data_dir""$remote_dl_dir"
     else
         remote_dl_dir="$complete_dir""$remote_dl_dir"
@@ -319,32 +431,84 @@ ARGSB () {
 }
 ############################################################
 
+# Fail early, and by name, rather than letting lftp report something cryptic.
+validate_config () {
+    missing=""
+    if [[ -z $server ]]; then missing="$missing server"; fi
+    if [[ -z $username ]]; then missing="$missing username"; fi
+    if [[ -z $port ]]; then missing="$missing port"; fi
+    if [[ -n $missing ]]; then
+        echo "alftp: missing required setting(s):$missing" >&2
+        echo "Set them in $config or $configsrc, or pass -s/-u/-P." >&2
+        exit 1
+    fi
+}
+
 WELCOME () {
-ON=0
-prevsession=0
-touch $listfile
 if [[ -z $(command -v lftp) ]]; then
     echo "lftp is not installed."
     exit 1
 fi
+validate_config
+if [[ -z $listfile ]]; then
+    listfile="$HOME/.cache/alftp/alftp.list"
+fi
+if [[ -z $logfile ]]; then
+    logfile="$HOME/.cache/alftp/alftp.log"
+fi
+if ! mkdir -p "$(dirname "$listfile")" "$(dirname "$logfile")"; then
+    echo "alftp: cannot create directory for listfile/logfile." >&2
+    exit 1
+fi
+if ! touch "$listfile"; then
+    echo "alftp: cannot write listfile \"$listfile\"." >&2
+    exit 1
+fi
+}
+
+# Every lftp session is generated into a temp script first, so that what was
+# actually sent to lftp can be inspected when something goes wrong (the file is
+# kept on failure, or whenever ALFTP_DEBUG is set) instead of only existing
+# inside a here-doc.
+run_lftp_script () {
+    scriptfile="$1"
+    rc=0
+    if [[ -n ${ALFTP_DEBUG:-} ]]; then
+        echo "alftp: lftp commands in $scriptfile" >&2
+    fi
+    export LC_ALL=C.UTF-8
+    lftp -p "$port" -u "$username,$password" "$server" < "$scriptfile" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "alftp: lftp exited $rc; the commands sent are in $scriptfile" >&2
+    elif [[ -z ${ALFTP_DEBUG:-} ]]; then
+        rm -f "$scriptfile"
+    fi
+    return $rc
 }
 
 CREATE_LIST () {
-    #DO NOT INDENT CONTENTS
     oldfile="$listfile"_old
     listfile2="$listfile"2
     cp "$listfile" "$oldfile"
-    lftp -p $port -u $username,$password $server << EOF
+
+    scriptfile=$(mktemp "${TMPDIR:-/tmp}/alftp.list.XXXXXX")
+    #DO NOT INDENT CONTENTS
+    cat > "$scriptfile" << EOF
+$(set_opts)
 cd "$remote_dl_dir"
 cls -1 > "$listfile"
 cd "$data_dir""$dirname"
 cls -1 > "$listfile2"
 quit
 EOF
+    run_lftp_script "$scriptfile"
 }
 
 NEW_SESSION () {
-    if [[ $old_only != True ]] && [[ $just_login != True ]]; then
+    if [[ $just_login == True ]]; then
+	lftp -p $port -u $username,$password $server
+	exitflag=True
+    elif [[ $old_only != True ]] && [[ $just_login != True ]]; then
 
         CREATE_LIST
         if [[ $all_files == True ]]; then
@@ -359,22 +523,32 @@ NEW_SESSION () {
         TYPE
         if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]]; then
             DOWNLD
-            while read -r line; do
-                if [[ -z $line ]]; then
-                    continue
-                fi
-                chmod 644 "$line"
-            done <<< "$LINESF"
-            while read -r line; do
-                if [[ -z $line ]]; then
-                    continue
-                fi
-                if [[ -z $nounrar ]]; then
-                    UNRAR_FUN "$line"
-                fi
-                find -path "$line" -type d -exec chmod -R 755 {} \;
-                find -path "$line" -type f -exec chmod 644  {} \;
-            done <<< "$LINESF"
+            if [[ $dry_run != True ]]; then
+                # Downloaded content lands under $local_dl_dir, and the SsS
+                # sentinel stands in for a trailing space in the name.
+                while read -r line; do
+                    if [[ -z $line ]]; then
+                        continue
+                    fi
+                    line=$(echo "$line" | sed 's|SsS$| |')
+                    chmod 644 "$local_dl_dir/$line"
+                done <<< "$LINESF"
+                while read -r line; do
+                    if [[ -z $line ]]; then
+                        continue
+                    fi
+                    line=$(echo "$line" | sed 's|SsS$| |')
+                    target="$local_dl_dir/$line"
+                    if [[ ! -e $target ]]; then
+                        continue
+                    fi
+                    if [[ -z $nounrar ]]; then
+                        UNRAR_FUN "$target"
+                    fi
+                    find "$target" -type d -exec chmod 777 {} \;
+                    find "$target" -type f -exec chmod 644  {} \;
+                done <<< "$LINESD"
+            fi
         fi
     fi
 }
@@ -388,8 +562,9 @@ TYPE () {
             if [[ -z $line ]]; then
                 continue
             fi
-            lined=$(echo "$LIST2" | grep -F "$line" | grep -e "\\/$" | sed 's|/$||' | sed 's|\s$|&SsS|') # last portion, handle trailing whitespace
-            linef=$(echo "$LIST2" | grep -F "$line" | grep -v -e "\\/$" | grep -v -e "^$" | sed 's|\s$|&SsS|')
+	    # XXX
+            lined=$(echo "$LIST2" | grep -F "$line" | grep -e "/$" | sed 's|/$||' | sed 's|\s$|&SsS|') # last portion, handle trailing whitespace
+            linef=$(echo "$LIST2" | grep -F "$line" | grep -v -e "/$" | grep -v -e "^$" | sed 's|\s$|&SsS|')
 
             if [[ ! -z $lined ]] && [[ -z $LINESD ]]; then
                 LINESD="$lined"
@@ -408,33 +583,58 @@ TYPE () {
 
 #INITIATE SESSION AND DOWNLOAD
 DOWNLD () {
+scriptfile=$(mktemp "${TMPDIR:-/tmp}/alftp.dl.XXXXXX")
 #DO NOT INDENT CONTENTS
-lftp -p $port -u $username,$password $server << EOF
+cat > "$scriptfile" << EOF
 cd "$remote_dl_dir"
-set ftp:ssl-allow no
-set mirror:use-pget-n 5
-set mirror:dereference yes
-set xfer:clobber yes
+$(set_opts)
 $(DLDR)
 $(DLFL)
 EOF
+run_lftp_script "$scriptfile"
 }
+
+set_opts () {
+	echo "set ftp:ssl-allow no"
+	echo "set mirror:use-pget-n 5"
+	echo "set mirror:dereference yes"
+	echo "set xfer:clobber yes"
+	echo "set ftp:charset utf-8"
+	echo "set file:charset utf-8"
+	echo "set ftp:use-utf8"
+	echo "set net:max-retries 3"
+	echo "set net:persist-retries 3"
+    echo "set net:timeout 60"
+}
+
+#set ftp:charset UTF-8
+#set ftp:lang en_US
+#set sftp:charset UTF-8
 
 #DOWNLOAD DIRECTORIES
 DLDR () {
     while read -r line; do
         #line=$(echo "$line" | sed 's|SsS$| |') # handle trailing whitespace and brackets
+        #echo echo "\"$line\""
         line=$(echo "$line" | sed 's|SsS$| |' | sed 's/\[/"\["/g') # handle trailing whitespace and brackets
+        #line=$(echo "$line" | sed 's|[ \t]*$| |' | sed 's/\[/"\["/g') # handle trailing whitespace and brackets
+        #echo echo "\"$line\""
         if [[ -z $line ]]; then
             continue
         fi
         if [[ $clean == True ]]; then
-            echo "rm -f \""$line"\"; !echo REMOVED: ""$line"""
+            echo "rm -f \"$line\"; !echo REMOVED: \"$line\""
+        elif [[ $dry_run == True ]]; then
+            echo "mirror -c -P5 --dry-run \"$line\" "$local_dl_dir"/"\"$line\""; !echo DRY-RUN: \"$line\""
         elif [[ $norm == True ]]; then
-            echo "mirror -c -P5 --log=/home/$USER/tmp/log/synctorrents.log \""$line"\" "$local_dl_dir"/\""$line"\"; !echo COMPLETE: \""$line"\""
+            echo "mirror -c -P5 --log="\"$logfile\"" \"$line\" "$local_dl_dir"/"\"$line\""; !echo COMPLETE: \"$line\""
         else
-            echo "mirror -c -P5 --log=/home/$USER/tmp/log/synctorrents.log \""$line"\" "$local_dl_dir"/\""$line"\" && rm -f \""$line"\""
-            echo "echo "COMPLETE: \""$line"\"""
+            echo "mirror -c -P5 --log="\"$logfile\"" \"$line\" "$local_dl_dir"/"\"$line\"" && rm -f \"$line\""
+	    #if [[ $(echo "!echo "$?"") -eq 0 ]]; then
+	    echo "echo "COMPLETE: \"$line\"""
+	    #else
+	    #    echo "echo "ERROR:    \"$line\"""
+            #fi
         fi
     done <<< "$LINESD"
 }
@@ -449,21 +649,26 @@ DLFL () {
             continue
         fi
         if [[ $clean == True ]]; then
-            echo "rm -f \""$line"\"; !echo REMOVED: \""$line"\""
+            echo "rm -f \"$line\"; !echo REMOVED: \"$line\""
+        elif [[ $dry_run == True ]]; then
+            echo "!echo DRY-RUN: pget \"$line\" -o "$local_dl_dir"/\"$line\""
         elif [[ $norm == True ]]; then
-            echo "pget -n 5 \""$line"\" -o "$local_dl_dir"/\""$line"\"; !echo COMPLETE: \""$line"\""
+            echo "pget -n 5 \"$line\" -o "$local_dl_dir"/\"$line\"; !echo COMPLETE: \"$line\""
         else
-            echo "pget -n 5 \""$line"\" -o "$local_dl_dir"/\""$line"\" && rm -f \"""$line""\""
-            echo "echo "COMPLETE: \""$line"\"""
+            echo "pget -n 5 \"$line\" -o "$local_dl_dir"/\"$line\" && rm -f \"$line\""
+            echo "echo "COMPLETE: \"$line\"""
         fi
     done <<< "$LINESF"
 }
 
 COMPLETE () {
-    rm -f /tmp/synctorrent.lock
+    if [[ -n $exitflag ]]; then
+	    return 0
+    fi
+    rm -f /tmp/alftp.lock
     trap - SIGINT SIGTERM
     if [[ $rm_list == True ]]; then
-        rm -f "$list_file"
+        rm -f "$listfile"
     fi
     if [[ $suspend_old == True ]]; then
         mv "$oldfile" "$listfile"
@@ -473,7 +678,7 @@ COMPLETE () {
 
 function chkrmd () {
     if [[ -d $1 ]]; then
-        rm -rf "$1/"
+        rm -rf "${1:?}/"
     fi
 }
 
@@ -486,7 +691,7 @@ function chkrmf () {
 UNRAR_FUN () {
     pdir="$1"
     ext='*.rar'
-    cdir=$(find "$pdir" -name "$ext" | xargs -I{} dirname {} | uniq | sort)
+    cdir=$(find "$pdir" -name "$ext" -exec dirname {} + | sort -u)
     if [[ -z $cdir ]]; then
         return 0
     fi
@@ -503,4 +708,8 @@ UNRAR_FUN () {
 }
 
 ############################################################
-MAIN "$@"
+# Sourcing with ALFTP_LIB set loads the functions without running anything,
+# which is how tests/alftp.bats exercises the parsing stages.
+if [[ -z ${ALFTP_LIB:-} ]]; then
+    MAIN "$@"
+fi

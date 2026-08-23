@@ -1,0 +1,457 @@
+#+TITLE: alftp Code Audit
+#+DATE: 2026-08-05
+
+Audit of the =alftp= script (single-file bash tool wrapping lftp) covering
+correctness bugs, unimplemented/half-implemented features, security concerns,
+portability, and suggested improvements. Line numbers refer to the current
+working-tree version of =alftp=.
+
+* Critical / Confirmed Bugs
+
+** SSH key configuration (~keyfile~) never reaches lftp
+   :PROPERTIES:
+   :LOCATION: alftp:368-370
+   :END:
+   #+begin_src bash
+   if [[ ! -z $keyfile ]]; then
+         set sftp:connect-program "ssh -a -x -i $keyfile"
+   fi
+   #+end_src
+   This ~set~ runs as a plain bash statement in ~ARGSC~, not inside an lftp
+   heredoc. Bash's builtin ~set~ with non-flag arguments just reassigns the
+   script's own positional parameters (~$1~, ~$2~, …); it does not configure
+   lftp in any way. The intended lftp directive is silently dropped, so
+   ~keyfile~-based SFTP key auth does not work.
+   - *Fix*: emit this as an ~echo "set sftp:connect-program ..."~ line inside
+     ~set_opts~ (conditionally on ~$keyfile~), the same way every other lftp
+     option is set.
+
+* Missing / Incomplete Features
+  These are flags or config keys that are parsed and stored but never acted
+  on — several are self-documented as such in the TODO block at the top of
+  the file (alftp:23-26, 27-41), but it's worth cataloguing exactly what's
+  dangling since the help text and =alftp.conf.template= advertise them as
+  real, working options:
+
+  - *Session locking* — the help text's default-action description promises
+    "Lock the current session" / "Check for previous session's download and
+    prompt for its check/completion" (alftp:55-56), and ~COMPLETE~ removes
+    the lock file (now ~/tmp/alftp.lock~) — but nothing ever creates that lock
+    file or checks for its existence at startup. ~WELCOME~'s ~ON=0~ /
+    ~prevsession=0~ (alftp:375-376) look like leftover scaffolding for this
+    and are never read again. Net effect: nothing stops two concurrent alftp
+    runs from clobbering the same list files / lftp session.
+  - *~-n~ (new_only)* — variable is set (alftp:310) but never consulted
+    anywhere else in the script.
+  - *~-o~ (old_only)* — only effect is to skip the entire
+    download/list-creation block in ~NEW_SESSION~ (alftp:405); there is no
+    actual "resume/finish old session" logic, so ~-o~ just does nothing
+    rather than the "checks/finishes old download only" behavior the help
+    text describes.
+  - *~-fs~ (print_fs / filesize)* — variable set (alftp:320) but unused; the
+    TODO block (alftp:30-38) contains the intended ~awk~/~numfmt~/~df~/~bc~
+    pseudocode for computing and displaying transfer sizes, never wired up.
+  - *~-rm~ (rm_remote)* — variable set (alftp:330) but unused; nothing in
+    ~DLDR~/~DLFL~/~DOWNLD~ issues a remote delete beyond removing the
+    completion symlink, so "remove files from remote location once download
+    is complete" doesn't happen.
+  - *~-r~ (no_append) and the "record" feature* — ~alftp.conf.template~
+    documents a ~record~ option ("list of everything that has been
+    successfully downloaded"), and ~-r~ is supposed to suppress appending to
+    it, but no code anywhere reads ~$record~ or appends to any such file.
+    Both the base feature and its suppression flag are entirely absent.
+  - *~errors~ / ~verify~ config keys* — documented in
+    ~alftp.conf.template~ ("where to log errors" / "store xfer verify logs to
+    verify data once downloaded") but never referenced in ~alftp~.
+  - *~autoUncompress~ config key* — documented in
+    ~alftp.conf.template~ as the way to opt in to automatic decompression,
+    but the actual code path unrars *unconditionally* unless ~-nu~ is passed
+    (alftp:430), and ~$autoUncompress~ is never read. Behavior is inverted
+    from what's documented, and the documented knob is dead.
+  - *GPG-encrypted config* — the help text's default action list literally
+    says "Read config file and *gpg file* variables" (alftp:53), but no gpg
+    invocation exists anywhere in the script. Passwords are plain text only
+    (see Security section).
+  - *~chkrmd~ / ~chkrmf~* (alftp:558-568) — defined, never called from
+    anywhere. Likely meant to clean up stale local directories/files (maybe
+    tied to the missing "old session" handling) but currently dead code.
+  - *checksum verification* — listed in the TODO block, not implemented; ties
+    into the also-unused ~verify~ config key above.
+
+* Security Concerns
+
+  - *Password exposure via process list*: ~lftp -p $port -u
+    $username,$password $server~ (alftp:391, 472) puts the plaintext password
+    on the command line, visible to any local user via ~ps~/~/proc~. Combined
+    with the config file storing ~password=~ in plaintext
+    (alftp.conf.template), there's no path to a non-plaintext credential today
+    despite the help text implying gpg-backed secrets were intended.
+    Consider: lftp's ~.netrc~ support, prompting interactively when password
+    is unset, or actually implementing the gpg-file idea from the help text.
+  - *~eval~ over untrusted-ish input*: ~eval_local_config~ and
+    ~eval_remote_config~ (alftp:169-197) both ~eval~ chunks of
+    ~alftp.src.conf~ built via ~awk~/~sed~ text surgery. This is inherent to
+    the "profiles are bash snippets" design (documented in README), so it's
+    not necessarily wrong, but it does mean a corrupted or maliciously edited
+    profile file is arbitrary code execution with no sandboxing — worth a
+    one-line callout in the README/config template so users don't treat
+    ~alftp.src.conf~ as inert data.
+  - *~chmod -R 777~ on downloaded directories* (alftp:433, and in ~DLDR~'s
+    ~norm~ branch messaging) makes downloaded content world-writable. This is
+    unusually permissive for content just pulled from a remote server;
+    ~755~/~775~ would cover the typical "I want to read/browse this as
+    another local user" use case without making it group/world-writable too.
+  - *Regex-injection via hostname / default_server*: see the "Unescaped
+    values embedded into awk regex" bug below — while not exploitable
+    remotely, a server name or hostname containing regex metacharacters can
+    silently corrupt profile matching.
+
+* Correctness / Robustness Issues (non-critical)
+   - *Done*: ~config_template~ holds a real, commented default config;
+     ~mkdir -p "$(dirname "$config")"~ runs first and aborts with a clear error if
+     it fails; the file is written with ~printf '%s'~. Verified end to end against
+     a throwaway ~$HOME~.
+
+** Dead/unused variables from the locking design that never landed
+   :PROPERTIES:
+   :LOCATION: alftp:375-376
+   :END:
+   ~ON=0~ and ~prevsession=0~ were set in ~WELCOME~ and never read again.
+   They have since been dropped along with the rest of the ~WELCOME~ rewrite,
+   but the feature they were scaffolding is still missing (see "Session
+   locking" above), so this stays open until locking is implemented or the
+   help text stops promising it.
+
+** No traps set despite ~COMPLETE~ clearing them
+   :PROPERTIES:
+   :LOCATION: alftp:548
+   :END:
+   #+begin_src bash
+   trap - SIGINT SIGTERM
+   #+end_src
+   clears traps for those signals, but the script never installs a trap on
+   them in the first place, so there's no cleanup (temp files, lock file,
+   partial list files) if the user Ctrl-C's mid-transfer.
+
+** No strict-mode / typo protection
+   Several of the bugs above (~sourcelfag~, ~$list_file~) are exactly the
+   class of error ~set -u~ (nounset) catches immediately at runtime instead
+   of silently misbehaving. ~set -u~ is now on (see Completed); ~-e~ and
+   ~pipefail~ are still off, and full ~-e~ may well be too aggressive given
+   how much of the control flow relies on commands "failing" as normal
+   control flow (e.g. grep with no matches). Worth revisiting per-pipeline
+   rather than globally.
+
+* Portability
+
+  - README explicitly states "Currently incompatible with mac" — likely
+    causes include: GNU-specific ~sed -i 's/.../.../ ' file~ (no space before
+    file arg needed for GNU, but BSD ~sed -i~ requires an explicit (even
+    empty) extension argument — see alftp:413) and GNU ~find -regex~
+    (alftp:580, uses POSIX awk-style regex which BSD find doesn't support the
+    same way). The hardcoded ~/home/$USER~ path is fixed (see Completed).
+    Worth either documenting the remaining incompatibilities or gating the
+    relevant commands behind an OS check.
+
+* Suggested Improvements / Possible New Features
+
+  - *Finish or remove the half-built features*: for each of ~-n~, ~-o~,
+    ~-fs~, ~-rm~, ~-r~/record, ~autoUncompress~, ~errors~, ~verify~ — either
+    implement the documented behavior or remove the flag/config key and its
+    mention in the help text and ~alftp.conf.template~ so the documented
+    surface area matches what actually works.
+  - *Structured logging*: right now the "record"/"errors" story is entirely
+    aspirational (see above); a real implementation could log
+    profile/timestamp/file/status lines to ~$record~, giving users an actual
+    audit trail of what was downloaded when — which is explicitly promised in
+    the config template's comments already.
+
+* Completed
+  Items resolved on 2026-08-23. Line numbers in the ~:LOCATION:~ drawers refer
+  to the pre-fix version of =alftp=.
+
+** DONE ~-ld~/~-rd~ set the wrong flags, breaking non-profile CLI usage
+   :PROPERTIES:
+   :LOCATION: alftp:295-304, alftp:349-356
+   :END:
+   In ~ARGSC~:
+   #+begin_src bash
+   -ld)
+       lastParam="$i"
+       nextParam="ld"
+       sourcelfag=1        # typo: "sourcelfag", not "sourceflag" — and wrong flag anyway
+       ;;
+   -rd)
+       lastParam="$i"
+       nextParam="rd"
+       destflag=1          # should be sourceflag=1
+       ;;
+   #+end_src
+   ~-ld~ (local/destination dir) sets a misspelled, otherwise-unused variable
+   ~sourcelfag~ instead of ~destflag~; ~-rd~ (remote/source dir) sets ~destflag~
+   instead of ~sourceflag~. The end-of-function check requires both
+   ~destflag~ and ~sourceflag~ to be non-empty:
+   #+begin_src bash
+   if [[ -z $destflag ]]; then echo "Please specify desitnation."; exit 0; fi
+   if [[ -z $sourceflag ]]; then echo "Please specify source."; exit 0; fi
+   #+end_src
+   Result: running alftp the way the README/help text documents —
+   ~alftp -s server -u user -p pass -P port -ld /local -rd /remote~ (i.e.
+   without ~-i~/~-a~) — *always* exits with "Please specify source.", even
+   though ~-rd~ was given. This appears to make the entire non-profile /
+   direct-flag invocation mode of the script non-functional.
+   - *Fix*: rename ~sourcelfag~ → ~destflag~ under ~-ld~, and change ~-rd~ to
+     set ~sourceflag=1~.
+   - *Done*: ~-ld~ now sets ~destflag=1~ and ~-rd~ sets ~sourceflag=1~; the misspelled
+     ~sourcelfag~ is gone. ~ARGSB~ also had to be fixed: selecting a profile that
+     already defines ~remote_dl_dir~ set ~destflag~ but never ~sourceflag~, so
+     ~-i~/~-a~ hit the same "Please specify source." dead end. It now sets
+     ~sourceflag=1~ whenever a profile is selected.
+
+** DONE Post-download processing loop iterates over files instead of directories
+   :PROPERTIES:
+   :LOCATION: alftp:426-435
+   :END:
+   #+begin_src bash
+   while read -r line; do
+       if [[ -z $line ]]; then continue; fi
+       if [[ -z $nounrar ]]; then
+           UNRAR_FUN "$line"
+       fi
+       find -path "$line" -type d -exec chmod -R 777 {} \;
+       find -path "$line" -type f -exec chmod 644  {} \;
+   done <<< "$LINESF"
+   #+end_src
+   This loop — which unrars archives and fixes permissions recursively — reads
+   from ~$LINESF~ (the *files* list) instead of ~$LINESD~ (the *directories*
+   list). Since ~UNRAR_FUN~ does a recursive ~find~ for ~*.rar~ inside its
+   argument and the ~chmod -R 777~ only matches ~-type d~, this logic is
+   meaningless applied to individual downloaded files, and mirrored
+   directories (the typical case for release-style downloads with rar sets)
+   never get unrared or permission-fixed at all. Combined with the preceding
+   loop (also over ~$LINESF~, doing a plain ~chmod 644~), files get touched
+   twice and directories never get touched.
+   - *Fix*: change the second loop to ~done <<< "$LINESD"~.
+   - *Done*: the unrar/permission loop now reads from ~$LINESD~.
+
+** DONE ~find -path "$line"~ doesn't target the actual download location
+   :PROPERTIES:
+   :LOCATION: alftp:433-434 (and the UNRAR_FUN call above it)
+   :END:
+   Downloaded content lands in ~"$local_dl_dir"/"$line"~ (see ~DLDR~/~DLFL~),
+   but the post-processing calls ~find -path "$line" ...~ with no starting
+   directory, which defaults to searching from the script's current working
+   directory and matches ~-path~ against relative paths from there. Unless
+   the script happens to be invoked with ~cwd == $local_dl_dir~, this ~find~
+   will not match the just-downloaded files/dirs at all.
+   - *Fix*: search under ~"$local_dl_dir/$line"~ explicitly, or ~cd
+     "$local_dl_dir"~ first.
+   - *Done*: post-processing now operates on ~"$local_dl_dir/$line"~ (and skips entries
+     that do not exist), for the ~chmod 644~ file loop as well. The ~SsS~
+     trailing-whitespace sentinel is translated back to a space first, the same
+     way ~DLDR~/~DLFL~ do it.
+
+** DONE ~data=true~ vs ~data=True~ case mismatch defeats the complete/data-dir fallback
+   :PROPERTIES:
+   :LOCATION: alftp:339, alftp:359-366
+   :END:
+   ~-d~ sets ~data=True~ (capital T), and the effective remote directory is
+   chosen with ~[[ $data == True ]]~ (case-sensitive comparison):
+   #+begin_src bash
+   if [[ -z $complete_dir ]] && [[ ! -z $data_dir ]]; then
+       data=true              # lowercase — will never match "True" below
+   fi
+   if [[ $data == True ]]; then
+       remote_dl_dir="$data_dir""$remote_dl_dir"
+   else
+       remote_dl_dir="$complete_dir""$remote_dl_dir"
+   fi
+   #+end_src
+   The fallback branch (used when only ~data_dir~ is configured and
+   ~complete_dir~ is not) sets ~data=true~, but the check two lines later
+   requires ~True~. So when a profile only defines ~data_dir~ (a
+   documented, valid configuration per ~alftp.conf.template~), ~remote_dl_dir~
+   is built with the empty ~$complete_dir~ instead of ~$data_dir~, producing a
+   wrong/incomplete remote path.
+   - *Fix*: use ~data=True~ for consistency (or switch both checks to a
+     case-insensitive / boolean-ish test).
+DO BOTH
+   - *Done*: the fallback sets ~data=True~ *and* the test is now case-insensitive
+     (~${data,,} == true~), as requested.
+
+** DONE ~-rl~ (remove list file) never removes the list file
+   :PROPERTIES:
+   :LOCATION: alftp:550
+   :END:
+   #+begin_src bash
+   if [[ $rm_list == True ]]; then
+       rm -f "$list_file"   # variable is $listfile everywhere else in the script
+   fi
+   #+end_src
+   ~$list_file~ is never defined anywhere else (the real variable is
+   ~$listfile~), so this expands to ~rm -f ""~, a silent no-op. The ~-rl~ flag
+   is effectively broken.
+   - *Fix*: ~rm -f "$listfile"~.
+   - *Done*: ~rm -f "$listfile"~.
+
+** DONE Config bootstrap writes the literal string "config_template", not its contents
+   :PROPERTIES:
+   :LOCATION: alftp:98-100, alftp:133
+   :END:
+   #+begin_src bash
+   config_template="
+
+   "
+   ...
+   echo config_template > $config
+   #+end_src
+   ~config_template~ is (a) unquoted so the literal word ~config_template~ is
+   written to the file instead of the variable's contents, and (b) itself
+   empty, so there's nothing useful to write even if quoted correctly. On top
+   of that, ~$config~'s parent directory (~~/.config/alftp/~) is never
+   created, so first-run bootstrap will fail with "No such file or directory"
+   on a fresh machine (the very case this code path exists for) rather than
+   creating anything.
+   - *Fix*: populate ~config_template~ with real default content (or ship
+     ~alftp.conf.template~ alongside the script and copy it), ~mkdir -p
+     "$(dirname "$config")"~ before writing, and use ~echo "$config_template"
+     > "$config"~ / better, ~printf '%s\n' "$config_template" > "$config"~.
+
+** DONE Unescaped values embedded into awk regex
+   :PROPERTIES:
+   :LOCATION: alftp:170, alftp:186
+   :END:
+   #+begin_src bash
+   I=$(hostname)'\\|*[A-Za-z0-9._]*\\]'
+   ...
+   I='\\|'"$default_server"'\\]'
+   #+end_src
+   Both the local hostname and the configured ~default_server~ are spliced
+   directly into an ~awk~ extended regex with no escaping. Any regex
+   metacharacter in the hostname or server name (a literal ~.~ is the common
+   case — hostnames routinely contain dots) changes what the pattern matches
+   rather than raising an error, so profile selection can silently pick the
+   wrong block or none at all.
+   - *Done*: new ~ere_escape~ helper escapes ERE metacharacters (doubling the
+     backslashes, since ~awk -v~ processes escapes itself) for both the hostname
+     and ~default_server~. Covered by a bats test using a fixture with both
+     ~example.com~ and ~exampleXcom~ profiles.
+
+** DONE Non-anchored ~grep -v~ filter can drop unrelated config lines
+   :PROPERTIES:
+   :LOCATION: alftp:172
+   :END:
+   #+begin_src bash
+   grep -vE "(port|user|dataDir|watchDir|completeDir|pass|srcs)"
+   #+end_src
+   This is meant to strip remote-only keys (~port~, ~username~, ~password~,
+   …) out of the local config chunk, but the pattern isn't anchored to the
+   start of the line or to ~key=~, so it matches the substring anywhere,
+   including inside *values*. A profile line like
+   ~local_dl_dir='~/Downloads/important'~ contains the substring ~port~ (from
+   "important") and would be silently dropped from the local config. Anchor
+   the pattern, e.g. ~grep -vE "^(port|user...)="~.
+   - *Done*: the pattern is anchored to the start of the line
+     (~^(port|user|dataDir|watchDir|completeDir|pass|srcs)~). It is anchored
+     without requiring a trailing ~=~ so the ~user~/~pass~ prefixes keep matching
+     ~username=~/~password=~. Covered by a bats test on a profile whose
+     ~dl_dir~ value contains "important".
+
+** DONE Help/copyright/warranty text is fed through ~printf~ as a format string
+   :PROPERTIES:
+   :LOCATION: alftp:154, 158, 162
+   :END:
+   #+begin_src bash
+   printf "$help"
+   #+end_src
+   Passing a variable as printf's *format* argument means any ~%~ or
+   backslash escape sequence embedded in the text is interpreted rather than
+   printed literally. Currently the text is escape-sequence-free, so it
+   happens to work, but it's a latent footgun the moment someone edits
+   ~$help~ to include a literal ~%~ (e.g. documenting a percentage option).
+   Use ~printf '%s\n' "$help"~ instead.
+   - *Done*: all three now use ~printf '%s\\n'~.
+
+** DONE Useless use of ~cat~ / unanchored grep for ~default_server~
+   :PROPERTIES:
+   :LOCATION: alftp:181
+   :END:
+   #+begin_src bash
+   def=$(cat "$configsrc" | grep "default_server")
+   #+end_src
+   No anchor and no comment-exclusion, so a commented-out
+   ~#default_server=...~ line, or any line merely mentioning the phrase, would
+   also match and get ~eval~'d.
+   - *Done*: ~grep -E '^[[:space:]]*default_server=' "$configsrc" | tail -n 1~.
+
+** DONE ~listfile~ has no default and no validation
+   :PROPERTIES:
+   :LOCATION: alftp:377
+   :END:
+   ~touch $listfile~ in ~WELCOME~ is the first use of ~$listfile~; if it's
+   never set (no config default exists in ~alftp.conf.template~, and ~-l~ is
+   the only way to set it, but ~-l~ isn't documented in the help text at
+   all), this call fails with a generic "touch: missing file operand" and the
+   script limps onward using an empty filename in every subsequent step
+   instead of failing with a clear "listfile is not set" error.
+   - *Done*: ~listfile~ defaults to ~$HOME/.cache/alftp/alftp.list~, its parent
+     directory is created, and a failing ~touch~ now aborts with a named error.
+     ~-l <file>~ is documented in the help text.
+
+** DONE Hardcoded, project-name-mismatched paths
+   :PROPERTIES:
+   :LOCATION: alftp:511, 513, 547
+   :END:
+   ~--log=/home/$USER/tmp/log/synctorrents.log~ hardcodes ~/home/$USER~
+   instead of ~$HOME~ (breaks on any system where home isn't under
+   ~/home~, part of why macOS is unsupported per the README), assumes
+   ~~/tmp/log/~ already exists (mirror's ~--log~ will simply fail to log,
+   silently, if it doesn't), and — along with ~/tmp/synctorrent.lock~ in
+   ~COMPLETE~ — references a "synctorrent" name that doesn't match the
+   project name "alftp", suggesting leftover paths from an earlier/forked
+   version that were never fully renamed.
+   - *Done*: ~mirror --log=~ uses a new ~logfile~ setting (default
+     ~$HOME/.cache/alftp/alftp.log~, directory created up front, documented in
+     ~alftp.conf.template~), and the lock path is ~/tmp/alftp.lock~.
+
+** DONE Suggested improvements implemented
+  - *Add shellcheck to CI* (a GitHub Actions workflow running ~shellcheck
+    alftp~ on push/PR) — trivially would have flagged the unused-variable /
+    typo class of bug in this audit (~sourcelfag~, ~$list_file~) and is zero
+    ongoing cost for a single-file project.
+  - *Add ~set -u~* (and audit for the handful of intentionally-unset
+    variables) to convert several of the "silent no-op" bugs above into
+    immediate, loud failures.
+  - *Basic test coverage via bats* (Bash Automated Testing System) for the
+    pure-parsing pieces that don't need a live server: ~ARGSB~/~ARGSC~ flag
+    parsing (in particular the source/dest flag logic that's currently
+    broken), and ~eval_local_config~/~eval_remote_config~ against a fixture
+    ~alftp.src.conf~. These are exactly the functions where bugs are easy to
+    introduce and hard to notice without a live remote to test against.
+  - *Progress / dry-run mode*: ~lftp mirror~ supports ~--dry-run~; exposing a
+    ~-n~/~--dry-run~ (careful: ~-n~ is already taken by ~new_only~) flag that
+    prints what would be downloaded without transferring would make the
+    tool much safer to experiment with, especially given how many flags
+    currently have unclear effects.
+  - *Config validation on startup*: check ~server~/~username~/~port~ are set
+    before ever opening an lftp session, with a clear error naming the
+    missing key, rather than letting lftp fail with a possibly cryptic error.
+  - *Replace positional-heredoc lftp scripting with lftp's job queue file or
+    ~-c~ script generation into a temp file*, which would make it much easier
+    to log/debug exactly what was sent to lftp on failure (currently only
+    visible by reading the source).
+
+   - *Done*: ~set -u~ is on, with every optional flag/config key initialised in a
+     DEFAULTS block that runs before ~alftp.conf~ is sourced (so config values
+     still win). ~.shellcheckrc~ records the three checks that are disabled on
+     purpose, and ~.github/workflows/ci.yml~ runs ~shellcheck --severity=warning
+     alftp~ plus ~bats tests~ on push/PR. ~tests/alftp.bats~ covers the
+     ~ARGSB~/~ARGSC~ source/dest logic, the ~complete_dir~/~data_dir~ selection
+     and both config-eval stages against ~tests/fixtures/alftp.src.conf~; the
+     script can be sourced without running ~MAIN~ by setting ~ALFTP_LIB=1~.
+     ~-dr~/~--dry-run~ emits ~mirror --dry-run~, prints what it would ~pget~,
+     removes nothing and skips all post-processing. ~validate_config~ names any
+     missing ~server~/~username~/~port~ before a session is opened. Both lftp
+     sessions are now generated into a temp script (~mktemp~) that is fed to
+     ~lftp~ on stdin and *kept*, with its path printed, when lftp exits non-zero
+     or when ~ALFTP_DEBUG~ is set.

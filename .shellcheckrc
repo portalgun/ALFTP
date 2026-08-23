@@ -1,0 +1,16 @@
+# alftp is a single bash script; these checks are disabled deliberately.
+
+# SC1090: `source "$config"` points at ~/.config/alftp/alftp.conf, which is
+# user data and cannot be followed at lint time.
+disable=SC1090
+
+# SC2034: several flags and config keys (new_only, print_fs, rm_remote,
+# no_append, record, errors, verify, autoUncompress) are parsed and documented
+# but not yet acted on. See the "Missing / Incomplete Features" section of
+# audit.org; the variables stay so `set -u` has a defined default for them.
+disable=SC2034
+
+# SC2027: the DLDR/DLFL functions build lftp command lines, so the "unquoting"
+# quote nesting is intentional -- it is what puts literal double quotes around
+# path arguments in the script handed to lftp.
+disable=SC2027

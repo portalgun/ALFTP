@@ -6,6 +6,7 @@
 #    local_dl_dir   - directory to download to
 #    editor         - the editor you prefer to use
 #    listfile       - where to download list of available files to
+#    logfile        - where lftp mirror writes its transfer log
 #    record         - list of everything that has been successfully downloaded
 #    errors         - where to log errors
 #    verify         - where to store xfer verify logs to verify data once downloaded
