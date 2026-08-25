@@ -1,0 +1,10 @@
+total 20
+lrwxrwxrwx   1 dave users     25 Aug 23 17:10 Rel.One-GRP -> ../../data/TV/Rel.One-GRP
+lrwxrwxrwx   1 dave users     23 Aug 23 17:10 notes.nfo -> ../../data/TV/notes.nfo
+lrwxrwxrwx   1 dave users     22 Aug 22 09:03 broken.link -> ../../data/TV/gone.mkv
+lrwxrwxrwx   1 dave users     33 Jan  2  2019 spaced link -> ../../data/TV/with space name.mkv
+lrwxrwxrwx   1 0    0         30 2026-08-23 17:10 elsewhere.mkv -> /srv/archive/elsewhere.mkv
+lrwxrwxrwx   1 dave users     41 Aug 23 17:10 deep.mkv -> ../../data/TV/Rel.One-GRP/movie.mkv
+lrwxrwxrwx   1 dave users     12 who knows -> anywhere
+-rw-r--r--   1 dave users   2103 Aug 22 09:03 plain.nfo
+drwxr-xr-x   2 dave users   4096 Aug 23 17:10 A.Directory

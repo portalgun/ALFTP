@@ -154,7 +154,22 @@ sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
 profilevar=""; override=""
 LINESD=""; LINESF=""; LINESR=""; oldfile=""; listfile2=""; dirname=""
 rawline=""; unlink_ok=""
-two_session=""; self=""; ARGV=(); dir_sizes=""; listfile3=""
+two_session=""; self=""; ARGV=(); dir_sizes=""; listfile3=""; listfile4=""
+
+# A completed directory is symlinks into the data directory, and they go stale
+# when the data behind one is removed. LINK_TARGET is what the listing session's
+# "ls -l" said each entry points at (verbatim -- relative or absolute), and
+# link_data_path turns a name into the path of the data behind it, falling back
+# to $data_dir$dirname/<name> where there is no parsed target. Anything that
+# needs to know what is behind a symlink reads these rather than parsing the
+# listing again. LINK_DATA is the data directory's own listing as a set, which
+# is what says whether a target is still there; LINESB holds the broken entries
+# VALIDATE_LINKS found, in the same form as LINESR.
+LINESB=""; prune_broken=True
+declare -A LINK_TARGET=(); declare -A LINK_DATA=()
+link_name=""; link_tgt=""; link_key=""; link_to=""; link_path=""; link_norm=""
+link_part=""; link_split=(); link_datadir=""; link_rel=""; link_count=0
+link_tmp=""; link_out=""; link_broken=()
 
 # The file picker: "tui" for the terminal UI, "editor" for $editor, empty to
 # use the UI wherever the terminal can drive it. Its state lives here too --
@@ -566,6 +581,7 @@ fi
 # Derived here so the parent and the in-session helper agree on it.
 listfile2="$listfile"2
 listfile3="$listfile"3
+listfile4="$listfile"4
 }
 
 # Quote a value for lftp's own (shell-like) command parser.
@@ -627,6 +643,15 @@ du_cmd () {
     fi
 }
 
+# The completed directory listed a second time, long form, which is the only
+# thing that says where each symlink points (see the SYMLINKS section). Prints
+# nothing when there is nowhere to put it, the way du_cmd does.
+ls_l_cmd () {
+    if [[ -n $listfile4 ]]; then
+        printf 'ls -l > %s\n' "$(lftp_quote "$listfile4")"
+    fi
+}
+
 CREATE_LIST () {
     oldfile="$listfile"_old
     cp "$listfile" "$oldfile"
@@ -638,6 +663,7 @@ $(open_cmd)
 $(set_opts)
 cd "$remote_dl_dir"
 cls -1 -F -h --size --date --time-style="%Y-%m-%d %H:%M" > "$listfile"
+$(ls_l_cmd)
 $(du_cmd)
 cd "$data_dir""$dirname"
 cls -1 > "$listfile2"
@@ -670,6 +696,7 @@ set net:idle never
 $(set_opts)
 cd "$remote_dl_dir"
 cls -1 -F -h --size --date --time-style="%Y-%m-%d %H:%M" > "$listfile"
+$(ls_l_cmd)
 $(du_cmd)
 cd "$data_dir""$dirname"
 cls -1 > "$listfile2"
@@ -689,10 +716,13 @@ EOF
 }
 
 # Runs inside the lftp session, spawned by the "!" line above.
+# The broken-link removals go first: they are housekeeping the user did not ask
+# for and did not select, and a run interrupted halfway through a long transfer
+# should still have done them.
 EMIT_DL () {
     EDIT_LIST
     TYPE
-    { DLDR; DLFL; DLRM; } > "$ALFTP_EMIT_DL"
+    { DLPRUNE; DLDR; DLFL; DLRM; } > "$ALFTP_EMIT_DL"
 }
 
 NEW_SESSION () {
@@ -711,7 +741,8 @@ NEW_SESSION () {
             CREATE_LIST
             EDIT_LIST
             TYPE
-            if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]] || [[ ! -z $LINESR ]]; then
+            if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]] || [[ ! -z $LINESR ]] \
+               || [[ ! -z $LINESB ]]; then
                 DOWNLD
                 POST_PROCESS
             fi
@@ -723,7 +754,7 @@ NEW_SESSION () {
             TYPE
             POST_PROCESS
         fi
-        rm -f "$listfile2" "$listfile3"
+        rm -f "$listfile2" "$listfile3" "$listfile4"
     fi
 }
 
@@ -809,6 +840,183 @@ FORMAT_LIST () {
     fi
     format_columns "$listfile" "$dufile" > "$tmpfile" && mv "$tmpfile" "$listfile"
     rm -f "$tmpfile"
+}
+
+# ----------------------------------------------------------------- SYMLINKS --
+# The completed directory is symlinks into the data directory, and a directory
+# that has been in use for a while collects broken ones: the data behind the
+# link was removed and the link outlived it. Downloading such an entry can only
+# fail, so the listing sessions capture "ls -l" into $listfile4 as well, and the
+# entries are checked against $listfile2 -- the data directory's own listing --
+# before the picker ever draws them.
+
+# Parse "name -> target" out of an "ls -l" listing, one "name<TAB>target"
+# record per symlink. What a server puts in front of the name is its business:
+# the group column is sometimes missing, the date may be "Mon DD HH:MM",
+# "Mon DD  YYYY" (ls drops the time once a file is old enough) or ISO, so the
+# name is taken to be whatever follows the timestamp rather than a fixed field
+# number. A line with no timestamp this recognises yields no record at all,
+# which is the safe direction: an entry with no record is never checked, and an
+# entry that was never checked counts as valid.
+# Names and targets may both contain spaces, hence " -> " as the separator; a
+# name that contains " -> " itself splits in the wrong place, and comes out as
+# a name matching nothing, which again only costs a check.
+link_targets () {
+    awk '
+        /^l[rwxsStT-]/ {
+            arrow = index($0, " -> ")
+            if (arrow == 0) { next }
+            head = substr($0, 1, arrow - 1)
+            tgt = substr($0, arrow + 4)
+            if (match(head, /[ \t][A-Za-z][A-Za-z][A-Za-z][ \t]+[0-9]+[ \t]+([0-9][0-9]:[0-9][0-9]|[0-9][0-9][0-9][0-9])[ \t]+/) ||
+                match(head, /[ \t][0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][ \t]+[0-9][0-9]:[0-9][0-9][ \t]+/)) {
+                nm = substr(head, RSTART + RLENGTH)
+            } else {
+                next
+            }
+            if (nm == "" || tgt == "") { next }
+            print nm "\t" tgt
+        }
+    ' "$1"
+}
+
+# Fill LINK_TARGET from the long listing. Cheap and idempotent, so call it
+# wherever the map is wanted; a missing or unreadable $listfile4 just leaves it
+# empty, and everything downstream treats "no target" as "not verifiable".
+LOAD_LINKS () {
+    unset LINK_TARGET
+    declare -gA LINK_TARGET=()
+    if [[ -z $listfile4 ]] || [[ ! -s $listfile4 ]]; then
+        return 0
+    fi
+    while IFS=$'\t' read -r link_name link_tgt; do
+        if [[ -n $link_name ]]; then
+            LINK_TARGET[$link_name]="$link_tgt"
+        fi
+    done < <(link_targets "$listfile4")
+}
+
+# Fold "." and ".." out of a remote path, textually: the path names something on
+# the server, so there is nothing here to resolve it against. Result in
+# $link_norm, absolute exactly when the input was.
+link_normalize () {
+    link_norm=""
+    IFS='/' read -r -a link_split <<< "$1"
+    for link_part in ${link_split[@]+"${link_split[@]}"}; do
+        case "$link_part" in
+            ''|.)
+                ;;
+            ..)
+                link_norm=${link_norm%/*}
+                ;;
+            *)
+                link_norm="$link_norm/$link_part"
+                ;;
+        esac
+    done
+    if [[ $1 != /* ]]; then
+        link_norm=${link_norm#/}
+    fi
+}
+
+# Where the data behind entry $1 lives, as an absolute remote path, in
+# $link_path. The target "ls -l" reported wins -- resolved against the completed
+# directory when it is relative, which is the usual case -- and an entry with no
+# parsed target falls back to the path the layout implies. The classifier cls -F
+# puts on a name ("@", "/") is not part of it.
+link_data_path () {
+    link_key=${1%[/@*]}
+    link_to=${LINK_TARGET[$link_key]:-}
+    if [[ -z $link_to ]]; then
+        link_normalize "$data_dir$dirname/$link_key"
+    elif [[ $link_to == /* ]]; then
+        link_normalize "$link_to"
+    else
+        link_normalize "$remote_dl_dir/$link_to"
+    fi
+    link_path=$link_norm
+}
+
+# Take the broken symlinks out of the listing and line them up for removal
+# ($LINESB, which DLPRUNE emits). A target is only ever judged against the one
+# listing we have: $listfile2 covers the top level of $data_dir$dirname, so a
+# target landing there is broken exactly when that listing does not have it, and
+# a target pointing anywhere else -- another directory, deeper than the listing
+# goes, or a line link_targets could not parse -- is left alone. "Could not be
+# verified" must never read as "delete it".
+# Expects LOAD_LINKS to have run; prune_broken=False turns the whole thing off.
+VALIDATE_LINKS () {
+    LINESB=""
+    link_count=0
+    link_broken=()
+    if [[ ${prune_broken,,} != true ]]; then
+        return 0
+    fi
+    if [[ ${#LINK_TARGET[@]} -eq 0 ]] || [[ -z $listfile2 ]] || [[ ! -s $listfile2 ]]; then
+        return 0
+    fi
+    unset LINK_DATA
+    declare -gA LINK_DATA=()
+    while IFS= read -r link_key || [[ -n $link_key ]]; do
+        if [[ -n $link_key ]]; then
+            LINK_DATA[${link_key%/}]=1
+        fi
+    done < "$listfile2"
+    link_normalize "$data_dir$dirname"
+    link_datadir=$link_norm
+    for link_name in "${!LINK_TARGET[@]}"; do
+        link_data_path "$link_name"
+        if [[ $link_path != "$link_datadir"/* ]]; then
+            continue
+        fi
+        link_rel=${link_path#"$link_datadir"/}
+        if [[ -z $link_rel ]] || [[ $link_rel == */* ]]; then
+            continue
+        fi
+        if [[ -n ${LINK_DATA[$link_rel]:-} ]]; then
+            continue
+        fi
+        link_broken+=("$link_name")
+    done
+    if [[ ${#link_broken[@]} -eq 0 ]]; then
+        return 0
+    fi
+    link_count=${#link_broken[@]}
+    link_tmp=$(mktemp "${TMPDIR:-/tmp}/alftp.broken.XXXXXX")
+    printf '%s\n' "${link_broken[@]}" | sort > "$link_tmp"
+    PRUNE_LIST
+    while IFS= read -r link_name; do
+        add_line LINESB "$(echo "$link_name" | sed 's|\s$|&SsS|')"
+    done < "$link_tmp"
+    rm -f "$link_tmp"
+    if [[ $dry_run == True ]]; then
+        echo "alftp: $link_count broken symlink(s) dropped from the list (dry run, none removed)"
+    elif [[ $norm == True ]]; then
+        echo "alftp: $link_count broken symlink(s) dropped from the list, left on the remote (-do)"
+    else
+        echo "alftp: pruning $link_count broken symlink(s) from $remote_dl_dir"
+    fi
+}
+
+# Drop every line of $listfile naming one of the entries in $link_tmp. The name
+# is recovered the way TYPE recovers it -- marker off the front, columns off the
+# end, classifier off the name -- so this matches whether the list has been
+# through the picker or not.
+PRUNE_LIST () {
+    link_out=$(mktemp "${TMPDIR:-/tmp}/alftp.prune.XXXXXX")
+    awk -v names="$link_tmp" '
+        BEGIN { while ((getline nm < names) > 0) { drop[nm] = 1 } }
+        {
+            nm = $0
+            sub(/^[-+*#]/, "", nm)
+            sub(/[ \t][ \t]+([^ \t]+[ \t]+)?[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9][ \t]*$/, "", nm)
+            sub(/[ \t]+$/, "", nm)
+            sub(/[\/@*]$/, "", nm)
+            if (nm in drop) { next }
+            print
+        }
+    ' "$listfile" > "$link_out" && mv "$link_out" "$listfile"
+    rm -f "$link_out"
 }
 
 # ------------------------------------------------------------------- PICKER --
@@ -1683,8 +1891,13 @@ pick_list () {
 
 # Let the user pick entries out of the listing. Shared by both paths: in the
 # single-session path this runs inside the lftp session, via EMIT_DL.
+# The symlinks are checked here rather than in the picker, so that both pickers
+# -- and a run with -a -q, which uses the list without showing it to anyone --
+# see the same list, with the broken entries already gone.
 EDIT_LIST () {
     FORMAT_LIST
+    LOAD_LINKS
+    VALIDATE_LINKS
     if [[ $all_files == True ]]; then
         if [[ $quiet != True ]]; then
             pick_list
@@ -1804,6 +2017,7 @@ cat > "$scriptfile" << EOF
 $(open_cmd)
 cd "$remote_dl_dir"
 $(set_opts)
+$(DLPRUNE)
 $(DLDR)
 $(DLFL)
 $(DLRM)
@@ -1911,6 +2125,29 @@ DLRM () {
             echo "rm -f \"$line\"; !echo UNLINKED: \"$line\""
         fi
     done <<< "$LINESR"
+}
+
+#REMOVE BROKEN SYMLINKS
+# The links VALIDATE_LINKS found pointing at data that is gone. Nobody selected
+# them -- they are already out of the listing -- so this is housekeeping the
+# session does on its way past. -do leaves the remote alone entirely, and
+# --dry-run says what it would have removed.
+DLPRUNE () {
+    if [[ $norm == True ]]; then
+        return 0
+    fi
+    while read -r rawline; do
+        rawline=$(echo "$rawline" | sed 's|SsS$| |')
+        if [[ -z $rawline ]]; then
+            continue
+        fi
+        line=$(echo "$rawline" | sed 's/\[/"\["/g')
+        if [[ $dry_run == True ]]; then
+            echo "!echo DRY-RUN: rm broken \"$line\""
+        else
+            echo "rm -f \"$line\"; !echo PRUNED: \"$line\""
+        fi
+    done <<< "$LINESB"
 }
 
 COMPLETE () {

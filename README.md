@@ -157,6 +157,26 @@ here.
 A `-` entry is never downloaded: its symlink is removed from the remote directory and that is all.
 (`-cl` still does that to everything in one go; `d` is the per-entry version of it.)
 
+### Broken symlinks
+A completed directory is symlinks into the data directory, and it collects broken ones: the data
+behind a link is removed and the link outlives it. Those entries can only fail to download, so
+alftp leaves them out of the list before you ever see it, removes them from the remote in the same
+session that does the downloading, and says how many it found:
+
+```
+alftp: pruning 2 broken symlink(s) from /remote/complete/TV
+```
+
+It works this out from a long listing (`ls -l`) of the completed directory taken alongside the
+normal one: a link whose target lands in the data directory is broken exactly when the data
+directory's own listing no longer has it. Anything it cannot check that way — a target pointing
+somewhere else entirely, a target deeper in than the listing goes, or a line whose format it did not
+recognise — is left exactly where it is. It never removes a link it could not prove is broken.
+
+`prune_broken=False` in the config turns the whole thing off, `--dry-run` prints what it would have
+removed without touching the remote, and `-do` (which never removes anything from the remote) leaves
+the links in place while still keeping them out of the list.
+
 ### The editor
 `--editor` (or `-e`), or `picker=editor` in the config, hands the list file to `$editor` instead.
 The UI also steps aside on its own — without a terminal (a cron job, output redirected to a file),
@@ -203,7 +223,8 @@ To see what a profile would transfer without downloading anything, add `--dry-ru
 $ alftp -a docs --dry-run
 ```
 Directories are listed via `lftp mirror --dry-run`, files are printed rather than fetched, nothing
-is removed from the remote, and no post-processing (unrar, permissions) runs.
+is removed from the remote — broken symlinks included, which are printed instead of pruned — and no
+post-processing (unrar, permissions) runs.
 
 ## HOW A RUN CONNECTS
 By default a run is a single lftp login. The one session lists the remote directory, shells out to
