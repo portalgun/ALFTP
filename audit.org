@@ -7,8 +7,7 @@ portability, and suggested improvements. Line numbers refer to the current
 working-tree version of =alftp=.
 
 * Critical / Confirmed Bugs
-
-** SSH key configuration (~keyfile~) never reaches lftp
+** X SSH key configuration (~keyfile~) never reaches lftp
    :PROPERTIES:
    :LOCATION: alftp:368-370
    :END:
@@ -33,7 +32,7 @@ working-tree version of =alftp=.
   dangling since the help text and =alftp.conf.template= advertise them as
   real, working options:
 
-  - *Session locking* — the help text's default-action description promises
+  - X *Session locking* — the help text's default-action description promises
     "Lock the current session" / "Check for previous session's download and
     prompt for its check/completion" (alftp:55-56), and ~COMPLETE~ removes
     the lock file (now ~/tmp/alftp.lock~) — but nothing ever creates that lock
@@ -41,16 +40,20 @@ working-tree version of =alftp=.
     ~prevsession=0~ (alftp:375-376) look like leftover scaffolding for this
     and are never read again. Net effect: nothing stops two concurrent alftp
     runs from clobbering the same list files / lftp session.
-  - *~-n~ (new_only)* — variable is set (alftp:310) but never consulted
+  - X *~-n~ (new_only)* — variable is set (alftp:310) but never consulted
     anywhere else in the script.
-  - *~-o~ (old_only)* — only effect is to skip the entire
+        - see next item
+  - X *~-o~ (old_only)* — only effect is to skip the entire
     download/list-creation block in ~NEW_SESSION~ (alftp:405); there is no
     actual "resume/finish old session" logic, so ~-o~ just does nothing
     rather than the "checks/finishes old download only" behavior the help
     text describes.
-  - *~-fs~ (print_fs / filesize)* — variable set (alftp:320) but unused; the
+        - remove -n and -o and opt for -c or --continue, which reads last sessions listfile if it exists and continue where it left off.
+        
+  - X *~-fs~ (print_fs / filesize)* — variable set (alftp:320) but unused; the
     TODO block (alftp:30-38) contains the intended ~awk~/~numfmt~/~df~/~bc~
     pseudocode for computing and displaying transfer sizes, never wired up.
+        - replace with -ls which shows filenames, their size, and creation date.
   - *~-rm~ (rm_remote)* — variable set (alftp:330) but unused; nothing in
     ~DLDR~/~DLFL~/~DOWNLD~ issues a remote delete beyond removing the
     completion symlink, so "remove files from remote location once download
@@ -60,27 +63,30 @@ working-tree version of =alftp=.
     successfully downloaded"), and ~-r~ is supposed to suppress appending to
     it, but no code anywhere reads ~$record~ or appends to any such file.
     Both the base feature and its suppression flag are entirely absent.
-  - *~errors~ / ~verify~ config keys* — documented in
+  - X *~errors~ / ~verify~ config keys* — documented in
     ~alftp.conf.template~ ("where to log errors" / "store xfer verify logs to
     verify data once downloaded") but never referenced in ~alftp~.
-  - *~autoUncompress~ config key* — documented in
+  - X *~autoUncompress~ config key* — documented in
     ~alftp.conf.template~ as the way to opt in to automatic decompression,
     but the actual code path unrars *unconditionally* unless ~-nu~ is passed
     (alftp:430), and ~$autoUncompress~ is never read. Behavior is inverted
     from what's documented, and the documented knob is dead.
-  - *GPG-encrypted config* — the help text's default action list literally
+        - make the default for this False if it isnt already
+  - X *GPG-encrypted config* — the help text's default action list literally
     says "Read config file and *gpg file* variables" (alftp:53), but no gpg
     invocation exists anywhere in the script. Passwords are plain text only
     (see Security section).
+        - add gpg_file config variable, which specifies is specified by a path
   - *~chkrmd~ / ~chkrmf~* (alftp:558-568) — defined, never called from
     anywhere. Likely meant to clean up stale local directories/files (maybe
     tied to the missing "old session" handling) but currently dead code.
-  - *checksum verification* — listed in the TODO block, not implemented; ties
+  - X *checksum verification* — listed in the TODO block, not implemented; ties
     into the also-unused ~verify~ config key above.
+        - make this "checsum=True/False' variable in config, and default it to False.
 
 * Security Concerns
 
-  - *Password exposure via process list*: ~lftp -p $port -u
+  - X *Password exposure via process list*: ~lftp -p $port -u
     $username,$password $server~ put the plaintext password on the command
     line, visible to any local user via ~ps~/~/proc~. *Fixed*: every session
     now starts with an ~open --user ... --password ...~ line inside the
@@ -92,7 +98,9 @@ working-tree version of =alftp=.
     despite the help text implying gpg-backed secrets were intended.
     Consider: lftp's ~.netrc~ support, prompting interactively when password
     is unset, or actually implementing the gpg-file idea from the help text.
-  - *~eval~ over untrusted-ish input*: ~eval_local_config~ and
+        - prompt for password if no keyfile, gpg-file doesn't provide password, and no password is provided
+       
+  - X *~eval~ over untrusted-ish input*: ~eval_local_config~ and
     ~eval_remote_config~ (alftp:169-197) both ~eval~ chunks of
     ~alftp.src.conf~ built via ~awk~/~sed~ text surgery. This is inherent to
     the "profiles are bash snippets" design (documented in README), so it's
@@ -100,12 +108,13 @@ working-tree version of =alftp=.
     profile file is arbitrary code execution with no sandboxing — worth a
     one-line callout in the README/config template so users don't treat
     ~alftp.src.conf~ as inert data.
-  - *~chmod -R 777~ on downloaded directories* (alftp:433, and in ~DLDR~'s
+  - X *~chmod -R 777~ on downloaded directories* (alftp:433, and in ~DLDR~'s
     ~norm~ branch messaging) makes downloaded content world-writable. This is
     unusually permissive for content just pulled from a remote server;
     ~755~/~775~ would cover the typical "I want to read/browse this as
     another local user" use case without making it group/world-writable too.
-  - *Regex-injection via hostname / default_server*: see the "Unescaped
+        - Add the ability to specify what permissions should be applied to downloaded files and directories via perms_dirs, and perms_files in the config.  These should be the three digits, unix format and should default to 744 for directories and 644 for files. A third option should toggle whether these are applied altogether chmod=True or chmod=False. Also add the ability to specify whether the owner should be changed for files and directories via option 'owner', and to toggle whether this is applied via chown=True or chown=False. 
+  - X *Regex-injection via hostname / default_server*: see the "Unescaped
     values embedded into awk regex" bug below — while not exploitable
     remotely, a server name or hostname containing regex metacharacters can
     silently corrupt profile matching.
@@ -126,7 +135,7 @@ working-tree version of =alftp=.
    locking" above), so this stays open until locking is implemented or the
    help text stops promising it.
 
-** No traps set despite ~COMPLETE~ clearing them
+** X No traps set despite ~COMPLETE~ clearing them
    :PROPERTIES:
    :LOCATION: alftp:548
    :END:
@@ -137,7 +146,7 @@ working-tree version of =alftp=.
    them in the first place, so there's no cleanup (temp files, lock file,
    partial list files) if the user Ctrl-C's mid-transfer.
 
-** No strict-mode / typo protection
+** X No strict-mode / typo protection
    Several of the bugs above (~sourcelfag~, ~$list_file~) are exactly the
    class of error ~set -u~ (nounset) catches immediately at runtime instead
    of silently misbehaving. ~set -u~ is now on (see Completed); ~-e~ and
@@ -164,7 +173,7 @@ working-tree version of =alftp=.
     implement the documented behavior or remove the flag/config key and its
     mention in the help text and ~alftp.conf.template~ so the documented
     surface area matches what actually works.
-  - *Structured logging*: right now the "record"/"errors" story is entirely
+  - X *Structured logging*: right now the "record"/"errors" story is entirely
     aspirational (see above); a real implementation could log
     profile/timestamp/file/status lines to ~$record~, giving users an actual
     audit trail of what was downloaded when — which is explicitly promised in

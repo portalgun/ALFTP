@@ -18,7 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install bats
-        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Install bats and lftp
+        # lftp speaks file://, which is what tests/integration.bats uses as its
+        # server; no daemon has to be started for it.
+        run: sudo apt-get update && sudo apt-get install -y bats lftp
       - name: Test
         run: bats tests
