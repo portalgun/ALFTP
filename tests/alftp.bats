@@ -169,6 +169,144 @@ stage() {
     [ "$output" = "rd=[/tmp/alftp-test/important] port=[2222] srv=[example.com]" ]
 }
 
+@test "-t and -e choose the picker, later flags winning" {
+    run stage 'ARGSC -ld /local -rd /remote --tui; echo "$picker"'
+    [ "$output" = "tui" ]
+    run stage 'ARGSC -ld /local -rd /remote -t -e; echo "$picker"'
+    [ "$output" = "editor" ]
+    run stage 'ARGSC -ld /local -rd /remote; echo "[$picker]"'
+    [ "$output" = "[]" ]
+}
+
+@test "tui_usable refuses a terminal that cannot drive the UI" {
+    run stage 'picker=editor; tui_usable; echo "$?: $tui_why"'
+    [ "$output" = "1: picker is set to editor" ]
+    # bats runs without a terminal, which is itself a reason to fall back.
+    run stage 'TERM=dumb; tui_usable; echo "$?: $tui_why"'
+    [ "$output" = "1: TERM is unset or dumb" ]
+}
+
+@test "pick_list falls back to the editor, commenting the list out for -i" {
+    listfile=$(mktemp)
+    log=$(mktemp)
+    printf '%s\n' 'file1  4.0K  2026-08-23 17:10' 'file2   753  2026-08-23 14:42' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; ind_files=True; picker=editor
+               editor="printf %s\n >> '"$log"' --"
+               pick_list; cat "$listfile"'
+    rm -f "$log"
+    # -i hands the editor a fully commented list for the user to uncomment.
+    [ "${lines[0]}" = "#file1  4.0K  2026-08-23 17:10" ]
+    [ "${lines[1]}" = "#file2   753  2026-08-23 14:42" ]
+    rm -f "$listfile"
+}
+
+@test "tui_load starts everything deselected and drops the comment markers" {
+    listfile=$(mktemp)
+    printf '%s\n' 'file1  4.0K  2026-08-23 17:10' '#file2   753  2026-08-23 14:42' '' \
+                  'dir1/   24K  2026-08-22 09:03' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; tui_load
+               echo "$TUI_N ${TUI_SEL[*]} [${TUI_RAW[1]}]"'
+    rm -f "$listfile"
+    [ "$output" = "3 0 0 0 [file2   753  2026-08-23 14:42]" ]
+}
+
+@test "tui_save comments out everything that was not selected" {
+    listfile=$(mktemp)
+    printf '%s\n' 'file1  4.0K  2026-08-23 17:10' 'file2   753  2026-08-23 14:42' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; tui_load; TUI_SEL[1]=1; tui_save; cat "$listfile"'
+    rm -f "$listfile"
+    [ "${lines[0]}" = "#file1  4.0K  2026-08-23 17:10" ]
+    [ "${lines[1]}" = "file2   753  2026-08-23 14:42" ]
+}
+
+@test "tui_widths measures the columns for the header" {
+    listfile=$(mktemp)
+    printf '%s\n' 'a.file.with.a.long.name  4.0K  2026-08-23 17:10' \
+                  '#dir/                          2026-08-22 09:03' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; tui_widths; echo "$tui_namew $tui_sizew"'
+    rm -f "$listfile"
+    [ "$output" = "23 4" ]
+}
+
+@test "tui_key_action maps letters and escape sequences to the same actions" {
+    run stage 'for k in j "$(printf "\e[B")" k "$(printf "\e[A")" 0 "$(printf "\e[1~")" \
+                        G "$(printf "\e[F")" "$(printf "\e[5~")" "$(printf "\e[6~")" \
+                        " " "$(printf "\r")" a A q "$(printf "\e")" x; do
+                   tui_key_action "$k"; printf "%s " "$tui_action"
+               done'
+    [ "$output" = "down down up up top top bottom bottom pgup pgdn toggle toggle all none quit quit ignore " ]
+}
+
+@test "tui_move clamps at both ends and scrolls to keep the cursor visible" {
+    run stage 'TUI_N=20; TUI_ROWS=5; tui_cur=0; tui_top=0
+               tui_action=up; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
+               for i in 1 2 3 4 5 6; do tui_action=down; tui_move; done
+               printf "%s/%s " "$tui_cur" "$tui_top"
+               tui_action=pgdn; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
+               tui_action=pgup; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
+               tui_action=bottom; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
+               tui_action=down; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
+               tui_action=top; tui_move; printf "%s/%s" "$tui_cur" "$tui_top"'
+    [ "$output" = "0/0 6/2 11/7 6/6 19/15 19/15 0/0" ]
+}
+
+@test "tui_move never scrolls a list that fits on the screen" {
+    run stage 'TUI_N=3; TUI_ROWS=5; tui_cur=0; tui_top=0
+               tui_action=bottom; tui_move; echo "$tui_cur/$tui_top"'
+    [ "$output" = "2/0" ]
+}
+
+# The event loop, driven by a scripted key source instead of a terminal: the
+# draw goes to /dev/null and tui_read_key pops a key off an array.
+keys () {
+    cat <<'SNIP'
+    exec {TUI_OUT}>/dev/null
+    TUI_RAW=(one two three four five); TUI_N=5
+    TUI_LINES=10; TUI_COLS=40; TUI_ROWS=5; remote_dl_dir=/remote
+    tui_cur=0; tui_top=0; tui_nsel=0; tui_prompt=""; tui_resized=0
+    TUI_SEL=(0 0 0 0 0); KI=0
+    tui_read_key () {
+        if (( KI >= ${#KEYS[@]} )); then return 1; fi
+        TUI_KEY=${KEYS[KI]}; KI=$(( KI + 1 )); return 0
+    }
+SNIP
+}
+
+@test "space and enter toggle the item under the cursor, q then s saves" {
+    run stage "$(keys)"'
+               printf -v NL "\n"
+               KEYS=(" " j "$NL" q s); tui_loop
+               echo "${TUI_SEL[*]} $tui_nsel $tui_result"'
+    [ "$output" = "1 1 0 0 0 2 save" ]
+}
+
+@test "a selects everything and A clears it again" {
+    run stage "$(keys)"'
+               KEYS=(a q s); tui_loop; echo "${TUI_SEL[*]} $tui_nsel"
+               KI=0; KEYS=(a A q s); tui_loop; echo "${TUI_SEL[*]} $tui_nsel"'
+    [ "${lines[0]}" = "1 1 1 1 1 5" ]
+    [ "${lines[1]}" = "0 0 0 0 0 0" ]
+}
+
+@test "the quit dialog cancels back to the list, saves, or exits" {
+    run stage "$(keys)"'
+               KEYS=(" " q c j " " q s); tui_loop
+               echo "cancel-then-save: ${TUI_SEL[*]} $tui_result"'
+    [ "$output" = "cancel-then-save: 1 1 0 0 0 save" ]
+    run stage "$(keys)"'
+               KEYS=(" " q e); tui_loop; echo "exit: $tui_result"'
+    [ "$output" = "exit: exit" ]
+}
+
+@test "G jumps to the last item and the arrow keys move too" {
+    run stage "$(keys)"'
+               KEYS=(G " " q s); tui_loop; echo "${TUI_SEL[*]}"
+               KI=0; TUI_SEL=(0 0 0 0 0); tui_cur=0; tui_top=0; tui_nsel=0
+               KEYS=("$(printf "\e[B")" "$(printf "\e[B")" " " q s); tui_loop; echo "${TUI_SEL[*]}"'
+    [ "${lines[0]}" = "0 0 0 0 1" ]
+    [ "${lines[1]}" = "0 0 1 0 0" ]
+}
+
 @test "FORMAT_LIST puts the name first and lines the columns up" {
     listfile=$(mktemp)
     printf '%s\n' '    4.0K 2026-08-23 17:10 tests/' \

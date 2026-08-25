@@ -88,7 +88,46 @@ as `dl_dir_tv_shows`.
 override where a profile is fetched *from*, use `remote_dl_dir_<profile>`, which takes precedence
 over the usual fallback of using the profile name as the remote directory.
 
-When using the -i flag, a list of available files to download will be displayed as commented lines.
+## PICKING FILES
+With `-i` or `-a`, alftp shows you what the remote directory holds and you pick what to fetch. That
+happens in the terminal UI by default, and in `$editor` where the terminal cannot drive a UI.
+
+### The terminal UI
+```
+ alftp  /remote/dir                                     2 of 27 selected
+  NAME                       SIZE  DATE
++ Some.Release.2026-GRP/     4.1G  2026-08-23 17:10
+  Another.Release-GRP/       2.7G  2026-08-23 14:42
++ notes.nfo                  2.1K  2026-08-22 09:03
+ j/k move  space toggle  a all  A none  q quit   1-9/27
+```
+The far-left column is the selection: `+` is going to be downloaded, blank is not. **Everything
+starts deselected** — `a` selects the lot if that is what you want, `A` clears it again.
+
+| key | |
+| --- | --- |
+| `j` / `k`, `↓` / `↑` | move down / up |
+| `space`, `enter` | toggle the item under the cursor |
+| `PgDn` / `PgUp` | move a screen at a time |
+| `0` / `Home`, `G` / `End` | jump to the top / bottom |
+| `a` / `A` | select all / select none |
+| `q` / `Esc` | quit, which asks first |
+
+`q` asks `(c)ancel`, `(s)ave and download`, or `(e)xit without downloading`. Cancel puts you back in
+the list; save writes your selection to the list file and the download starts; exit leaves the list
+file empty, so nothing is downloaded and the run ends. `Ctrl-C` does the same as exit.
+
+### The editor
+`--editor` (or `-e`), or `picker=editor` in the config, hands the list file to `$editor` instead.
+The UI also steps aside on its own — without a terminal (a cron job, output redirected to a file),
+without `tput`, with `TERM` unset or `dumb`, or in a window too small to draw in — so a run never
+fails just because it could not open a UI. `--tui` (`-t`) asks for the UI explicitly, and says why
+it fell back if it could not run.
+
+Editing the list file directly, the convention is the reverse of the UI's: a line that is commented
+out is not downloaded, and the file arrives fully commented under `-i` for you to uncomment what you
+want.
+
 Each line is three columns — name, size, modification date:
 ```
 #file1                4.0K  2026-08-23 17:10

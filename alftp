@@ -96,6 +96,9 @@ Options:
 --dry-run (-dr) print what would be transferred without downloading anything
 --dir-sizes (-ds) fill in the size column for directories, which the remote
                 listing omits; costs a recursive walk of the remote directory
+--tui (-t)       pick files in the terminal UI (the default where the terminal
+                supports it)
+--editor (-e)    pick files in \$editor instead of the terminal UI
 --two-session   use one lftp login for the listing and a second for the
                 download, instead of doing both in a single session
 "
@@ -120,6 +123,10 @@ logfile="$HOME/.cache/alftp/alftp.log"
 
 # Editor used to pick files out of the listing (defaults to $EDITOR, then vi)
 #editor=vim
+
+# How to pick files: "tui" for the terminal UI, "editor" for $editor. Unset
+# means the UI wherever the terminal supports it, and $editor otherwise.
+#picker=tui
 
 # Remote defaults. Usually set per profile in alftp.src.conf instead.
 #server=example.com
@@ -147,6 +154,21 @@ sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
 profilevar=""; override=""
 LINESD=""; LINESF=""; oldfile=""; listfile2=""; dirname=""
 two_session=""; self=""; ARGV=(); dir_sizes=""; listfile3=""
+
+# The file picker: "tui" for the terminal UI, "editor" for $editor, empty to
+# use the UI wherever the terminal can drive it. Its state lives here too --
+# TUI_RAW holds one line of the listing per entry and TUI_SEL its "+" flag.
+picker=""; tui_why=""; tui_result=""; tui_answer=""; tui_prompt=""
+tui_action=""; tui_fitted=""; tui_scratch=""; tui_line=""; tui_out=""
+tui_left=""; tui_right=""; tui_pad=0; tui_i=0
+tui_cur=0; tui_top=0; tui_nsel=0; tui_resized=0; tui_open_flag=0
+tui_namew=0; tui_sizew=0; tui_saved_stty=""
+tui_saved_int=""; tui_saved_term=""; tui_saved_winch=""
+TUI_RAW=(); TUI_SEL=(); TUI_N=0; TUI_KEY=""
+TUI_IN=0; TUI_OUT=1; tui_owns_fd=0; tui_dev_tty=0
+TUI_LINES=0; TUI_COLS=0; TUI_ROWS=0
+t_smcup=""; t_rmcup=""; t_civis=""; t_cnorm=""; t_clear=""; t_home=""
+t_el=""; t_rev=""; t_bold=""; t_dim=""; t_sgr0=""
 
 server=""; username=""; password=""; port=""; keyfile=""
 default_server=""; complete_dir=""; data_dir=""
@@ -463,6 +485,12 @@ ARGSC () {
             -ds|--dir-sizes)
                 dir_sizes=True
                 ;;
+            -t|--tui)
+                picker=tui
+                ;;
+            -e|--editor)
+                picker=editor
+                ;;
             --two-session)
                 two_session=True
                 ;;
@@ -767,17 +795,505 @@ FORMAT_LIST () {
     rm -f "$tmpfile"
 }
 
+# ------------------------------------------------------------------- PICKER --
+# The listing is picked either in $editor (the original way) or in the terminal
+# UI below, which is the default wherever the terminal can drive it. There are
+# no curses bindings for bash, so the UI is terminfo strings from tput written
+# to whichever fds reach the terminal -- /dev/tty when there is one, stdin and
+# stdout otherwise, which is what makes it work in the single-session path,
+# where this code runs inside the "!" shell-out from lftp.
+
+# What the UI needs. Anything missing (no terminal, no terminfo, a terminal too
+# small or too dumb) falls back to $editor instead of failing the run; $tui_why
+# says which requirement was the problem.
+tui_usable () {
+    tui_why=""
+    if [[ $picker == editor ]]; then
+        tui_why="picker is set to editor"
+        return 1
+    fi
+    if ! command -v tput > /dev/null 2>&1; then
+        tui_why="tput (ncurses) is not installed"
+        return 1
+    fi
+    if [[ -z ${TERM:-} ]] || [[ $TERM == dumb ]]; then
+        tui_why="TERM is unset or dumb"
+        return 1
+    fi
+    # /dev/tty is the first choice, but lftp's "!" hands its child the
+    # terminal on stdin/stdout without a controlling terminal (tpgid -1), and
+    # that is where this runs in the single-session path -- so stdin/stdout
+    # are a perfectly good fallback, and only having neither rules the UI out.
+    tui_dev_tty=0
+    if ( : <> /dev/tty ) 2> /dev/null; then
+        tui_dev_tty=1
+    elif [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+        tui_why="not attached to a terminal"
+        return 1
+    fi
+    tui_caps
+    if [[ -z $t_rev ]] || [[ -z $t_sgr0 ]]; then
+        tui_why="terminfo has no reverse video for $TERM"
+        return 1
+    fi
+    tui_size
+    if (( TUI_LINES < 6 )) || (( TUI_COLS < 20 )); then
+        tui_why="terminal is only ${TUI_COLS}x${TUI_LINES}"
+        return 1
+    fi
+    return 0
+}
+
+# Every capability is looked up once: each tput is a fork, and the UI redraws
+# on every keystroke. A capability the terminal lacks comes back empty, which
+# is exactly what should then be printed for it.
+tui_caps () {
+    t_smcup=$(tput smcup 2> /dev/null)
+    t_rmcup=$(tput rmcup 2> /dev/null)
+    t_civis=$(tput civis 2> /dev/null)
+    t_cnorm=$(tput cnorm 2> /dev/null)
+    t_clear=$(tput clear 2> /dev/null)
+    t_home=$(tput home 2> /dev/null)
+    t_el=$(tput el 2> /dev/null)
+    t_rev=$(tput rev 2> /dev/null)
+    t_bold=$(tput bold 2> /dev/null)
+    t_dim=$(tput dim 2> /dev/null)
+    t_sgr0=$(tput sgr0 2> /dev/null)
+}
+
+# stty knows the size of the terminal even when stdout is a pipe, which tput
+# does not; tput is the fallback and a sane 80x24 the fallback of last resort.
+tui_size () {
+    if [[ $tui_dev_tty == 1 ]]; then
+        tui_scratch=$(stty size < /dev/tty 2> /dev/null) || tui_scratch=""
+    else
+        tui_scratch=$(stty size <&"$TUI_IN" 2> /dev/null) || tui_scratch=""
+    fi
+    TUI_LINES=${tui_scratch%% *}
+    TUI_COLS=${tui_scratch##* }
+    if [[ ! $TUI_LINES =~ ^[1-9][0-9]*$ ]]; then
+        TUI_LINES=$(tput lines 2> /dev/null)
+    fi
+    if [[ ! $TUI_COLS =~ ^[1-9][0-9]*$ ]]; then
+        TUI_COLS=$(tput cols 2> /dev/null)
+    fi
+    if [[ ! $TUI_LINES =~ ^[1-9][0-9]*$ ]]; then
+        TUI_LINES=24
+    fi
+    if [[ ! $TUI_COLS =~ ^[1-9][0-9]*$ ]]; then
+        TUI_COLS=80
+    fi
+    tui_rows_calc
+}
+
+# Rows left for the list once the title, the column header and the footer have
+# had their line each.
+tui_rows_calc () {
+    TUI_ROWS=$(( TUI_LINES - 3 ))
+    if (( TUI_ROWS < 1 )); then
+        TUI_ROWS=1
+    fi
+}
+
+# Read the list the user is choosing from. A leading "#" is how the editor
+# convention marks a line as not wanted, so it comes off here -- everything
+# starts deselected either way, and "a" is one keystroke away.
+tui_load () {
+    TUI_RAW=()
+    TUI_SEL=()
+    while IFS= read -r tui_scratch || [[ -n $tui_scratch ]]; do
+        tui_scratch=${tui_scratch#\#}
+        if [[ -z ${tui_scratch//[[:space:]]/} ]]; then
+            continue
+        fi
+        TUI_RAW+=("$tui_scratch")
+        TUI_SEL+=(0)
+    done < "$listfile"
+    TUI_N=${#TUI_RAW[@]}
+}
+
+# Write the selection back in the form TYPE reads: chosen lines uncommented,
+# the rest commented out, columns untouched.
+tui_save () {
+    tui_scratch=$(mktemp "${TMPDIR:-/tmp}/alftp.sel.XXXXXX")
+    for (( tui_i = 0; tui_i < TUI_N; tui_i++ )); do
+        if [[ ${TUI_SEL[tui_i]} == 1 ]]; then
+            printf '%s\n' "${TUI_RAW[tui_i]}"
+        else
+            printf '#%s\n' "${TUI_RAW[tui_i]}"
+        fi
+    done > "$tui_scratch" && mv "$tui_scratch" "$listfile"
+    rm -f "$tui_scratch"
+}
+
+# Column widths for the header labels, found the same way strip_columns finds
+# the name: the leftmost "  size  date time" tail, with the size possibly
+# empty (directories). Intervals are spelled out because not every awk has
+# {n,m}.
+tui_widths () {
+    tui_scratch=$(sed 's/^#//' "$listfile" | awk '
+        {
+            if (match($0, /[ \t][ \t]+[^ \t]*[ \t]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9][ \t]*$/)) {
+                nm = substr($0, 1, RSTART - 1)
+                n = split(substr($0, RSTART), f, /[ \t]+/)
+                sz = (n >= 4) ? f[2] : ""
+                if (length(nm) > nw) { nw = length(nm) }
+                if (length(sz) > sw) { sw = length(sz) }
+            } else if (length($0) > nw) {
+                nw = length($0)
+            }
+        }
+        END { print nw+0, sw+0 }
+    ')
+    tui_namew=${tui_scratch%% *}
+    tui_sizew=${tui_scratch##* }
+}
+
+# Cut a line to the width of the terminal so nothing wraps and shifts the rest
+# of the screen down.
+tui_fit () {
+    if (( $2 <= 0 )); then
+        tui_fitted=""
+    elif (( ${#1} > $2 )); then
+        tui_fitted=${1:0:$2}
+    else
+        tui_fitted=$1
+    fi
+}
+
+# One screen, built as a single string and written in one go: no cursor
+# addressing (that would be a tput fork per row) and no flicker. Every line is
+# padded and cleared to the right edge, so what was there before is covered.
+tui_draw () {
+    tui_left="alftp  ${remote_dl_dir}"
+    tui_right="${tui_nsel} of ${TUI_N} selected"
+    tui_pad=$(( TUI_COLS - ${#tui_left} - ${#tui_right} - 2 ))
+    if (( tui_pad < 1 )); then
+        tui_fit "$tui_left" $(( TUI_COLS - ${#tui_right} - 3 ))
+        tui_left=$tui_fitted
+        tui_pad=1
+    fi
+    printf -v tui_line ' %s%*s%s ' "$tui_left" "$tui_pad" "" "$tui_right"
+    tui_fit "$tui_line" "$TUI_COLS"
+    tui_out="${t_home}${t_rev}${tui_fitted}${t_sgr0}${t_el}"$'\n'
+
+    # Column header, lined up with the two-column selection gutter.
+    printf -v tui_line '  %-*s  %*s  %s' "$tui_namew" "NAME" "$tui_sizew" "SIZE" "DATE"
+    tui_fit "$tui_line" "$TUI_COLS"
+    tui_out+="${t_bold}${tui_fitted}${t_sgr0}${t_el}"$'\n'
+
+    for (( tui_i = tui_top; tui_i < tui_top + TUI_ROWS; tui_i++ )); do
+        if (( tui_i < TUI_N )); then
+            if [[ ${TUI_SEL[tui_i]} == 1 ]]; then
+                tui_line="+ ${TUI_RAW[tui_i]}"
+            else
+                tui_line="  ${TUI_RAW[tui_i]}"
+            fi
+            tui_fit "$tui_line" "$TUI_COLS"
+            if (( tui_i == tui_cur )); then
+                printf -v tui_line '%-*s' "$TUI_COLS" "$tui_fitted"
+                tui_out+="${t_rev}${tui_line}${t_sgr0}${t_el}"$'\n'
+            else
+                tui_out+="${tui_fitted}${t_el}"$'\n'
+            fi
+        else
+            tui_out+="${t_el}"$'\n'
+        fi
+    done
+
+    if [[ -n $tui_prompt ]]; then
+        tui_fit "$tui_prompt" "$TUI_COLS"
+        printf -v tui_line '%-*s' "$TUI_COLS" "$tui_fitted"
+        tui_out+="${t_rev}${tui_line}${t_sgr0}${t_el}"
+    else
+        tui_line="j/k move  space toggle  a all  A none  q quit"
+        if (( TUI_N > TUI_ROWS )); then
+            printf -v tui_line '%s   %s-%s/%s' "$tui_line" \
+                "$(( tui_top + 1 ))" "$(( tui_top + TUI_ROWS < TUI_N ? tui_top + TUI_ROWS : TUI_N ))" "$TUI_N"
+        fi
+        tui_fit " $tui_line" "$TUI_COLS"
+        tui_out+="${t_dim}${tui_fitted}${t_sgr0}${t_el}"
+    fi
+    printf '%s' "$tui_out" >&"$TUI_OUT"
+}
+
+# One keystroke, or one escape sequence: after ESC the rest of the sequence is
+# already in the buffer, so a short timeout tells a real arrow key from a bare
+# ESC without making the UI feel sluggish.
+tui_read_key () {
+    TUI_KEY=""
+    IFS= read -rN1 -u "$TUI_IN" TUI_KEY || return 1
+    if [[ $TUI_KEY == $'\e' ]]; then
+        while IFS= read -rN1 -t 0.05 -u "$TUI_IN" tui_scratch; do
+            TUI_KEY+=$tui_scratch
+            if [[ $tui_scratch == [A-Za-z~] ]]; then
+                break
+            fi
+        done
+    fi
+    return 0
+}
+
+# Keys to actions. Both the letter and the escape-sequence spelling of every
+# movement key land here, which is also what makes the mapping testable
+# without a terminal.
+tui_key_action () {
+    case $1 in
+        j|$'\e[B'|$'\eOB')                     tui_action=down ;;
+        k|$'\e[A'|$'\eOA')                     tui_action=up ;;
+        0|$'\e[H'|$'\eOH'|$'\e[1~'|$'\e[7~')   tui_action=top ;;
+        G|$'\e[F'|$'\eOF'|$'\e[4~'|$'\e[8~')   tui_action=bottom ;;
+        $'\e[5~')                              tui_action=pgup ;;
+        $'\e[6~')                              tui_action=pgdn ;;
+        ' '|$'\n'|$'\r')                       tui_action=toggle ;;
+        a)                                     tui_action=all ;;
+        A)                                     tui_action=none ;;
+        q|$'\e')                               tui_action=quit ;;
+        $'\f')                                 tui_action=redraw ;;
+        *)                                     tui_action=ignore ;;
+    esac
+}
+
+tui_move () {
+    case $tui_action in
+        up)     if (( tui_cur > 0 )); then tui_cur=$(( tui_cur - 1 )); fi ;;
+        down)   if (( tui_cur < TUI_N - 1 )); then tui_cur=$(( tui_cur + 1 )); fi ;;
+        top)    tui_cur=0 ;;
+        bottom) tui_cur=$(( TUI_N - 1 )) ;;
+        pgup)   tui_cur=$(( tui_cur - TUI_ROWS )) ;;
+        pgdn)   tui_cur=$(( tui_cur + TUI_ROWS )) ;;
+    esac
+    if (( tui_cur < 0 )); then
+        tui_cur=0
+    fi
+    if (( tui_cur > TUI_N - 1 )); then
+        tui_cur=$(( TUI_N - 1 ))
+    fi
+    tui_scroll
+}
+
+# Keep the cursor on screen, and the screen full: after a resize or a jump to
+# the end there is no reason to leave blank rows below the last entry.
+tui_scroll () {
+    if (( tui_cur < tui_top )); then
+        tui_top=$tui_cur
+    fi
+    if (( tui_cur >= tui_top + TUI_ROWS )); then
+        tui_top=$(( tui_cur - TUI_ROWS + 1 ))
+    fi
+    if (( tui_top > TUI_N - TUI_ROWS )); then
+        tui_top=$(( TUI_N - TUI_ROWS ))
+    fi
+    if (( tui_top < 0 )); then
+        tui_top=0
+    fi
+}
+
+tui_toggle () {
+    if [[ ${TUI_SEL[tui_cur]} == 1 ]]; then
+        TUI_SEL[tui_cur]=0
+        tui_nsel=$(( tui_nsel - 1 ))
+    else
+        TUI_SEL[tui_cur]=1
+        tui_nsel=$(( tui_nsel + 1 ))
+    fi
+}
+
+tui_set_all () {
+    for (( tui_i = 0; tui_i < TUI_N; tui_i++ )); do
+        TUI_SEL[tui_i]=$1
+    done
+    if [[ $1 == 1 ]]; then
+        tui_nsel=$TUI_N
+    else
+        tui_nsel=0
+    fi
+}
+
+# q asks before it does anything irreversible. Drawn as the footer of the
+# normal screen, so the list stays visible behind the question.
+tui_quit_prompt () {
+    tui_prompt="quit: (c)ancel   (s)ave and download   (e)xit without downloading"
+    tui_answer=""
+    while [[ -z $tui_answer ]]; do
+        tui_draw
+        if ! tui_read_key; then
+            tui_answer="exit"
+            break
+        fi
+        case $TUI_KEY in
+            c|C|$'\e')     tui_answer=cancel ;;
+            s|S)           tui_answer=save ;;
+            e|E|q|Q)       tui_answer="exit" ;;
+        esac
+    done
+    tui_prompt=""
+}
+
+# The event loop. Kept free of terminal setup so a test can drive it with a
+# stubbed tui_read_key and TUI_OUT pointed somewhere harmless.
+tui_loop () {
+    tui_result=""
+    while true; do
+        if [[ $tui_resized == 1 ]]; then
+            tui_resized=0
+            tui_size
+            tui_scroll
+            printf '%s' "$t_clear" >&"$TUI_OUT"
+        fi
+        tui_draw
+        if ! tui_read_key; then
+            tui_result="exit"
+            return 0
+        fi
+        tui_key_action "$TUI_KEY"
+        case $tui_action in
+            up|down|top|bottom|pgup|pgdn)
+                tui_move
+                ;;
+            toggle)
+                tui_toggle
+                ;;
+            all)
+                tui_set_all 1
+                ;;
+            none)
+                tui_set_all 0
+                ;;
+            redraw)
+                printf '%s' "$t_clear" >&"$TUI_OUT"
+                ;;
+            quit)
+                tui_quit_prompt
+                case $tui_answer in
+                    save)
+                        tui_result=save
+                        return 0
+                        ;;
+                    exit)
+                        tui_result="exit"
+                        return 0
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+tui_open () {
+    tui_owns_fd=0
+    if [[ $tui_dev_tty == 1 ]]; then
+        exec {TUI_IN}<> /dev/tty || return 1
+        TUI_OUT=$TUI_IN
+        tui_owns_fd=1
+    elif [[ -t 0 ]] && [[ -t 1 ]]; then
+        TUI_IN=0
+        TUI_OUT=1
+    else
+        return 1
+    fi
+    tui_open_flag=1
+    tui_saved_stty=$(stty -g <&"$TUI_IN" 2> /dev/null) || tui_saved_stty=""
+    # Raw enough to get a keystroke at a time with nothing echoed; bash's
+    # read -N would do most of this per call, but not between calls.
+    stty -echo -icanon min 1 time 0 <&"$TUI_IN" 2> /dev/null
+    tui_saved_int=$(trap -p INT)
+    tui_saved_term=$(trap -p TERM)
+    tui_saved_winch=$(trap -p WINCH)
+    trap 'tui_abort' INT TERM
+    trap 'tui_resized=1' WINCH
+    printf '%s%s%s' "$t_smcup" "$t_civis" "$t_clear" >&"$TUI_OUT"
+    return 0
+}
+
+tui_close () {
+    if [[ $tui_open_flag != 1 ]]; then
+        return 0
+    fi
+    tui_open_flag=0
+    printf '%s%s%s' "$t_sgr0" "$t_cnorm" "$t_rmcup" >&"$TUI_OUT"
+    if [[ -n $tui_saved_stty ]]; then
+        stty "$tui_saved_stty" <&"$TUI_IN" 2> /dev/null
+    fi
+    # Only a fd this opened is ours to close; stdin and stdout are not.
+    if [[ $tui_owns_fd == 1 ]]; then
+        exec {TUI_IN}>&-
+        tui_owns_fd=0
+    fi
+    TUI_IN=0
+    TUI_OUT=1
+    trap - INT TERM WINCH
+    if [[ -n $tui_saved_int ]]; then eval "$tui_saved_int"; fi
+    if [[ -n $tui_saved_term ]]; then eval "$tui_saved_term"; fi
+    if [[ -n $tui_saved_winch ]]; then eval "$tui_saved_winch"; fi
+}
+
+# Ctrl-C means "I did not choose anything": leave the list empty rather than
+# leaving whatever was on screen to be downloaded.
+tui_abort () {
+    tui_close
+    : > "$listfile"
+    echo "alftp: interrupted, nothing selected." >&2
+    exit 130
+}
+
+tui_select () {
+    tui_load
+    if (( TUI_N == 0 )); then
+        echo "alftp: the listing is empty, nothing to pick."
+        return 0
+    fi
+    if ! tui_open; then
+        tui_why="cannot open the terminal"
+        return 1
+    fi
+    tui_cur=0
+    tui_top=0
+    tui_nsel=0
+    tui_prompt=""
+    tui_resized=0
+    tui_size
+    tui_widths
+    tui_loop
+    tui_close
+    if [[ $tui_result == save ]]; then
+        tui_save
+        echo "alftp: saved $tui_nsel of $TUI_N item(s) to $listfile."
+    else
+        : > "$listfile"
+        echo "alftp: nothing selected."
+    fi
+    return 0
+}
+
+# Hand the listing to whichever picker is in play. Both leave $listfile in the
+# same state -- wanted lines uncommented, the rest commented out -- which is
+# all TYPE reads back.
+pick_list () {
+    if tui_usable && tui_select; then
+        return 0
+    fi
+    if [[ $picker == tui ]]; then
+        echo "alftp: using \$editor instead of the terminal UI ($tui_why)." >&2
+    fi
+    # The editor convention is the inverse of the UI's: with -i every entry is
+    # commented out for the user to uncomment what they want.
+    if [[ $ind_files == True ]]; then
+        sed -i 's/^\([^#]\)/#\1/g' "$listfile"
+    fi
+    $editor "$listfile"
+}
+
 # Let the user pick entries out of the listing. Shared by both paths: in the
 # single-session path this runs inside the lftp session, via EMIT_DL.
 EDIT_LIST () {
     FORMAT_LIST
     if [[ $all_files == True ]]; then
         if [[ $quiet != True ]]; then
-            $editor "$listfile"
+            pick_list
         fi
     elif [[ $ind_files == True ]]; then
-        sed -i 's/^\([^#]\)/#\1/g' "$listfile"
-        $editor "$listfile"
+        pick_list
     fi
 }
 

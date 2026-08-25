@@ -5,6 +5,8 @@
 #    remote_dl_dir  - directory to look in for files
 #    local_dl_dir   - directory to download to
 #    editor         - the editor you prefer to use
+#    picker         - (tui|editor|[unset]) how to choose files: the terminal UI, $editor,
+#                     or unset for the UI wherever the terminal supports it
 #    listfile       - where to download list of available files to
 #    logfile        - where lftp mirror writes its transfer log
 #    record         - list of everything that has been successfully downloaded
