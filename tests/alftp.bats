@@ -489,3 +489,225 @@ SNIP
     [ "${lines[0]}" = "a file  with spaces" ]
     [ "${lines[1]}" = "plain-name" ]
 }
+
+# ---------------------------------------------------------------- audit fixes
+
+@test "-c/--continue and -ls are parsed, and -ns only suspends the old list" {
+    run stage 'ARGSC -ld /l -rd d -c; echo "[$continue_prev]"'
+    [ "$output" = "[True]" ]
+    run stage 'ARGSC -ld /l -rd d --continue; echo "[$continue_prev]"'
+    [ "$output" = "[True]" ]
+    run stage 'ARGSC -ld /l -rd d -ls; echo "[$print_ls]"'
+    [ "$output" = "[True]" ]
+    run stage 'ARGSC -ld /l -rd d -ns; echo "[$suspend_old]"'
+    [ "$output" = "[True]" ]
+}
+
+@test "set_opts configures the ssh key, under either spelling, and only then" {
+    run stage 'set_opts | grep -c sftp:connect-program'
+    [ "$output" = "0" ]
+    run stage 'keyfile=/home/me/.ssh/id_ed25519; resolve_keyfile; set_opts | grep sftp'
+    [ "$output" = 'set sftp:connect-program "ssh -a -x -i /home/me/.ssh/id_ed25519"' ]
+    # The config in the wild spells it keyFile.
+    run stage 'keyFile=/home/me/.ssh/id_rsa; resolve_keyfile; set_opts | grep sftp'
+    [ "$output" = 'set sftp:connect-program "ssh -a -x -i /home/me/.ssh/id_rsa"' ]
+}
+
+@test "marked_entries reads +, - and unmarked lines and drops the columns" {
+    f=$(mktemp)
+    printf '%s\n' '+Rel.One-GRP@   4.1G  2026-08-23 17:10' \
+                  '-Rel.Two-GRP@   2.7G  2026-08-23 14:42' \
+                  '#notes.nfo      2.1K  2026-08-22 09:03' \
+                  '*Rel.Three-GRP@ 1.0G  2026-08-22 09:03' \
+                  'hand.edited.nfo  753  2026-08-22 09:03' > "$f"
+    run stage 'marked_entries "'"$f"'"'
+    rm -f "$f"
+    [ "${lines[0]}" = "$(printf '+\tRel.One-GRP@')" ]
+    [ "${lines[1]}" = "$(printf -- '-\tRel.Two-GRP@')" ]
+    [ "${lines[2]}" = "$(printf '+\thand.edited.nfo')" ]
+    [ "${#lines[@]}" -eq 3 ]
+}
+
+@test "-c carries the previous session's marks into a fresh listing" {
+    listfile=$(mktemp); oldfile=$(mktemp)
+    # What the picker saved last time ...
+    printf '%s\n' '+Rel.One-GRP@   4.1G  2026-08-23 17:10' \
+                  '-Rel.Two-GRP@   2.7G  2026-08-23 14:42' \
+                  '#notes.nfo      2.1K  2026-08-22 09:03' > "$oldfile"
+    # ... and this run's listing: the same two entries, plus a new one.
+    printf '%s\n' 'Rel.One-GRP@    4.1G  2026-08-24 17:10' \
+                  'Rel.Two-GRP@    2.7G  2026-08-24 14:42' \
+                  'brand.new.nfo    753  2026-08-24 09:03' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; oldfile="'"$oldfile"'"; CONTINUE_LIST
+               cat "$listfile"'
+    rm -f "$listfile" "$oldfile"
+    [[ "${lines[0]}" == *"carried over 2 mark(s)"* ]]
+    [ "${lines[1]}" = "+Rel.One-GRP@    4.1G  2026-08-24 17:10" ]
+    [ "${lines[2]}" = "-Rel.Two-GRP@    2.7G  2026-08-24 14:42" ]
+    # Anything the last run said nothing about starts unmarked, as always.
+    [ "${lines[3]}" = "brand.new.nfo    753  2026-08-24 09:03" ]
+}
+
+@test "-c with no previous list says so and changes nothing" {
+    listfile=$(mktemp); oldfile=$(mktemp)
+    printf '%s\n' 'only.nfo   753  2026-08-24 09:03' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; oldfile="'"$oldfile"'"; CONTINUE_LIST; cat "$listfile"'
+    rm -f "$listfile" "$oldfile"
+    [[ "${lines[0]}" == *"no previous session list"* ]]
+    [ "${lines[1]}" = "only.nfo   753  2026-08-24 09:03" ]
+}
+
+@test "-c puts last session's marks back into the picker's tree" {
+    run stage "$(tree)"'
+        printf "%s\n" "+Rel.One-GRP@   4.1G  2026-08-23 17:10" \
+                      "-Rel.Two-GRP@   2.7G  2026-08-23 14:42" \
+                      "#notes.nfo      2.1K  2026-08-22 09:03" > "$listfile"
+        tui_load; tui_apply_marks
+        marks; echo "$tui_nsel $tui_nrm"'
+    # tui_load leaves the tree closed, so only the top level comes back: the
+    # release selected and the second one marked for unlinking.
+    [ "${lines[0]}" = "[+- ]" ]
+    [ "${lines[1]}" = "1 1" ]
+}
+
+@test "-ls prints the marked entries with their size and date" {
+    listfile=$(mktemp)
+    printf '%s\n' '+Rel.One-GRP@   4.1G  2026-08-23 17:10' \
+                  '-Rel.Two-GRP@   2.7G  2026-08-23 14:42' \
+                  '#notes.nfo      2.1K  2026-08-22 09:03' \
+                  'hand.edited.nfo  753  2026-08-22 09:03' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; LIST_MARKED'
+    rm -f "$listfile"
+    [ "${lines[0]}" = "Rel.One-GRP@   4.1G  2026-08-23 17:10" ]
+    [ "${lines[1]}" = "hand.edited.nfo  753  2026-08-22 09:03" ]
+    [ "${#lines[@]}" -eq 2 ]
+}
+
+@test "the lock refuses a live run, ignores a stale one, and is given back" {
+    lock=$(mktemp -u)
+    run stage 'lockfile="'"$lock"'"; take_lock; cat "$lockfile"; release_lock
+               if [[ -e $lockfile ]]; then echo "still there"; else echo "gone"; fi'
+    [ -n "${lines[0]}" ]                # the holder's pid
+    [ "${lines[1]}" = "gone" ]
+
+    # A pid that is alive (this test) holds it against everyone else.
+    printf '%s\n' "$$" > "$lock"
+    run stage 'lockfile="'"$lock"'"; take_lock; echo "took it anyway"'
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"another run (pid $$) is in progress"* ]]
+
+    # A pid that is gone does not.
+    printf '%s\n' 999999 > "$lock"
+    run stage 'lockfile="'"$lock"'"; take_lock; echo "lock=[$lock_held]"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"stale lock"* ]]
+    [[ "$output" == *"lock=[1]"* ]]
+    rm -f "$lock"
+}
+
+@test "an interrupted run gives the lock back and dies of the signal" {
+    lock=$(mktemp -u)
+    run stage 'lockfile="'"$lock"'"; install_traps; take_lock
+               kill -INT $$; sleep 5'
+    # 128 + SIGINT: the trap re-raises rather than swallowing it.
+    [ "$status" -eq 130 ]
+    [ ! -e "$lock" ]
+}
+
+@test "a temp file the run made is taken back when it is interrupted" {
+    run stage 'new_tmp "${TMPDIR:-/tmp}/alftp.test.XXXXXX"; echo "$tmpfile_new"
+               install_traps; kill -TERM $$; sleep 5'
+    [ "$status" -eq 143 ]
+    [ ! -e "${lines[0]}" ]
+}
+
+@test "gpg_file is decrypted and evaluated, and a failure is named" {
+    secret=$(mktemp)
+    printf '%s\n' 'password=fromgpg' 'port=2121' > "$secret"
+    # A stub for gpg: the decryption itself is gpg's business, not alftp's.
+    run stage 'gpg () { cat "${!#}"; }
+               gpg_file="'"$secret"'"; eval_gpg_config
+               echo "[$password] [$port]"'
+    [ "$output" = "[fromgpg] [2121]" ]
+
+    run stage 'gpg () { return 2; }
+               gpg_file="'"$secret"'"; eval_gpg_config; echo "carried on"'
+    rm -f "$secret"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"could not decrypt"* ]]
+
+    run stage 'gpg_file=/nonexistent/secrets.gpg; eval_gpg_config'
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"does not exist"* ]]
+}
+
+@test "a password is asked for only when there is nothing else to log in with" {
+    # No terminal under bats, so the prompt is skipped and the empty password
+    # stands -- which is what a cron run needs.
+    run stage 'username=u; server=s; prompt_password; echo "[$password][$password_prompted]"'
+    [ "$output" = "[][]" ]
+    run stage 'username=u; server=s; password=set; prompt_password; echo "[$password]"'
+    [ "$output" = "[set]" ]
+    run stage 'username=u; server=s; keyfile=/k; prompt_password; echo "[$password]"'
+    [ "$output" = "[]" ]
+}
+
+@test "an interactively typed password reaches the in-session helper" {
+    run stage 'emitfile=/tmp/e; argvfile=/tmp/a; password=secret; child_env'
+    [ "$output" = "ALFTP_EMIT_DL='/tmp/e' ALFTP_ARGV='/tmp/a'" ]
+    run stage 'emitfile=/tmp/e; argvfile=/tmp/a; password=secret
+               password_prompted=1; child_env'
+    [ "$output" = "ALFTP_EMIT_DL='/tmp/e' ALFTP_ARGV='/tmp/a' ALFTP_PASSWORD='secret'" ]
+}
+
+@test "permissions are left alone unless the config asks for them" {
+    d=$(mktemp -d); touch "$d/f"; chmod 700 "$d"; chmod 600 "$d/f"
+    run stage 'apply_perms "'"$d"'"'
+    [ "$(stat -c '%a' "$d")" = "700" ]
+    [ "$(stat -c '%a' "$d/f")" = "600" ]
+    run stage 'chmod=True; perms_dirs=755; perms_files=640; apply_perms "'"$d"'"'
+    [ "$(stat -c '%a' "$d")" = "755" ]
+    [ "$(stat -c '%a' "$d/f")" = "640" ]
+    rm -rf "$d"
+}
+
+@test "POST_PROCESS records what arrived, logs what did not, and verifies" {
+    dl=$(mktemp -d); rec=$(mktemp); err=$(mktemp); ver=$(mktemp)
+    printf 'four\n' > "$dl/here.nfo"          # five bytes
+    run stage 'local_dl_dir="'"$dl"'"; record="'"$rec"'"; errors="'"$err"'"
+               verify="'"$ver"'"; profile=TV; checksum=True
+               LINESF="here.nfo
+missing.nfo"; POST_PROCESS'
+    [ "$status" -eq 0 ]
+    [ "$(cut -f3,4 < "$rec")" = "$(printf 'here.nfo\tdownloaded')" ]
+    [ "$(cut -f3,4 < "$err")" = "$(printf 'missing.nfo\tdid not arrive')" ]
+    # checksum=True says what landed: its size, and the hash of a single file.
+    [[ "$(cat "$ver")" == *"bytes=5"* ]]
+    [[ "$(cat "$ver")" == *"sha256=$(sha256sum < "$dl/here.nfo" | cut -d" " -f1)"* ]]
+
+    # -r keeps the record file out of it; the errors log is not a record of
+    # downloads, so it stays.
+    : > "$rec"
+    run stage 'local_dl_dir="'"$dl"'"; record="'"$rec"'"; errors="'"$err"'"
+               no_append=True; LINESF="here.nfo"; POST_PROCESS'
+    [ ! -s "$rec" ]
+    rm -rf "$dl" "$rec" "$err" "$ver"
+}
+
+@test "unrar runs only when autoUncompress asks for it" {
+    dl=$(mktemp -d); mkdir "$dl/Rel.One-GRP"
+    run stage 'local_dl_dir="'"$dl"'"; record=""; errors=""; verify=""
+               UNRAR_FUN () { echo "unrar $1"; }
+               LINESD="Rel.One-GRP"; POST_PROCESS'
+    [ "$output" = "" ]
+    run stage 'local_dl_dir="'"$dl"'"; record=""; errors=""; verify=""
+               autoUncompress=True; UNRAR_FUN () { echo "unrar $1"; }
+               LINESD="Rel.One-GRP"; POST_PROCESS'
+    [ "$output" = "unrar $dl/Rel.One-GRP" ]
+    # -nu turns it off again even where the config asked for it.
+    run stage 'local_dl_dir="'"$dl"'"; record=""; errors=""; verify=""
+               autoUncompress=True; nounrar=True; UNRAR_FUN () { echo "unrar $1"; }
+               LINESD="Rel.One-GRP"; POST_PROCESS'
+    [ "$output" = "" ]
+    rm -rf "$dl"
+}

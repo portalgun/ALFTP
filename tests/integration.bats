@@ -114,3 +114,110 @@ PICK
     [ -f "$DL/Rel.One-GRP/CD1/part1.bin" ]
     [ ! -e "$DL/notes.nfo" ]
 }
+
+# ---------------------------------------------------------------- audit fixes
+#
+# These run the whole script, so they need a lock file of their own: the real
+# one is /tmp/alftp.lock, and a test has no business taking it away from a run
+# the user started.
+
+# $1 = extra lines for the config, $2... = alftp's arguments.
+srv_run() {
+    home=$(srv_home)
+    printf 'lockfile="%s"\n%s\n' "$SRV/alftp.lock" "$1" \
+        >> "$home/.config/alftp/alftp.conf"
+    shift
+    env HOME="$home" EDITOR="/bin/true" "$ALFTP" "$@"
+}
+
+@test "-ls says what was marked and transfers nothing" {
+    run srv_run "" -a TV -q -ls
+    [ "$status" -eq 0 ]
+    # -a with -q marks the lot, so every entry in the completed directory is
+    # named with its size and date ...
+    [[ "$output" == *"Rel.One-GRP@"* ]]
+    [[ "$output" == *"notes.nfo@"* ]]
+    [[ "$output" == *"2026-"* ]] || [[ "$output" == *"20"* ]]
+    # ... and nothing was downloaded or unlinked.
+    [ -z "$(ls -A "$DL")" ]
+    [ -L "$SRV/complete/TV/Rel.One-GRP" ]
+}
+
+@test "a second run refuses to start while the first holds the lock" {
+    home=$(srv_home)
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    printf '%s\n' "$$" > "$SRV/alftp.lock"      # a pid that is very much alive
+    run env HOME="$home" EDITOR="/bin/true" "$ALFTP" -a TV -q
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"another run (pid $$) is in progress"* ]]
+    [ -z "$(ls -A "$DL")" ]
+    # The run that could not start does not remove the lock it did not take.
+    [ -e "$SRV/alftp.lock" ]
+}
+
+@test "a finished run gives its lock back" {
+    run srv_run "" -a TV -q -nu
+    [ "$status" -eq 0 ]
+    [ ! -e "$SRV/alftp.lock" ]
+}
+
+@test "-c starts the next run from the selection the last one made" {
+    # First run: keep the symlinks (-do) so the same entries are still there
+    # next time, and pick just the release.
+    editor="$SRV/pick"
+    cat > "$editor" <<'PICK'
+#!/usr/bin/env bash
+awk '{ if ($0 ~ /^Rel\.One-GRP/) print $0; else print "#" $0 }' "$1" > "$1.new"
+mv "$1.new" "$1"
+PICK
+    chmod +x "$editor"
+    home=$(srv_home)
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" EDITOR="$editor" "$ALFTP" -a TV -do -nu
+    [ "$status" -eq 0 ]
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+
+    # Second run, -c: the release comes back marked without the editor being
+    # asked to mark anything (this one leaves the list exactly as it found it).
+    run env HOME="$home" EDITOR="/bin/true" "$ALFTP" -i TV -c -do -ls
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"carried over 1 mark(s)"* ]]
+    [[ "$output" == *"Rel.One-GRP@"* ]]
+    [[ "$output" != *"notes.nfo"* ]]
+}
+
+@test "the record says what was downloaded, and -r keeps it out of it" {
+    run srv_run "" -a TV -q -nu
+    [ "$status" -eq 0 ]
+    rec="$SRV/home/.cache/alftp/alftp.record"
+    [ -s "$rec" ]
+    [[ "$(cat "$rec")" == *"Rel.One-GRP"* ]]
+    [[ "$(cut -f2 < "$rec" | head -n 1)" = "TV" ]]
+
+    # A second run with -r: it downloads (nothing is left to fetch, but the
+    # entries are still walked) and writes no new record line.
+    before=$(wc -l < "$rec")
+    run srv_run "" -a TV -q -nu -r
+    [ "$status" -eq 0 ]
+    [ "$(wc -l < "$rec")" -eq "$before" ]
+}
+
+@test "checksum=True writes down what arrived" {
+    run srv_run 'checksum=True' -a TV -q -nu
+    [ "$status" -eq 0 ]
+    ver="$SRV/home/.cache/alftp/alftp.verify"
+    [ -s "$ver" ]
+    # A single file gets its size and its hash; a directory gets its total.
+    [[ "$(grep notes.nfo "$ver")" == *"bytes=11 sha256=$(sha256sum < "$DL/notes.nfo" | cut -d' ' -f1)"* ]]
+    [[ "$(grep Rel.One-GRP "$ver")" == *"bytes="* ]]
+}
+
+@test "chmod/chown settings decide the permissions of what was downloaded" {
+    run srv_run 'chmod=True
+perms_dirs=755
+perms_files=640' -a TV -q -nu
+    [ "$status" -eq 0 ]
+    [ "$(stat -c '%a' "$DL/Rel.One-GRP")" = "755" ]
+    [ "$(stat -c '%a' "$DL/Rel.One-GRP/movie.mkv")" = "640" ]
+    [ "$(stat -c '%a' "$DL/Rel.One-GRP/CD1")" = "755" ]
+}

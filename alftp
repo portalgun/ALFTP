@@ -56,16 +56,15 @@ Config file located at ~/.config/alftp.conf
 Default action, given required fields:
     Read config file and gpg file variables
     Lock the current session
-    Check for previous sessions download and prompt for its check/completion
     Login to server, create a list of contents
-    Open default editor. Requires user to uncomment desired files (built with vi/vim usage in mind)
+    Open the picker. Requires user to mark the desired files
     Download files/directories using lftp
     Unlock current session
 
 Usage: alftp [options <value> ...]
 
 Options:
--h               (help) displays this info\
+-h               (help) displays this info
 --showc          display copyright
 --showw          display warranty
 
@@ -83,13 +82,14 @@ Options:
 -d    (data) checkout data dir instead of complete dir, doesn't delete anything
 -do   (download only) download, but don't remove symlink
 -q    (quiet) don't ask to confirm downloads (use with -a)
--n    (new) new session only
+-c    (continue) start from the previous session's selection instead of an empty
+                one; --continue is the same flag
 -ns   (new save (old)) new session and saves old previous download info for next time
--o    (old) checks/finishes old download only
 -jl   (just login) login by lftp only
 -rl   (removelist) do not save list file, cannot check previous session in next session
 -rm   (remove) remove files from remote location once download is complete
--fs   (filesize) print filesizes of marked files and retain list file
+-ls   (list) print the name, size and date of every marked entry and exit
+                without downloading anything
 -r    ((supress) record) do not append current download to record of download
 -cl   remove items from list and their symlinks
 -nu   (no unrar) do not extract
@@ -110,7 +110,9 @@ warranty=" This program comes with ABSOLUTELY NO WARRANTY; for details type 'alf
 
 config_template='# alftp configuration
 # Every key below has a command line flag equivalent; see `alftp -h`.
-# Per-profile overrides live in ~/.config/alftp/alftp.src.conf.
+# Per-profile overrides live in ~/.config/alftp/alftp.src.conf, which is eval'"'"'d
+# as bash: it is code, not inert data. Only put things in it you would be happy
+# to run.
 
 # Where to download to
 local_dl_dir="$HOME/Downloads"
@@ -120,6 +122,29 @@ listfile="$HOME/.cache/alftp/alftp.list"
 
 # Where lftp mirror writes its transfer log
 logfile="$HOME/.cache/alftp/alftp.log"
+
+# One line per entry that downloaded (record) or failed (errors), and where
+# checksum=True writes what it verified
+#record="$HOME/.cache/alftp/alftp.record"
+#errors="$HOME/.cache/alftp/alftp.errors"
+#verify="$HOME/.cache/alftp/alftp.verify"
+
+# Only one alftp run at a time; this file holds the running pid
+#lockfile=/tmp/alftp.lock
+
+# Extract downloaded .rar sets (True|False). -nu turns it off for one run.
+#autoUncompress=False
+
+# Verify each transfer and log what was checked to $verify (True|False)
+#checksum=False
+
+# What to do with the permissions of what was downloaded. The default is to
+# leave them exactly as they arrived.
+#chmod=False
+#perms_dirs=744
+#perms_files=644
+#chown=False
+#owner=me:me
 
 # Editor used to pick files out of the listing (defaults to $EDITOR, then vi)
 #editor=vim
@@ -136,6 +161,14 @@ logfile="$HOME/.cache/alftp/alftp.log"
 #complete_dir=
 #data_dir=
 #remote_dl_dir=
+
+# SFTP key authentication, instead of a password (keyFile= is accepted too)
+#keyfile="$HOME/.ssh/id_ed25519"
+
+# A gpg-encrypted file holding any of the settings above (typically the
+# password), decrypted and evaluated at startup so no secret sits here in
+# plaintext:  gpg --encrypt -r you -o ~/.config/alftp/secrets.gpg secrets
+#gpg_file="$HOME/.config/alftp/secrets.gpg"
 '
 
 config=$HOME/.config/alftp/alftp.conf
@@ -147,14 +180,21 @@ editor=${EDITOR:-vi}
 # file is sourced (so the config still wins), so that `set -u` above flags
 # genuine typos instead of tripping over options that simply weren't given.
 all_files=""; ind_files=""; quiet=""
-new_only=""; old_only=""; suspend_old=""; just_login=""
+suspend_old=""; just_login=""; continue_prev=""
 clean=""; data=""; norm=""; nounrar=""; dry_run=""
-print_fs=""; rm_list=""; rm_remote=""; no_append=""
+print_ls=""; rm_list=""; rm_remote=""; no_append=""
 sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
-profilevar=""; override=""
+profile=""; profilevar=""; override=""
 LINESD=""; LINESF=""; LINESR=""; oldfile=""; listfile2=""; dirname=""
 rawline=""; unlink_ok=""
 two_session=""; self=""; ARGV=(); dir_sizes=""; listfile3=""
+
+# Everything the run creates and has to take back with it if it is interrupted:
+# the lock (see take_lock) and every temp file new_tmp handed out.
+lockfile=""; lock_held=""; lockpid=""; tmpfiles=(); tmpfile_new=""
+# Scratch for the credential, -c and post-processing helpers.
+password_prompted=""; gpg_plain=""; contmarks=""; contlist=""
+target=""; verify_sum=""; verify_size=""
 
 # The file picker: "tui" for the terminal UI, "editor" for $editor, empty to
 # use the UI wherever the terminal can drive it. Its state lives here too --
@@ -179,10 +219,19 @@ TUI_LINES=0; TUI_COLS=0; TUI_ROWS=0
 t_smcup=""; t_rmcup=""; t_civis=""; t_cnorm=""; t_clear=""; t_home=""
 t_el=""; t_rev=""; t_bold=""; t_dim=""; t_sgr0=""
 
-server=""; username=""; password=""; port=""; keyfile=""
+# keyFile is the spelling a hand-written alftp.src.conf tends to use; both are
+# read (see resolve_keyfile).
+server=""; username=""; password=""; port=""; keyfile=""; keyFile=""
+gpg_file=""
 default_server=""; complete_dir=""; data_dir=""
 remote_dl_dir=""; local_dl_dir=""; listfile=""; logfile=""
-record=""; errors=""; verify=""; autoUncompress=""
+record=""; errors=""; verify=""
+
+# What happens to what was downloaded once it is here. Every one of these is
+# off by default: content arrives with the permissions and owner it had on the
+# server, and nothing is unpacked or hashed unless it was asked for.
+autoUncompress=False; checksum=False
+chmod=False; perms_dirs=744; perms_files=644; chown=False; owner=""
 
 
 ################################################################################
@@ -202,6 +251,9 @@ MAIN () {
     ARGSA "$@" #PRIORITY FLAGS
     eval_local_config
     eval_remote_config
+    # After both config passes (either of which may name the gpg file) but
+    # before the argument passes, so a flag still beats an encrypted setting.
+    eval_gpg_config
     ARGSB "$@" #CONFIG FLAGS
     ARGSC "$@" #OTHER FLAGS
 
@@ -324,6 +376,34 @@ eval_remote_config () {
 
 }
 
+# A gpg-encrypted file of settings, so credentials need not sit in plaintext in
+# alftp.conf or alftp.src.conf. Its plaintext is bash, and is eval'd exactly
+# the way the rest of the config is -- typically it is one password= line.
+# Anything that goes wrong here is fatal and named: silently carrying on would
+# mean logging in with whatever credentials happened to be lying around.
+eval_gpg_config () {
+    if [[ -z $gpg_file ]]; then
+        return 0
+    fi
+    gpg_file="${gpg_file/#\~/$HOME}"
+    if [[ ! -f $gpg_file ]]; then
+        echo "alftp: gpg_file \"$gpg_file\" does not exist." >&2
+        exit 1
+    fi
+    if ! command -v gpg > /dev/null 2>&1; then
+        echo "alftp: gpg is not installed, so gpg_file \"$gpg_file\" cannot be read." >&2
+        exit 1
+    fi
+    # --batch keeps gpg from taking the terminal away from us; a key that needs
+    # a passphrase has to come from the agent (or a pinentry gpg can drive).
+    if ! gpg_plain=$(gpg --batch --quiet --decrypt "$gpg_file" 2> /dev/null); then
+        echo "alftp: could not decrypt gpg_file \"$gpg_file\"." >&2
+        exit 1
+    fi
+    eval "$gpg_plain"
+    gpg_plain=""
+}
+
 ARGSB () {
     for i in "$@"; do
         if [ ! -z "$nextParam" ]; then
@@ -336,6 +416,9 @@ ARGSB () {
             esac
             case "$nextParam" in
                 [ia])
+		    # Kept for the record/errors logs, which say which profile a
+		    # line came from.
+		    profile="$i"
 		    profilevar=$(profile_var_name "$i")
 
 		    # dl_dir_<profile> (renamed to local_dl_dir_<profile> when the
@@ -450,18 +533,14 @@ ARGSC () {
                 lastParam="$i"
                 nextParam="l"
                 ;;
-            -n)
-                new_only=True
-                ;;
             -ns)
                 suspend_old=True
-                new_only=True
                 ;;
-            -o)
-                old_only=True
+            -c|--continue)
+                continue_prev=True
                 ;;
-            -fs)
-                print_fs=True
+            -ls)
+                print_ls=True
                 ;;
             -jl)
                 just_login=True
@@ -523,12 +602,88 @@ ARGSC () {
     else
         remote_dl_dir="$complete_dir""$remote_dl_dir"
     fi
-
-    if [[ ! -z $keyfile ]]; then
-          set sftp:connect-program "ssh -a -x -i $keyfile"
-    fi
 }
 ############################################################
+
+# Every temp file the run creates goes through here, so that a signal can take
+# them all back again (see cleanup_run). The name comes back in $tmpfile_new
+# rather than on stdout because a $(...) would put the append in a subshell,
+# where the array would not survive.
+new_tmp () {
+    tmpfile_new=$(mktemp "$1") || return 1
+    tmpfiles+=("$tmpfile_new")
+}
+
+# One run at a time: two of them share $listfile and would pick each other's
+# selections apart. The pid in the file is what tells a live holder from one
+# that was killed before it could clean up.
+take_lock () {
+    if [[ -z $lockfile ]]; then
+        return 0
+    fi
+    # noclobber makes the create-if-absent atomic, so two runs starting at once
+    # cannot both decide the lock is free.
+    if ( set -o noclobber; printf '%s\n' "$$" > "$lockfile" ) 2> /dev/null; then
+        lock_held=1
+        return 0
+    fi
+    lockpid=$(head -n 1 "$lockfile" 2> /dev/null) || lockpid=""
+    if [[ $lockpid =~ ^[0-9]+$ ]] && kill -0 "$lockpid" 2> /dev/null; then
+        echo "alftp: another run (pid $lockpid) is in progress; $lockfile is held." >&2
+        echo "Wait for it to finish, or remove $lockfile if it is not." >&2
+        exit 1
+    fi
+    echo "alftp: ignoring stale lock $lockfile (pid ${lockpid:-unknown} is gone)." >&2
+    rm -f "$lockfile"
+    if ! ( set -o noclobber; printf '%s\n' "$$" > "$lockfile" ) 2> /dev/null; then
+        echo "alftp: cannot create lock file \"$lockfile\"." >&2
+        exit 1
+    fi
+    lock_held=1
+}
+
+# Only the run that took the lock removes it: the in-session helper re-enters
+# MAIN with the parent's lock already in place and must leave it alone.
+release_lock () {
+    if [[ -n $lock_held ]] && [[ -n $lockfile ]]; then
+        rm -f "$lockfile"
+        lock_held=""
+    fi
+}
+
+# What an interrupted run has to take back with it. The temp files are kept
+# when ALFTP_DEBUG asked for them, the same way a failed lftp session keeps its
+# script.
+cleanup_run () {
+    release_lock
+    if [[ -z ${ALFTP_DEBUG:-} ]] && [[ ${#tmpfiles[@]} -gt 0 ]]; then
+        rm -f "${tmpfiles[@]}"
+    fi
+}
+
+# Clean up, then die of the signal we caught rather than of exit 0, so whatever
+# ran alftp sees an interrupted process. COMPLETE clears these again.
+on_signal () {
+    trap - INT TERM HUP
+    echo
+    echo "alftp: interrupted (SIG$1), cleaning up." >&2
+    cleanup_run
+    kill -"$1" $$
+}
+
+install_traps () {
+    trap 'on_signal INT' INT
+    trap 'on_signal TERM' TERM
+    trap 'on_signal HUP' HUP
+}
+
+# The config in the wild spells this keyFile; the script has always read
+# keyfile. Take whichever one was set, preferring the documented spelling.
+resolve_keyfile () {
+    if [[ -z $keyfile ]] && [[ -n $keyFile ]]; then
+        keyfile="$keyFile"
+    fi
+}
 
 # Fail early, and by name, rather than letting lftp report something cryptic.
 validate_config () {
@@ -543,19 +698,64 @@ validate_config () {
     fi
 }
 
+# A password that is neither configured nor in the gpg file, with no key to
+# fall back on, is worth asking for rather than failing on -- but only when
+# there is somebody there to ask. Without a terminal (cron, a redirected run)
+# the empty password stands, which is also what an anonymous server wants.
+prompt_password () {
+    if [[ -n $password ]] || [[ -n $keyfile ]] || [[ -z $username ]]; then
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+    read -r -s -p "Password for $username@$server: " password
+    echo
+    if [[ -n $password ]]; then
+        password_prompted=1
+    fi
+}
+
 WELCOME () {
 if [[ -z $(command -v lftp) ]]; then
     echo "lftp is not installed."
     exit 1
 fi
-validate_config
+resolve_keyfile
+# The in-session helper is this same script re-entered from inside the lftp
+# session (see SINGLE_SESSION): the run's lock is already held by the parent,
+# and the password it was asked for came down in the environment rather than
+# being asked for a second time in the middle of the session.
+if [[ -n ${ALFTP_EMIT_DL:-} ]]; then
+    if [[ -n ${ALFTP_PASSWORD:-} ]]; then
+        password="$ALFTP_PASSWORD"
+    fi
+else
+    validate_config
+    prompt_password
+    if [[ -z $lockfile ]]; then
+        lockfile=/tmp/alftp.lock
+    fi
+    install_traps
+    take_lock
+fi
 if [[ -z $listfile ]]; then
     listfile="$HOME/.cache/alftp/alftp.list"
 fi
 if [[ -z $logfile ]]; then
     logfile="$HOME/.cache/alftp/alftp.log"
 fi
-if ! mkdir -p "$(dirname "$listfile")" "$(dirname "$logfile")"; then
+if [[ -z $record ]]; then
+    record="$HOME/.cache/alftp/alftp.record"
+fi
+if [[ -z $errors ]]; then
+    errors="$HOME/.cache/alftp/alftp.errors"
+fi
+if [[ -z $verify ]]; then
+    verify="$HOME/.cache/alftp/alftp.verify"
+fi
+if ! mkdir -p "$(dirname "$listfile")" "$(dirname "$logfile")" \
+              "$(dirname "$record")" "$(dirname "$errors")" "$(dirname "$verify")"; then
     echo "alftp: cannot create directory for listfile/logfile." >&2
     exit 1
 fi
@@ -563,9 +763,11 @@ if ! touch "$listfile"; then
     echo "alftp: cannot write listfile \"$listfile\"." >&2
     exit 1
 fi
-# Derived here so the parent and the in-session helper agree on it.
+# Derived here so the parent and the in-session helper agree on them -- the
+# helper never runs the session functions that would otherwise name them.
 listfile2="$listfile"2
 listfile3="$listfile"3
+oldfile="$listfile"_old
 }
 
 # Quote a value for lftp's own (shell-like) command parser.
@@ -628,10 +830,11 @@ du_cmd () {
 }
 
 CREATE_LIST () {
-    oldfile="$listfile"_old
+    # Last run's list, marks and all, is what -c carries into this one; the
+    # listing below is about to overwrite it.
     cp "$listfile" "$oldfile"
 
-    scriptfile=$(mktemp "${TMPDIR:-/tmp}/alftp.list.XXXXXX")
+    new_tmp "${TMPDIR:-/tmp}/alftp.list.XXXXXX"; scriptfile="$tmpfile_new"
     #DO NOT INDENT CONTENTS
     cat > "$scriptfile" << EOF
 $(open_cmd)
@@ -651,18 +854,17 @@ EOF
 # the selection into mirror/pget commands), then sources what it wrote -- so
 # the connection opened for the listing is the one that does the transfer.
 SINGLE_SESSION () {
-    oldfile="$listfile"_old
     cp "$listfile" "$oldfile"
 
-    emitfile=$(mktemp "${TMPDIR:-/tmp}/alftp.emit.XXXXXX")
-    argvfile=$(mktemp "${TMPDIR:-/tmp}/alftp.argv.XXXXXX")
+    new_tmp "${TMPDIR:-/tmp}/alftp.emit.XXXXXX"; emitfile="$tmpfile_new"
+    new_tmp "${TMPDIR:-/tmp}/alftp.argv.XXXXXX"; argvfile="$tmpfile_new"
     if [[ ${#ARGV[@]} -gt 0 ]]; then
         printf '%s\0' "${ARGV[@]}" > "$argvfile"
     else
         : > "$argvfile"
     fi
 
-    scriptfile=$(mktemp "${TMPDIR:-/tmp}/alftp.session.XXXXXX")
+    new_tmp "${TMPDIR:-/tmp}/alftp.session.XXXXXX"; scriptfile="$tmpfile_new"
     #DO NOT INDENT CONTENTS
     cat > "$scriptfile" << EOF
 $(open_cmd)
@@ -674,7 +876,7 @@ $(du_cmd)
 cd "$data_dir""$dirname"
 cls -1 > "$listfile2"
 cd "$remote_dl_dir"
-!env ALFTP_EMIT_DL=$(sh_quote "$emitfile") ALFTP_ARGV=$(sh_quote "$argvfile") bash $(sh_quote "$self")
+!env $(child_env) bash $(sh_quote "$self")
 source "$emitfile"
 quit
 EOF
@@ -688,9 +890,28 @@ EOF
     return $rc
 }
 
+# What the "!" line hands the helper. Everything else it re-derives from the
+# config and argv, but a password that was typed at a prompt is not in either --
+# and the helper needs it for the listing logins that tab does. A child's
+# environment is readable only by its owner, and the script this line lives in
+# already holds the same secret.
+child_env () {
+    printf 'ALFTP_EMIT_DL=%s ALFTP_ARGV=%s' \
+        "$(sh_quote "$emitfile")" "$(sh_quote "$argvfile")"
+    if [[ -n $password_prompted ]]; then
+        printf ' ALFTP_PASSWORD=%s' "$(sh_quote "$password")"
+    fi
+}
+
 # Runs inside the lftp session, spawned by the "!" line above.
 EMIT_DL () {
     EDIT_LIST
+    # -ls is answered by the parent, from the same list file this just saved,
+    # so the session finds nothing to source and transfers nothing.
+    if [[ $print_ls == True ]]; then
+        : > "$ALFTP_EMIT_DL"
+        return 0
+    fi
     TYPE
     { DLDR; DLFL; DLRM; } > "$ALFTP_EMIT_DL"
 }
@@ -700,28 +921,35 @@ NEW_SESSION () {
 	# Interactive session, so the open command (and with it the credentials)
 	# comes from a temp rc file instead of the command line, keeping the
 	# password out of ps output like the generated sessions do.
-	openrc=$(mktemp "${TMPDIR:-/tmp}/alftp.open.XXXXXX")
+	new_tmp "${TMPDIR:-/tmp}/alftp.open.XXXXXX"; openrc="$tmpfile_new"
 	open_cmd > "$openrc"
 	lftp --rcfile "$openrc"
 	rm -f "$openrc"
 	exitflag=True
-    elif [[ $old_only != True ]] && [[ $just_login != True ]]; then
-
+    else
         if [[ $two_session == True ]]; then
             CREATE_LIST
             EDIT_LIST
-            TYPE
-            if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]] || [[ ! -z $LINESR ]]; then
-                DOWNLD
-                POST_PROCESS
+            if [[ $print_ls == True ]]; then
+                LIST_MARKED
+            else
+                TYPE
+                if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]] || [[ ! -z $LINESR ]]; then
+                    DOWNLD
+                    POST_PROCESS
+                fi
             fi
         else
             SINGLE_SESSION
             # The selection was made by the helper inside the session; re-run
             # TYPE here against the same (edited) list to recover what was
             # downloaded, so post-processing knows what to work on.
-            TYPE
-            POST_PROCESS
+            if [[ $print_ls == True ]]; then
+                LIST_MARKED
+            else
+                TYPE
+                POST_PROCESS
+            fi
         fi
         rm -f "$listfile2" "$listfile3"
     fi
@@ -802,7 +1030,7 @@ FORMAT_LIST () {
     if [[ ! -s $listfile ]]; then
         return 0
     fi
-    tmpfile=$(mktemp "${TMPDIR:-/tmp}/alftp.fmt.XXXXXX")
+    new_tmp "${TMPDIR:-/tmp}/alftp.fmt.XXXXXX"; tmpfile="$tmpfile_new"
     dufile=""
     if [[ -n $listfile3 ]] && [[ -s $listfile3 ]]; then
         dufile="$listfile3"
@@ -1395,9 +1623,9 @@ tui_fetch () {
     tui_strip_class "${TUI_PATH[$1]}"
     tui_msg="listing ${TUI_NAME[$1]} ..."
     tui_draw
-    tui_raw=$(mktemp "${TMPDIR:-/tmp}/alftp.sub.XXXXXX")
-    tui_log=$(mktemp "${TMPDIR:-/tmp}/alftp.sublog.XXXXXX")
-    tui_script=$(mktemp "${TMPDIR:-/tmp}/alftp.subcmd.XXXXXX")
+    new_tmp "${TMPDIR:-/tmp}/alftp.sub.XXXXXX"; tui_raw="$tmpfile_new"
+    new_tmp "${TMPDIR:-/tmp}/alftp.sublog.XXXXXX"; tui_log="$tmpfile_new"
+    new_tmp "${TMPDIR:-/tmp}/alftp.subcmd.XXXXXX"; tui_script="$tmpfile_new"
     #DO NOT INDENT CONTENTS
     cat > "$tui_script" << EOF
 $(open_cmd)
@@ -1604,7 +1832,7 @@ tui_save () {
             tui_pathw=${#TUI_PATH[tui_id]}
         fi
     done
-    tui_scratch=$(mktemp "${TMPDIR:-/tmp}/alftp.sel.XXXXXX")
+    new_tmp "${TMPDIR:-/tmp}/alftp.sel.XXXXXX"; tui_scratch="$tmpfile_new"
     for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
         if (( TUI_DEPTH[tui_id] > 0 )) && (( TUI_STATE[tui_id] == 0 )) \
            && (( TUI_SELCNT[tui_id] == 0 )); then
@@ -1631,6 +1859,26 @@ tui_save () {
     rm -f "$tui_scratch"
 }
 
+# -c: CONTINUE_LIST has already marked the listing with last session's picks,
+# but tui_load drops every marker on purpose (a reloaded list starts
+# deselected), so put them back through the one function allowed to set state.
+# Only top-level entries can be matched: nothing below them exists in the tree
+# until a directory is opened.
+tui_apply_marks () {
+    while IFS=$'\t' read -r tui_mark tui_nm; do
+        for tui_i in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+            if [[ ${TUI_PATH[tui_i]} == "$tui_nm" ]]; then
+                if [[ $tui_mark == "-" ]]; then
+                    tui_set_state "$tui_i" 2
+                else
+                    tui_set_state "$tui_i" 1
+                fi
+                break
+            fi
+        done
+    done < <(marked_entries "$listfile")
+}
+
 tui_select () {
     tui_cur=0
     tui_top=0
@@ -1638,6 +1886,9 @@ tui_select () {
     tui_msg=""
     tui_resized=0
     tui_load
+    if [[ $continue_prev == True ]]; then
+        tui_apply_marks
+    fi
     if (( TUI_N == 0 )); then
         echo "alftp: the listing is empty, nothing to pick."
         return 0
@@ -1674,9 +1925,15 @@ pick_list () {
         echo "alftp: using \$editor instead of the terminal UI ($tui_why)." >&2
     fi
     # The editor convention is the inverse of the UI's: with -i every entry is
-    # commented out for the user to uncomment what they want.
+    # commented out for the user to uncomment what they want. With -c the marks
+    # CONTINUE_LIST just wrote are the selection to start from, so those lines
+    # are left as they are.
     if [[ $ind_files == True ]]; then
-        sed -i 's/^\([^#]\)/#\1/g' "$listfile"
+        if [[ $continue_prev == True ]]; then
+            sed -i 's/^\([^#+-]\)/#\1/g' "$listfile"
+        else
+            sed -i 's/^\([^#]\)/#\1/g' "$listfile"
+        fi
     fi
     $editor "$listfile"
 }
@@ -1685,6 +1942,9 @@ pick_list () {
 # single-session path this runs inside the lftp session, via EMIT_DL.
 EDIT_LIST () {
     FORMAT_LIST
+    if [[ $continue_prev == True ]]; then
+        CONTINUE_LIST
+    fi
     if [[ $all_files == True ]]; then
         if [[ $quiet != True ]]; then
             pick_list
@@ -1694,8 +1954,78 @@ EDIT_LIST () {
     fi
 }
 
+# One line per entry, tab separated so it greps and cuts: when, which profile,
+# which entry, what happened to it. A log that cannot be written is not worth
+# failing a finished download over, so this never reports an error of its own.
+log_event () {
+    if [[ -z $1 ]]; then
+        return 0
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+        "${profile:-${dirname:-.}}" "$2" "$3" >> "$1" 2> /dev/null || return 0
+}
+
+# checksum=True: a line per downloaded entry saying exactly what landed -- its
+# size in bytes and, for a single file, its sha256 -- so that what is on disk
+# can be checked later against what was fetched, and two copies of the same
+# release can be compared without re-downloading either.
+#
+# It deliberately does not compare against the size in the listing: the
+# completed directory is full of symlinks, and a server that reports the size
+# of the link rather than of the file behind it (which is what a plain
+# filesystem does) would make every entry look wrong. lftp's own xfer:verify is
+# not used either -- its verify-file helper needs perl modules that are often
+# missing, and when it fails it takes the transfer down with it, along with the
+# symlink removal that follows a successful one.
+verify_entry () {
+    verify_size=$(du -sb -- "$1" 2> /dev/null | cut -f1) || verify_size=""
+    if [[ -d $1 ]] || ! command -v sha256sum > /dev/null 2>&1; then
+        verify_sum="-"
+    else
+        verify_sum=$(sha256sum -- "$1" 2> /dev/null) || verify_sum=""
+        verify_sum=${verify_sum%% *}
+    fi
+    log_event "$verify" "$2" "bytes=${verify_size:-?} sha256=${verify_sum:--}"
+}
+
+# There is no success line to read back out of lftp: the session's output goes
+# to the terminal (and in the single-session path shares it with the picker),
+# so the honest test of whether an entry arrived is the local side -- it is
+# here, or it is not.
+record_result () {
+    if [[ -e $1 ]]; then
+        if [[ $no_append != True ]]; then
+            log_event "$record" "$2" "downloaded"
+        fi
+        if [[ ${checksum,,} == true ]]; then
+            verify_entry "$1" "$2"
+        fi
+    else
+        log_event "$errors" "$2" "did not arrive"
+    fi
+}
+
+# Downloaded content keeps the permissions and the owner it arrived with unless
+# the config asks for something else: chmod=True applies perms_dirs to
+# directories and perms_files to files, chown=True hands the lot to $owner.
+apply_perms () {
+    if [[ ${chmod,,} == true ]]; then
+        if [[ -d $1 ]]; then
+            find "$1" -type d -exec chmod "$perms_dirs" {} +
+            find "$1" -type f -exec chmod "$perms_files" {} +
+        else
+            chmod "$perms_files" "$1"
+        fi
+    fi
+    if [[ ${chown,,} == true ]] && [[ -n $owner ]]; then
+        chown -R "$owner" "$1"
+    fi
+}
+
 POST_PROCESS () {
-    if [[ $dry_run == True ]]; then
+    # Neither of these downloaded anything: -cl removed the entries instead,
+    # and --dry-run only said what it would have done.
+    if [[ $dry_run == True ]] || [[ $clean == True ]]; then
         return 0
     fi
     # Downloaded content lands under $local_dl_dir, and the SsS sentinel
@@ -1705,8 +2035,10 @@ POST_PROCESS () {
             continue
         fi
         line=$(echo "$line" | sed 's|SsS$| |')
-        if [[ -e "$local_dl_dir/$line" ]]; then
-            chmod 644 "$local_dl_dir/$line"
+        target="$local_dl_dir/$line"
+        record_result "$target" "$line"
+        if [[ -e $target ]]; then
+            apply_perms "$target"
         fi
     done <<< "$LINESF"
     while read -r line; do
@@ -1715,15 +2047,99 @@ POST_PROCESS () {
         fi
         line=$(echo "$line" | sed 's|SsS$| |')
         target="$local_dl_dir/$line"
+        record_result "$target" "$line"
         if [[ ! -e $target ]]; then
             continue
         fi
-        if [[ -z $nounrar ]]; then
+        # Unpacking is opt-in (autoUncompress), and -nu turns it off for a run
+        # even where the config asked for it.
+        if [[ ${autoUncompress,,} == true ]] && [[ -z $nounrar ]]; then
             UNRAR_FUN "$target"
         fi
-        find "$target" -type d -exec chmod 777 {} \;
-        find "$target" -type f -exec chmod 644  {} \;
+        apply_perms "$target"
     done <<< "$LINESD"
+}
+
+# "mark<TAB>name" for every entry the list file says something about: "+" (or
+# no marker at all, which is what hand-editing produces) is a download and "-"
+# an unlink. The size and date columns come off, so what is left is the name
+# lftp is given -- the same thing TYPE reads, without deciding file or
+# directory. "#" and "*" say nothing and are skipped.
+marked_entries () {
+    awk '
+        function stripname(s) {
+            if (match(s, /[ \t][ \t]+([^ \t]+[ \t]+)?[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9][ \t]*$/)) {
+                s = substr(s, 1, RSTART - 1)
+            }
+            sub(/[ \t]+$/, "", s)
+            return s
+        }
+        {
+            line = $0
+            if (line ~ /^[ \t]*$/) { next }
+            mark = substr(line, 1, 1)
+            if (mark == "#" || mark == "*") { next }
+            if (mark == "+" || mark == "-") { line = substr(line, 2) }
+            else { mark = "+" }
+            name = stripname(line)
+            if (name == "") { next }
+            print mark "\t" name
+        }
+    ' "$1"
+}
+
+# -ls: say what was marked -- name, size and date, as the list shows them --
+# and download nothing. The columns are already aligned, so the marker is all
+# that comes off.
+LIST_MARKED () {
+    awk '
+        {
+            line = $0
+            if (line ~ /^[ \t]*$/) { next }
+            if (line ~ /^[#*-]/) { next }
+            if (substr(line, 1, 1) == "+") { line = substr(line, 2) }
+            print line
+        }
+    ' "$listfile"
+}
+
+# -c: last session's selection, carried into this run's listing. $oldfile is
+# the list the picker saved last time (both session functions copy it aside
+# before the fresh listing overwrites it), so its marks are the ones the user
+# made: an entry that is still on the server comes up marked, an entry that is
+# gone goes with it, and anything new starts unmarked as usual.
+CONTINUE_LIST () {
+    if [[ ! -s $oldfile ]]; then
+        echo "alftp: -c: no previous session list in $oldfile; starting from an empty selection."
+        return 0
+    fi
+    new_tmp "${TMPDIR:-/tmp}/alftp.cont.XXXXXX"; contmarks="$tmpfile_new"
+    marked_entries "$oldfile" > "$contmarks"
+    new_tmp "${TMPDIR:-/tmp}/alftp.cont.XXXXXX"; contlist="$tmpfile_new"
+    awk -F'\t' '
+        function stripname(s) {
+            sub(/^[-+*#]/, "", s)
+            if (match(s, /[ \t][ \t]+([^ \t]+[ \t]+)?[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9][ \t]*$/)) {
+                s = substr(s, 1, RSTART - 1)
+            }
+            sub(/[ \t]+$/, "", s)
+            return s
+        }
+        NR == FNR { old[$2] = $1; next }
+        {
+            if ($0 ~ /^[ \t]*$/) { print; next }
+            key = stripname($0)
+            if (key in old) {
+                line = $0
+                sub(/^[-+*#]/, "", line)
+                print old[key] line
+            } else {
+                print
+            }
+        }
+    ' "$contmarks" "$listfile" > "$contlist" && mv "$contlist" "$listfile"
+    rm -f "$contlist"
+    echo "alftp: -c: carried over $(grep -c '^[+-]' "$listfile") mark(s) from the previous session."
 }
 
 # Inverse of FORMAT_LIST, on stdin: remove the trailing "  size  date time"
@@ -1798,7 +2214,7 @@ add_line () {
 
 #INITIATE SESSION AND DOWNLOAD
 DOWNLD () {
-scriptfile=$(mktemp "${TMPDIR:-/tmp}/alftp.dl.XXXXXX")
+new_tmp "${TMPDIR:-/tmp}/alftp.dl.XXXXXX"; scriptfile="$tmpfile_new"
 #DO NOT INDENT CONTENTS
 cat > "$scriptfile" << EOF
 $(open_cmd)
@@ -1822,6 +2238,12 @@ set_opts () {
 	echo "set net:max-retries 3"
 	echo "set net:persist-retries 3"
     echo "set net:timeout 60"
+    # SFTP key authentication. This has to be an lftp directive in the
+    # generated script -- as a bash statement "set" only reassigns this
+    # script's own positional parameters, which is what it used to do.
+    if [[ -n $keyfile ]]; then
+        echo "set sftp:connect-program $(lftp_quote "ssh -a -x -i $keyfile")"
+    fi
 }
 
 #set ftp:charset UTF-8
@@ -1914,15 +2336,19 @@ DLRM () {
 }
 
 COMPLETE () {
+    # The lock and the traps go first, before the early return: -jl took the
+    # lock like any other run and has to give it back.
+    release_lock
+    trap - INT TERM HUP
     if [[ -n $exitflag ]]; then
 	    return 0
     fi
-    rm -f /tmp/alftp.lock
-    trap - SIGINT SIGTERM
     if [[ $rm_list == True ]]; then
         rm -f "$listfile"
     fi
-    if [[ $suspend_old == True ]]; then
+    # -ns: next run starts from the list this one started from, rather than
+    # from what it just picked.
+    if [[ $suspend_old == True ]] && [[ -e $oldfile ]]; then
         mv "$oldfile" "$listfile"
     fi
 }
