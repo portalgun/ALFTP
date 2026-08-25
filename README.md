@@ -89,17 +89,33 @@ override where a profile is fetched *from*, use `remote_dl_dir_<profile>`, which
 over the usual fallback of using the profile name as the remote directory.
 
 When using the -i flag, a list of available files to download will be displayed as commented lines.
-``` 
-#file1
-#file2
-#directory1\
-``` 
-To download '''file1''' and '''directory1\''', simply uncomment them:
-``` 
-file1
-directory1\
-#file2
-``` 
+Each line is three columns — name, size, modification date:
+```
+#file1                4.0K  2026-08-23 17:10
+#file2                 753  2026-08-23 14:42
+#directory1/           24K  2026-08-22 09:03
+```
+To download '''file1''' and '''directory1/''', simply uncomment them:
+```
+file1                 4.0K  2026-08-23 17:10
+#file2                 753  2026-08-23 14:42
+directory1/            24K  2026-08-22 09:03
+```
+Only the first column matters when the list is read back: the size and date columns are there to
+inform the choice and are stripped off again, so you can leave them alone (or edit/delete them —
+a line with just a name still works).
+
+Most servers report no size for a directory, so that column comes up blank for them. `--dir-sizes`
+(or `-ds`) fills it in by asking lftp for `du -h --max-depth=1` on the remote directory while the
+listing session is still open:
+``` bash
+$ alftp -a docs --dir-sizes
+```
+It is off by default because it costs a recursive walk of everything below the remote directory —
+one listing request per subdirectory — before the editor opens. On a directory with a few dozen
+releases that is a moment; on a deep tree it is not. Where a server does report a directory size of
+its own, the `du` total wins, since the server's figure is the size of the directory entry rather
+than of its contents.
 
 ## DRY RUN
 To see what a profile would transfer without downloading anything, add `--dry-run` (or `-dr`):

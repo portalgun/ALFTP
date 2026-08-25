@@ -168,3 +168,67 @@ stage() {
     # unescaped '.' in "example.com" would match instead.
     [ "$output" = "rd=[/tmp/alftp-test/important] port=[2222] srv=[example.com]" ]
 }
+
+@test "FORMAT_LIST puts the name first and lines the columns up" {
+    listfile=$(mktemp)
+    printf '%s\n' '    4.0K 2026-08-23 17:10 tests/' \
+                  '     753 2026-08-23 14:42 a file  with spaces' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; FORMAT_LIST; cat "$listfile"'
+    rm -f "$listfile"
+    [ "${lines[0]}" = "tests/               4.0K  2026-08-23 17:10" ]
+    [ "${lines[1]}" = "a file  with spaces   753  2026-08-23 14:42" ]
+}
+
+@test "FORMAT_LIST left-aligns directories, which have no size" {
+    listfile=$(mktemp)
+    printf '%s\n' '    4.0K 2026-08-23 17:10 somefile.mkv' \
+                  '         2026-08-23 14:42 A.Dir.Name/' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; FORMAT_LIST; cat "$listfile"'
+    rm -f "$listfile"
+    # The name starts at column 1 on both lines; the size column is blank for
+    # the directory, and the dates still line up.
+    [ "${lines[0]}" = "somefile.mkv  4.0K  2026-08-23 17:10" ]
+    [ "${lines[1]}" = "A.Dir.Name/         2026-08-23 14:42" ]
+}
+
+@test "FORMAT_LIST fills the directory size column from the du listing" {
+    listfile=$(mktemp)
+    listfile3=$(mktemp)
+    printf '%s\n' '    4.0K 2026-08-23 17:10 somefile.mkv' \
+                  '         2026-08-23 14:42 A.Dir.Name/' \
+                  '         2026-08-01 09:00 no.du.entry/' > "$listfile"
+    # A server that reports a size for the directory entry itself: du wins.
+    printf '%s\t%s\n' '40K' './A.Dir.Name' '41K' '.' > "$listfile3"
+    run stage 'listfile="'"$listfile"'"; listfile3="'"$listfile3"'"; FORMAT_LIST; cat "$listfile"'
+    rm -f "$listfile" "$listfile3"
+    [ "${lines[0]}" = "somefile.mkv  4.0K  2026-08-23 17:10" ]
+    [ "${lines[1]}" = "A.Dir.Name/    40K  2026-08-23 14:42" ]
+    [ "${lines[2]}" = "no.du.entry/        2026-08-01 09:00" ]
+}
+
+@test "du_cmd is emitted only with --dir-sizes" {
+    run stage 'listfile3="/tmp/x y/list3"; dir_sizes=True; du_cmd; dir_sizes=""; echo "off:[$(du_cmd)]"'
+    [ "${lines[0]}" = 'du -h --max-depth=1 . > "/tmp/x y/list3"' ]
+    [ "${lines[1]}" = "off:[]" ]
+}
+
+@test "strip_columns recovers a directory name with no size column" {
+    run stage 'printf "%s\n" "A.Dir.Name/         2026-08-23 14:42" | strip_columns'
+    [ "${lines[0]}" = "A.Dir.Name/" ]
+}
+
+@test "FORMAT_LIST is idempotent and leaves unrecognised lines alone" {
+    listfile=$(mktemp)
+    printf '%s\n' '    4.0K 2026-08-23 17:10 tests/' '#a comment' 'plain-name' > "$listfile"
+    run stage 'listfile="'"$listfile"'"; FORMAT_LIST; FORMAT_LIST; cat "$listfile"'
+    rm -f "$listfile"
+    [ "${lines[0]}" = "tests/  4.0K  2026-08-23 17:10" ]
+    [ "${lines[1]}" = "#a comment" ]
+    [ "${lines[2]}" = "plain-name" ]
+}
+
+@test "strip_columns recovers just the filename" {
+    run stage 'printf "%s\n" "a file  with spaces   753  2026-08-23 14:42" "plain-name" | strip_columns'
+    [ "${lines[0]}" = "a file  with spaces" ]
+    [ "${lines[1]}" = "plain-name" ]
+}

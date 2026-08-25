@@ -94,6 +94,8 @@ Options:
 -cl   remove items from list and their symlinks
 -nu   (no unrar) do not extract
 --dry-run (-dr) print what would be transferred without downloading anything
+--dir-sizes (-ds) fill in the size column for directories, which the remote
+                listing omits; costs a recursive walk of the remote directory
 --two-session   use one lftp login for the listing and a second for the
                 download, instead of doing both in a single session
 "
@@ -144,7 +146,7 @@ print_fs=""; rm_list=""; rm_remote=""; no_append=""
 sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
 profilevar=""; override=""
 LINESD=""; LINESF=""; oldfile=""; listfile2=""; dirname=""
-two_session=""; self=""; ARGV=()
+two_session=""; self=""; ARGV=(); dir_sizes=""; listfile3=""
 
 server=""; username=""; password=""; port=""; keyfile=""
 default_server=""; complete_dir=""; data_dir=""
@@ -458,6 +460,9 @@ ARGSC () {
             -dr|--dry-run)
                 dry_run=True
                 ;;
+            -ds|--dir-sizes)
+                dir_sizes=True
+                ;;
             --two-session)
                 two_session=True
                 ;;
@@ -523,6 +528,7 @@ if ! touch "$listfile"; then
 fi
 # Derived here so the parent and the in-session helper agree on it.
 listfile2="$listfile"2
+listfile3="$listfile"3
 }
 
 # Quote a value for lftp's own (shell-like) command parser.
@@ -574,6 +580,16 @@ run_lftp_script () {
     return $rc
 }
 
+# The remote listing has no size for directories, so with -ds we ask lftp for
+# one. This walks the whole tree below $remote_dl_dir (one listing per
+# subdirectory), which is why it is opt-in rather than always on. Prints
+# nothing when the flag is off, so the line simply vanishes from the script.
+du_cmd () {
+    if [[ $dir_sizes == True ]]; then
+        printf 'du -h --max-depth=1 . > %s\n' "$(lftp_quote "$listfile3")"
+    fi
+}
+
 CREATE_LIST () {
     oldfile="$listfile"_old
     cp "$listfile" "$oldfile"
@@ -584,7 +600,8 @@ CREATE_LIST () {
 $(open_cmd)
 $(set_opts)
 cd "$remote_dl_dir"
-cls -1 > "$listfile"
+cls -1 -F -h --size --date --time-style="%Y-%m-%d %H:%M" > "$listfile"
+$(du_cmd)
 cd "$data_dir""$dirname"
 cls -1 > "$listfile2"
 quit
@@ -615,7 +632,8 @@ $(open_cmd)
 set net:idle never
 $(set_opts)
 cd "$remote_dl_dir"
-cls -1 > "$listfile"
+cls -1 -F -h --size --date --time-style="%Y-%m-%d %H:%M" > "$listfile"
+$(du_cmd)
 cd "$data_dir""$dirname"
 cls -1 > "$listfile2"
 cd "$remote_dl_dir"
@@ -668,13 +686,91 @@ NEW_SESSION () {
             TYPE
             POST_PROCESS
         fi
-        rm -f "$listfile2"
+        rm -f "$listfile2" "$listfile3"
     fi
+}
+
+# Turn the raw "size date time name" listing lftp writes into the columnar
+# form the user edits: name first, then size, then date, padded so the columns
+# line up. Only the name is meaningful when the file is read back (see TYPE),
+# the other columns are there to inform the selection. Lines that do not look
+# like a listing entry (a server that omits the date, say) are passed through
+# untouched, so nothing is ever dropped from the list.
+FORMAT_LIST () {
+    if [[ ! -s $listfile ]]; then
+        return 0
+    fi
+    tmpfile=$(mktemp "${TMPDIR:-/tmp}/alftp.fmt.XXXXXX")
+    dufile=""
+    if [[ -n $listfile3 ]] && [[ -s $listfile3 ]]; then
+        dufile="$listfile3"
+    fi
+    awk -v dufile="$dufile" '
+        # With -ds, $listfile3 holds "size<TAB>./name" for every directory
+        # (plus a grand total for "."), which fills the size column the
+        # listing leaves empty.
+        BEGIN {
+            while (dufile != "" && (getline duline < dufile) > 0) {
+                tab = index(duline, "\t")
+                if (tab == 0) { continue }
+                duname = substr(duline, tab + 1)
+                sub(/^\.\//, "", duname)
+                sub(/\/+$/, "", duname)
+                if (duname == "" || duname == ".") { continue }
+                dusize[duname] = substr(duline, 1, tab - 1)
+            }
+            if (dufile != "") { close(dufile) }
+        }
+        {
+            line[NR] = $0
+            # "size date time name" (files) and, for directories, which lftp
+            # lists without a size, "date time name".
+            if (match($0, /^[ \t]*[^ \t]+[ \t]+[0-9][0-9-]+ [0-9][0-9:]+ /)) {
+                head = substr($0, 1, RLENGTH)
+                name[NR] = substr($0, RLENGTH + 1)
+                sub(/^[ \t]+/, "", head)
+                split(head, f, / +/)
+                size[NR] = f[1]
+                date[NR] = f[2] " " f[3]
+            } else if (match($0, /^[ \t]*[0-9][0-9-]+ [0-9][0-9:]+ /)) {
+                head = substr($0, 1, RLENGTH)
+                name[NR] = substr($0, RLENGTH + 1)
+                sub(/^[ \t]+/, "", head)
+                split(head, f, / +/)
+                size[NR] = ""
+                date[NR] = f[1] " " f[2]
+            }
+            # cls -F marks directories with a trailing "/". Their size, when
+            # the server gives one at all, is the size of the directory entry
+            # rather than of its contents, so du wins wherever it has an
+            # answer.
+            if (NR in name && name[NR] ~ /\/$/) {
+                key = name[NR]
+                sub(/\/$/, "", key)
+                if (key in dusize) { size[NR] = dusize[key] }
+            }
+            if (NR in name) {
+                if (length(name[NR]) > namew) { namew = length(name[NR]) }
+                if (length(size[NR]) > sizew) { sizew = length(size[NR]) }
+            }
+        }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (i in name) {
+                    printf "%-*s  %*s  %s\n", namew, name[i], sizew, size[i], date[i]
+                } else {
+                    print line[i]
+                }
+            }
+        }
+    ' "$listfile" > "$tmpfile" && mv "$tmpfile" "$listfile"
+    rm -f "$tmpfile"
 }
 
 # Let the user pick entries out of the listing. Shared by both paths: in the
 # single-session path this runs inside the lftp session, via EMIT_DL.
 EDIT_LIST () {
+    FORMAT_LIST
     if [[ $all_files == True ]]; then
         if [[ $quiet != True ]]; then
             $editor "$listfile"
@@ -717,9 +813,17 @@ POST_PROCESS () {
     done <<< "$LINESD"
 }
 
+# Inverse of FORMAT_LIST, on stdin: remove the trailing "  size  date time"
+# columns (and the padding in front of them) so only the filename is left.
+# The size column is empty for directories, hence the optional group.
+strip_columns () {
+    sed -E 's/[[:space:]]{2,}([^[:space:]]+[[:space:]]+)?[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}[[:space:]]*$//'
+}
+
 #DETERMINE IF COMMNET, FILE, DIRECTORY
 TYPE () {
-        LIST=$(cat "$listfile" | grep -v -e "^#" | grep -v -e "^$" | sed 's|@$||')
+        # Drop the size/date columns FORMAT_LIST appended, leaving the name.
+        LIST=$(cat "$listfile" | grep -v -e "^#" | grep -v -e "^$" | strip_columns | sed 's|@$||')
         LIST2=$(cat "$listfile2")
 
         while read -r line; do
