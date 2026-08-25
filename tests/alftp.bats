@@ -138,7 +138,8 @@ stage() {
     # one login for the whole run: a single open, then listing, helper, download
     [ "$(grep -c "^open " <<< "$output")" -eq 1 ]
     [[ "$output" == *"set net:idle never"* ]]          # survive the editor pause
-    [[ "$output" == *'cls -1 > "/tmp/alftp-test-list"'* ]]
+    [[ "$output" == *'--size --date'*'> "/tmp/alftp-test-list"'* ]]
+    [[ "$output" == *'cls -1 > "/tmp/alftp-test-list2"'* ]]
     [[ "$output" == *"!env ALFTP_EMIT_DL="*"ALFTP_ARGV="*"bash '/usr/local/bin/alftp'"* ]]
     [[ "$output" == *'source "'* ]]
 }
@@ -189,15 +190,20 @@ stage() {
 @test "pick_list falls back to the editor, commenting the list out for -i" {
     listfile=$(mktemp)
     log=$(mktemp)
+    stub=$(mktemp)
     printf '%s\n' 'file1  4.0K  2026-08-23 17:10' 'file2   753  2026-08-23 14:42' > "$listfile"
+    # A stub $editor that records the file it was handed and prints nothing:
+    # anything it wrote to stdout would land in $output ahead of the list.
+    printf '#!/bin/sh\nprintf %%s "$1" > %s\n' "$log" > "$stub"
+    chmod +x "$stub"
     run stage 'listfile="'"$listfile"'"; ind_files=True; picker=editor
-               editor="printf %s\n >> '"$log"' --"
+               editor="'"$stub"'"
                pick_list; cat "$listfile"'
-    rm -f "$log"
+    [ "$(cat "$log")" = "$listfile" ]
     # -i hands the editor a fully commented list for the user to uncomment.
     [ "${lines[0]}" = "#file1  4.0K  2026-08-23 17:10" ]
     [ "${lines[1]}" = "#file2   753  2026-08-23 14:42" ]
-    rm -f "$listfile"
+    rm -f "$listfile" "$log" "$stub"
 }
 
 # A small tree, built the way tui_fetch would: three top-level entries, the
@@ -286,9 +292,9 @@ SNIP
         tui_cur=4; tui_mark_remove
                         tui_set_all 1; marks; echo "$tui_nsel/$tui_nrm"
                         tui_set_all 0; marks; echo "$tui_nsel/$tui_nrm"'
-    [ "${lines[0]}" = "[++++ +]" ]
+    [ "${lines[0]}" = "[++++-+]" ]
     [ "${lines[1]}" = "2/1" ]
-    [ "${lines[2]}" = "[     -]" ]
+    [ "${lines[2]}" = "[    - ]" ]
     [ "${lines[3]}" = "0/1" ]
 }
 
@@ -314,9 +320,12 @@ SNIP
 
 @test "TYPE splits the picked list into mirrors, pgets and unlinks" {
     listfile=$(mktemp); listfile2=$(mktemp)
+    # Two spaces before the size column, which is what FORMAT_LIST and
+    # tui_save always write: strip_columns needs them to tell the columns from
+    # a name that has spaces in it.
     printf '%s\n' '*Rel.One-GRP@          4.1G  2026-08-23 17:10' \
                   '+Rel.One-GRP/CD1/            2026-08-23 17:10' \
-                  '+Rel.One-GRP/movie.mkv 4.0G  2026-08-23 17:10' \
+                  '+Rel.One-GRP/movie.mkv  4.0G  2026-08-23 17:10' \
                   '-Rel.Two-GRP@          2.7G  2026-08-23 14:42' \
                   '#notes.nfo             2.1K  2026-08-22 09:03' > "$listfile"
     printf '%s\n' 'Rel.One-GRP/' 'Rel.Two-GRP/' 'notes.nfo' > "$listfile2"
@@ -380,7 +389,7 @@ SNIP
         printf -v NL "\n"
         KEYS=(" " j "$NL" q s); tui_loop
         marks; echo "$tui_nsel $tui_result"'
-    [ "${lines[0]}" = "[+ +   ]" ]
+    [ "${lines[0]}" = "[* ++  ]" ]
     [ "${lines[1]}" = "2 save" ]
 }
 
