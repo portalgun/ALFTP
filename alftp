@@ -152,19 +152,28 @@ clean=""; data=""; norm=""; nounrar=""; dry_run=""
 print_fs=""; rm_list=""; rm_remote=""; no_append=""
 sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
 profilevar=""; override=""
-LINESD=""; LINESF=""; oldfile=""; listfile2=""; dirname=""
+LINESD=""; LINESF=""; LINESR=""; oldfile=""; listfile2=""; dirname=""
+rawline=""; unlink_ok=""
 two_session=""; self=""; ARGV=(); dir_sizes=""; listfile3=""
 
 # The file picker: "tui" for the terminal UI, "editor" for $editor, empty to
 # use the UI wherever the terminal can drive it. Its state lives here too --
 # TUI_RAW holds one line of the listing per entry and TUI_SEL its "+" flag.
-picker=""; tui_why=""; tui_result=""; tui_answer=""; tui_prompt=""
+picker=""; tui_why=""; tui_result=""; tui_answer=""; tui_prompt=""; tui_msg=""
 tui_action=""; tui_fitted=""; tui_scratch=""; tui_line=""; tui_out=""
-tui_left=""; tui_right=""; tui_pad=0; tui_i=0
-tui_cur=0; tui_top=0; tui_nsel=0; tui_resized=0; tui_open_flag=0
-tui_namew=0; tui_sizew=0; tui_saved_stty=""
+tui_left=""; tui_right=""; tui_pad=0; tui_i=0; tui_id=0; tui_node=0
+tui_cur=0; tui_top=0; tui_nsel=0; tui_nrm=0; tui_resized=0; tui_open_flag=0
+tui_namew=0; tui_sizew=0; tui_pathw=0; tui_saved_stty=""
 tui_saved_int=""; tui_saved_term=""; tui_saved_winch=""
-TUI_RAW=(); TUI_SEL=(); TUI_N=0; TUI_KEY=""
+tui_nodes=0; tui_new_id=0; tui_stripped=""; tui_mark=""; tui_anc=-1
+tui_old=0; tui_delta=0; tui_p=0; tui_d=0; tui_r0=0; tui_r1=0; tui_skipd=-1
+tui_walk=0; tui_step=0; tui_kid=0; tui_isdir=0; tui_nm=""; tui_sz=""; tui_dt=""
+tui_raw=""; tui_log=""; tui_script=""
+tui_chain=(); tui_kids=(); tui_kidsnew=()
+TUI_NAME=(); TUI_PATH=(); TUI_SIZE=(); TUI_DATE=(); TUI_DEPTH=(); TUI_PARENT=()
+TUI_ISDIR=(); TUI_OPEN=(); TUI_LOADED=(); TUI_STATE=(); TUI_SELCNT=(); TUI_POS=()
+TUI_ORDER=(); TUI_VIS=(); declare -A TUI_DIRMAP=()
+TUI_N=0; TUI_KEY=""
 TUI_IN=0; TUI_OUT=1; tui_owns_fd=0; tui_dev_tty=0
 TUI_LINES=0; TUI_COLS=0; TUI_ROWS=0
 t_smcup=""; t_rmcup=""; t_civis=""; t_cnorm=""; t_clear=""; t_home=""
@@ -683,7 +692,7 @@ EOF
 EMIT_DL () {
     EDIT_LIST
     TYPE
-    { DLDR; DLFL; } > "$ALFTP_EMIT_DL"
+    { DLDR; DLFL; DLRM; } > "$ALFTP_EMIT_DL"
 }
 
 NEW_SESSION () {
@@ -702,7 +711,7 @@ NEW_SESSION () {
             CREATE_LIST
             EDIT_LIST
             TYPE
-            if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]]; then
+            if [[ ! -z $LINESF ]] || [[ ! -z $LINESD ]] || [[ ! -z $LINESR ]]; then
                 DOWNLD
                 POST_PROCESS
             fi
@@ -724,16 +733,11 @@ NEW_SESSION () {
 # the other columns are there to inform the selection. Lines that do not look
 # like a listing entry (a server that omits the date, say) are passed through
 # untouched, so nothing is ever dropped from the list.
-FORMAT_LIST () {
-    if [[ ! -s $listfile ]]; then
-        return 0
-    fi
-    tmpfile=$(mktemp "${TMPDIR:-/tmp}/alftp.fmt.XXXXXX")
-    dufile=""
-    if [[ -n $listfile3 ]] && [[ -s $listfile3 ]]; then
-        dufile="$listfile3"
-    fi
-    awk -v dufile="$dufile" '
+# The awk that does it, factored out so the picker can put a freshly fetched
+# subdirectory listing through the same transformation ($2 is the du file, or
+# empty when there is none).
+format_columns () {
+    awk -v dufile="$2" '
         # With -ds, $listfile3 holds "size<TAB>./name" for every directory
         # (plus a grand total for "."), which fills the size column the
         # listing leaves empty.
@@ -791,7 +795,19 @@ FORMAT_LIST () {
                 }
             }
         }
-    ' "$listfile" > "$tmpfile" && mv "$tmpfile" "$listfile"
+    ' "$1"
+}
+
+FORMAT_LIST () {
+    if [[ ! -s $listfile ]]; then
+        return 0
+    fi
+    tmpfile=$(mktemp "${TMPDIR:-/tmp}/alftp.fmt.XXXXXX")
+    dufile=""
+    if [[ -n $listfile3 ]] && [[ -s $listfile3 ]]; then
+        dufile="$listfile3"
+    fi
+    format_columns "$listfile" "$dufile" > "$tmpfile" && mv "$tmpfile" "$listfile"
     rm -f "$tmpfile"
 }
 
@@ -802,6 +818,14 @@ FORMAT_LIST () {
 # to whichever fds reach the terminal -- /dev/tty when there is one, stdin and
 # stdout otherwise, which is what makes it work in the single-session path,
 # where this code runs inside the "!" shell-out from lftp.
+#
+# What the user picks is a tree: Tab lists a remote directory (over a short
+# lived lftp login of its own, since the session that spawned this one is
+# blocked waiting for it) and its entries appear indented underneath. A node
+# carries one of three states -- nothing, "+" download, "-" remove the source
+# symlink -- and a directory holding a selection it does not itself have shows
+# "*". Everything below is indexed by node id; TUI_ORDER is the tree flattened
+# for display and TUI_VIS the part of it that open directories make visible.
 
 # What the UI needs. Anything missing (no terminal, no terminfo, a terminal too
 # small or too dumb) falls back to $editor instead of failing the run; $tui_why
@@ -895,58 +919,321 @@ tui_rows_calc () {
     fi
 }
 
-# Read the list the user is choosing from. A leading "#" is how the editor
-# convention marks a line as not wanted, so it comes off here -- everything
-# starts deselected either way, and "a" is one keystroke away.
+tui_reset () {
+    TUI_NAME=(); TUI_PATH=(); TUI_SIZE=(); TUI_DATE=()
+    TUI_DEPTH=(); TUI_PARENT=(); TUI_ISDIR=(); TUI_OPEN=(); TUI_LOADED=()
+    TUI_STATE=(); TUI_SELCNT=(); TUI_POS=()
+    TUI_ORDER=(); TUI_VIS=()
+    tui_nodes=0; TUI_N=0; tui_nsel=0; tui_nrm=0
+}
+
+# The classifier cls -F puts on a name ("/" for a directory, "@" for a symlink)
+# is display only: it has no place in a path handed back to lftp.
+tui_strip_class () {
+    tui_stripped=${1%[/@*]}
+}
+
+tui_add_node () {
+    tui_new_id=$tui_nodes
+    tui_nodes=$(( tui_nodes + 1 ))
+    TUI_NAME[tui_new_id]=$1
+    TUI_SIZE[tui_new_id]=$2
+    TUI_DATE[tui_new_id]=$3
+    TUI_PARENT[tui_new_id]=$4
+    TUI_ISDIR[tui_new_id]=$5
+    TUI_STATE[tui_new_id]=0
+    TUI_SELCNT[tui_new_id]=0
+    TUI_OPEN[tui_new_id]=0
+    TUI_LOADED[tui_new_id]=0
+    TUI_POS[tui_new_id]=0
+    if (( $4 < 0 )); then
+        TUI_DEPTH[tui_new_id]=0
+        # Top level keeps the name exactly as the listing had it, classifier
+        # and all, because TYPE resolves those against $listfile2 the way it
+        # always has.
+        TUI_PATH[tui_new_id]=$1
+    else
+        TUI_DEPTH[tui_new_id]=$(( TUI_DEPTH[$4] + 1 ))
+        tui_strip_class "${TUI_PATH[$4]}"
+        tui_scratch=$tui_stripped
+        tui_strip_class "$1"
+        # A path below the top level is the one thing TYPE cannot look up, so
+        # it carries its own type: a trailing "/" means directory.
+        if [[ $5 == 1 ]]; then
+            TUI_PATH[tui_new_id]="$tui_scratch/$tui_stripped/"
+        else
+            TUI_PATH[tui_new_id]="$tui_scratch/$tui_stripped"
+        fi
+    fi
+}
+
+# Split a formatted listing into name/size/date records. Any marker written by
+# a previous pass comes off here: a reloaded list starts deselected like any
+# other.
+tui_parse_listing () {
+    awk '
+        {
+            line = $0
+            sub(/^[-+*#]/, "", line)
+            if (line ~ /^[ \t]*$/) { next }
+            if (match(line, /[ \t][ \t]+[^ \t]*[ \t]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9][ \t]*$/)) {
+                nm = substr(line, 1, RSTART - 1)
+                n = split(substr(line, RSTART), f, /[ \t]+/)
+                if (n >= 4) { sz = f[2]; dt = f[3] " " f[4] } else { sz = ""; dt = f[2] " " f[3] }
+            } else {
+                nm = line
+                sz = ""
+                dt = ""
+            }
+            sub(/[ \t]+$/, "", nm)
+            if (nm == "" || nm == "." || nm == ".." || nm == "./" || nm == "../") { next }
+            print nm "\t" sz "\t" dt
+        }
+    ' "$1"
+}
+
+# The top level of the tree. Which of those entries are directories is the same
+# question TYPE asks, and it has the same answer: $listfile2, the listing of
+# the real directory behind the symlinks.
 tui_load () {
-    TUI_RAW=()
-    TUI_SEL=()
-    while IFS= read -r tui_scratch || [[ -n $tui_scratch ]]; do
-        tui_scratch=${tui_scratch#\#}
-        if [[ -z ${tui_scratch//[[:space:]]/} ]]; then
+    tui_reset
+    unset TUI_DIRMAP
+    declare -gA TUI_DIRMAP=()
+    if [[ -n $listfile2 ]] && [[ -s $listfile2 ]]; then
+        while IFS= read -r tui_scratch || [[ -n $tui_scratch ]]; do
+            if [[ $tui_scratch == */ ]]; then
+                TUI_DIRMAP[${tui_scratch%/}]=1
+            fi
+        done < "$listfile2"
+    fi
+    while IFS=$'\t' read -r tui_nm tui_sz tui_dt; do
+        tui_isdir=0
+        tui_strip_class "$tui_nm"
+        if [[ $tui_nm == */ ]] || [[ -n ${TUI_DIRMAP[$tui_stripped]:-} ]]; then
+            tui_isdir=1
+        fi
+        tui_add_node "$tui_nm" "$tui_sz" "$tui_dt" -1 "$tui_isdir"
+        TUI_ORDER+=("$tui_new_id")
+    done < <(tui_parse_listing "$listfile")
+    tui_reindex
+    tui_rebuild_vis
+    tui_widths
+}
+
+tui_reindex () {
+    for (( tui_i = 0; tui_i < ${#TUI_ORDER[@]}; tui_i++ )); do
+        TUI_POS[${TUI_ORDER[tui_i]}]=$tui_i
+    done
+}
+
+# Everything under a closed directory drops out of view; TUI_N counts what is
+# left, so movement and drawing work on rows without knowing about the tree.
+tui_rebuild_vis () {
+    TUI_VIS=()
+    tui_skipd=-1
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( tui_skipd >= 0 )) && (( TUI_DEPTH[tui_id] > tui_skipd )); then
             continue
         fi
-        TUI_RAW+=("$tui_scratch")
-        TUI_SEL+=(0)
-    done < "$listfile"
-    TUI_N=${#TUI_RAW[@]}
-}
-
-# Write the selection back in the form TYPE reads: chosen lines uncommented,
-# the rest commented out, columns untouched.
-tui_save () {
-    tui_scratch=$(mktemp "${TMPDIR:-/tmp}/alftp.sel.XXXXXX")
-    for (( tui_i = 0; tui_i < TUI_N; tui_i++ )); do
-        if [[ ${TUI_SEL[tui_i]} == 1 ]]; then
-            printf '%s\n' "${TUI_RAW[tui_i]}"
-        else
-            printf '#%s\n' "${TUI_RAW[tui_i]}"
+        tui_skipd=-1
+        TUI_VIS+=("$tui_id")
+        if (( TUI_ISDIR[tui_id] == 1 )) && (( TUI_OPEN[tui_id] == 0 )); then
+            tui_skipd=${TUI_DEPTH[tui_id]}
         fi
-    done > "$tui_scratch" && mv "$tui_scratch" "$listfile"
-    rm -f "$tui_scratch"
+    done
+    TUI_N=${#TUI_VIS[@]}
+    if (( tui_cur >= TUI_N )); then
+        tui_cur=$(( TUI_N - 1 ))
+    fi
+    if (( tui_cur < 0 )); then
+        tui_cur=0
+    fi
+    tui_scroll
 }
 
-# Column widths for the header labels, found the same way strip_columns finds
-# the name: the leftmost "  size  date time" tail, with the size possibly
-# empty (directories). Intervals are spelled out because not every awk has
-# {n,m}.
+# Children are inserted straight after their parent, so a subtree is always a
+# run of consecutive entries -- which is what makes these two cheap.
+tui_subtree () {
+    tui_r0=$(( $1 + 1 ))
+    tui_r1=$tui_r0
+    tui_d=${TUI_DEPTH[${TUI_ORDER[$1]}]}
+    while (( tui_r1 < ${#TUI_ORDER[@]} )) && (( TUI_DEPTH[${TUI_ORDER[tui_r1]}] > tui_d )); do
+        tui_r1=$(( tui_r1 + 1 ))
+    done
+}
+
+tui_children () {
+    tui_kids=()
+    tui_subtree "${TUI_POS[$1]}"
+    tui_d=$(( TUI_DEPTH[$1] + 1 ))
+    for (( tui_i = tui_r0; tui_i < tui_r1; tui_i++ )); do
+        if (( TUI_DEPTH[${TUI_ORDER[tui_i]}] == tui_d )); then
+            tui_kids+=("${TUI_ORDER[tui_i]}")
+        fi
+    done
+}
+
+# The nearest ancestor already marked for download, if any: everything under it
+# comes along, so its descendants show "+" without holding a state of their own.
+tui_sel_ancestor () {
+    tui_anc=-1
+    tui_p=${TUI_PARENT[$1]}
+    while (( tui_p >= 0 )); do
+        if (( TUI_STATE[tui_p] == 1 )); then
+            tui_anc=$tui_p
+            return 0
+        fi
+        tui_p=${TUI_PARENT[tui_p]}
+    done
+    return 0
+}
+
+# The one place a state changes, so the "some of this directory is selected"
+# counters can be kept up to date on the way past.
+tui_set_state () {
+    tui_old=${TUI_STATE[$1]}
+    if (( tui_old == $2 )); then
+        return 0
+    fi
+    TUI_STATE[$1]=$2
+    tui_delta=0
+    if (( tui_old == 1 )); then
+        tui_delta=$(( tui_delta - 1 ))
+    fi
+    if (( $2 == 1 )); then
+        tui_delta=$(( tui_delta + 1 ))
+    fi
+    if (( tui_old == 2 )); then
+        tui_nrm=$(( tui_nrm - 1 ))
+    fi
+    if (( $2 == 2 )); then
+        tui_nrm=$(( tui_nrm + 1 ))
+    fi
+    if (( tui_delta != 0 )); then
+        tui_nsel=$(( tui_nsel + tui_delta ))
+        tui_p=${TUI_PARENT[$1]}
+        while (( tui_p >= 0 )); do
+            TUI_SELCNT[tui_p]=$(( TUI_SELCNT[tui_p] + tui_delta ))
+            tui_p=${TUI_PARENT[tui_p]}
+        done
+    fi
+}
+
+tui_clear_subtree () {
+    tui_subtree "${TUI_POS[$1]}"
+    for (( tui_i = tui_r0; tui_i < tui_r1; tui_i++ )); do
+        tui_set_state "${TUI_ORDER[tui_i]}" 0
+    done
+}
+
+# Taking one entry out of a directory that was selected whole: the directory
+# stops being a single mirror and becomes the list of everything it holds
+# except this one.
+tui_split_ancestor () {
+    tui_chain=("$1")
+    tui_p=${TUI_PARENT[$1]}
+    while (( tui_p >= 0 )) && (( tui_p != $2 )); do
+        tui_chain=("$tui_p" ${tui_chain[@]+"${tui_chain[@]}"})
+        tui_p=${TUI_PARENT[tui_p]}
+    done
+    tui_set_state "$2" 0
+    tui_walk=$2
+    for tui_step in ${tui_chain[@]+"${tui_chain[@]}"}; do
+        tui_children "$tui_walk"
+        for tui_kid in ${tui_kids[@]+"${tui_kids[@]}"}; do
+            if (( tui_kid != tui_step )); then
+                tui_set_state "$tui_kid" 1
+            fi
+        done
+        tui_walk=$tui_step
+    done
+    tui_set_state "$1" 0
+}
+
+tui_toggle () {
+    tui_node=${TUI_VIS[tui_cur]}
+    if (( TUI_STATE[tui_node] == 2 )); then
+        tui_set_state "$tui_node" 1
+        return 0
+    fi
+    tui_sel_ancestor "$tui_node"
+    if (( tui_anc >= 0 )); then
+        tui_split_ancestor "$tui_node" "$tui_anc"
+        return 0
+    fi
+    if (( TUI_STATE[tui_node] == 1 )); then
+        tui_set_state "$tui_node" 0
+        return 0
+    fi
+    # A directory showing "*" holds a selection made further down; space takes
+    # all of it back rather than swallowing the directory whole.
+    if (( TUI_SELCNT[tui_node] > 0 )); then
+        tui_clear_subtree "$tui_node"
+        return 0
+    fi
+    tui_clear_subtree "$tui_node"
+    tui_set_state "$tui_node" 1
+}
+
+# "d" marks the source symlink for removal, which only the top level has one
+# of: everything below is a real file or directory inside the target.
+tui_mark_remove () {
+    tui_node=${TUI_VIS[tui_cur]}
+    if (( TUI_DEPTH[tui_node] > 0 )); then
+        tui_msg="only a top-level entry has a symlink to remove"
+        return 0
+    fi
+    if (( TUI_STATE[tui_node] == 2 )); then
+        tui_set_state "$tui_node" 0
+    else
+        tui_clear_subtree "$tui_node"
+        tui_set_state "$tui_node" 2
+    fi
+}
+
+# a/A work on the download selection and leave the "-" marks alone: they are a
+# separate decision about the remote side.
+tui_set_all () {
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( TUI_DEPTH[tui_id] > 0 )); then
+            tui_set_state "$tui_id" 0
+        elif (( TUI_STATE[tui_id] != 2 )); then
+            tui_set_state "$tui_id" "$1"
+        fi
+    done
+}
+
+# Column widths over every node loaded, indentation included, so the columns
+# stay put when a directory is opened or closed.
 tui_widths () {
-    tui_scratch=$(sed 's/^#//' "$listfile" | awk '
-        {
-            if (match($0, /[ \t][ \t]+[^ \t]*[ \t]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9][ \t]*$/)) {
-                nm = substr($0, 1, RSTART - 1)
-                n = split(substr($0, RSTART), f, /[ \t]+/)
-                sz = (n >= 4) ? f[2] : ""
-                if (length(nm) > nw) { nw = length(nm) }
-                if (length(sz) > sw) { sw = length(sz) }
-            } else if (length($0) > nw) {
-                nw = length($0)
-            }
-        }
-        END { print nw+0, sw+0 }
-    ')
-    tui_namew=${tui_scratch%% *}
-    tui_sizew=${tui_scratch##* }
+    tui_namew=0
+    tui_sizew=0
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        tui_i=$(( TUI_DEPTH[tui_id] * 2 + ${#TUI_NAME[tui_id]} ))
+        if (( tui_i > tui_namew )); then
+            tui_namew=$tui_i
+        fi
+        if (( ${#TUI_SIZE[tui_id]} > tui_sizew )); then
+            tui_sizew=${#TUI_SIZE[tui_id]}
+        fi
+    done
+}
+
+tui_marker () {
+    if (( TUI_STATE[$1] == 2 )); then
+        tui_mark="-"
+    elif (( TUI_STATE[$1] == 1 )); then
+        tui_mark="+"
+    else
+        tui_sel_ancestor "$1"
+        if (( tui_anc >= 0 )); then
+            tui_mark="+"
+        elif (( TUI_SELCNT[$1] > 0 )); then
+            tui_mark="*"
+        else
+            tui_mark=" "
+        fi
+    fi
 }
 
 # Cut a line to the width of the terminal so nothing wraps and shifts the rest
@@ -966,7 +1253,10 @@ tui_fit () {
 # padded and cleared to the right edge, so what was there before is covered.
 tui_draw () {
     tui_left="alftp  ${remote_dl_dir}"
-    tui_right="${tui_nsel} of ${TUI_N} selected"
+    tui_right="${tui_nsel} selected"
+    if (( tui_nrm > 0 )); then
+        tui_right="$tui_right, $tui_nrm to unlink"
+    fi
     tui_pad=$(( TUI_COLS - ${#tui_left} - ${#tui_right} - 2 ))
     if (( tui_pad < 1 )); then
         tui_fit "$tui_left" $(( TUI_COLS - ${#tui_right} - 3 ))
@@ -984,11 +1274,12 @@ tui_draw () {
 
     for (( tui_i = tui_top; tui_i < tui_top + TUI_ROWS; tui_i++ )); do
         if (( tui_i < TUI_N )); then
-            if [[ ${TUI_SEL[tui_i]} == 1 ]]; then
-                tui_line="+ ${TUI_RAW[tui_i]}"
-            else
-                tui_line="  ${TUI_RAW[tui_i]}"
-            fi
+            tui_id=${TUI_VIS[tui_i]}
+            tui_marker "$tui_id"
+            printf -v tui_line '%s %*s%-*s  %*s  %s' "$tui_mark" \
+                "$(( TUI_DEPTH[tui_id] * 2 ))" "" \
+                "$(( tui_namew - TUI_DEPTH[tui_id] * 2 ))" "${TUI_NAME[tui_id]}" \
+                "$tui_sizew" "${TUI_SIZE[tui_id]}" "${TUI_DATE[tui_id]}"
             tui_fit "$tui_line" "$TUI_COLS"
             if (( tui_i == tui_cur )); then
                 printf -v tui_line '%-*s' "$TUI_COLS" "$tui_fitted"
@@ -1006,7 +1297,13 @@ tui_draw () {
         printf -v tui_line '%-*s' "$TUI_COLS" "$tui_fitted"
         tui_out+="${t_rev}${tui_line}${t_sgr0}${t_el}"
     else
-        tui_line="j/k move  space toggle  a all  A none  q quit"
+        if [[ -n $tui_msg ]]; then
+            tui_line=$tui_msg
+        elif (( TUI_COLS >= 74 )); then
+            tui_line="j/k move  space toggle  tab open dir  d unlink  a all  A none  q quit"
+        else
+            tui_line="j/k  space  tab  d  a/A  q"
+        fi
         if (( TUI_N > TUI_ROWS )); then
             printf -v tui_line '%s   %s-%s/%s' "$tui_line" \
                 "$(( tui_top + 1 ))" "$(( tui_top + TUI_ROWS < TUI_N ? tui_top + TUI_ROWS : TUI_N ))" "$TUI_N"
@@ -1046,6 +1343,8 @@ tui_key_action () {
         $'\e[5~')                              tui_action=pgup ;;
         $'\e[6~')                              tui_action=pgdn ;;
         ' '|$'\n'|$'\r')                       tui_action=toggle ;;
+        $'\t')                                 tui_action=open ;;
+        d)                                     tui_action="unlink" ;;
         a)                                     tui_action=all ;;
         A)                                     tui_action=none ;;
         q|$'\e')                               tui_action=quit ;;
@@ -1089,25 +1388,75 @@ tui_scroll () {
     fi
 }
 
-tui_toggle () {
-    if [[ ${TUI_SEL[tui_cur]} == 1 ]]; then
-        TUI_SEL[tui_cur]=0
-        tui_nsel=$(( tui_nsel - 1 ))
-    else
-        TUI_SEL[tui_cur]=1
-        tui_nsel=$(( tui_nsel + 1 ))
+# List one remote directory. The session that spawned this one is blocked in
+# its "!" waiting for the picker to finish, so this is a login of its own --
+# once per directory, since what it finds stays in the tree.
+tui_fetch () {
+    tui_strip_class "${TUI_PATH[$1]}"
+    tui_msg="listing ${TUI_NAME[$1]} ..."
+    tui_draw
+    tui_raw=$(mktemp "${TMPDIR:-/tmp}/alftp.sub.XXXXXX")
+    tui_log=$(mktemp "${TMPDIR:-/tmp}/alftp.sublog.XXXXXX")
+    tui_script=$(mktemp "${TMPDIR:-/tmp}/alftp.subcmd.XXXXXX")
+    #DO NOT INDENT CONTENTS
+    cat > "$tui_script" << EOF
+$(open_cmd)
+$(set_opts)
+cd "$remote_dl_dir"
+cd $(lftp_quote "$tui_stripped")
+cls -1 -F -h --size --date --time-style="%Y-%m-%d %H:%M" > $(lftp_quote "$tui_raw")
+quit
+EOF
+    tui_msg=""
+    if ! lftp -f "$tui_script" < /dev/null > "$tui_log" 2>&1; then
+        tui_msg="could not list ${TUI_NAME[$1]}: $(head -n 1 "$tui_log")"
+        if [[ -n ${ALFTP_DEBUG:-} ]]; then
+            tui_msg="$tui_msg (script $tui_script)"
+        else
+            rm -f "$tui_script" "$tui_raw" "$tui_log"
+        fi
+        return 1
     fi
+    tui_kidsnew=()
+    while IFS=$'\t' read -r tui_nm tui_sz tui_dt; do
+        tui_isdir=0
+        if [[ $tui_nm == */ ]]; then
+            tui_isdir=1
+        fi
+        tui_add_node "$tui_nm" "$tui_sz" "$tui_dt" "$1" "$tui_isdir"
+        tui_kidsnew+=("$tui_new_id")
+    done < <(format_columns "$tui_raw" "" | tui_parse_listing /dev/stdin)
+    tui_i=${TUI_POS[$1]}
+    TUI_ORDER=("${TUI_ORDER[@]:0:tui_i + 1}" ${tui_kidsnew[@]+"${tui_kidsnew[@]}"} \
+               "${TUI_ORDER[@]:tui_i + 1}")
+    TUI_LOADED[$1]=1
+    tui_reindex
+    tui_widths
+    if (( ${#tui_kidsnew[@]} == 0 )); then
+        tui_msg="${TUI_NAME[$1]} is empty"
+    fi
+    rm -f "$tui_script" "$tui_raw" "$tui_log"
+    return 0
 }
 
-tui_set_all () {
-    for (( tui_i = 0; tui_i < TUI_N; tui_i++ )); do
-        TUI_SEL[tui_i]=$1
-    done
-    if [[ $1 == 1 ]]; then
-        tui_nsel=$TUI_N
-    else
-        tui_nsel=0
+tui_toggle_open () {
+    tui_node=${TUI_VIS[tui_cur]}
+    if (( TUI_ISDIR[tui_node] == 0 )); then
+        tui_msg="${TUI_NAME[tui_node]} is not a directory"
+        return 0
     fi
+    if (( TUI_OPEN[tui_node] == 1 )); then
+        TUI_OPEN[tui_node]=0
+        tui_rebuild_vis
+        return 0
+    fi
+    if (( TUI_LOADED[tui_node] == 0 )); then
+        if ! tui_fetch "$tui_node"; then
+            return 0
+        fi
+    fi
+    TUI_OPEN[tui_node]=1
+    tui_rebuild_vis
 }
 
 # q asks before it does anything irreversible. Drawn as the footer of the
@@ -1146,6 +1495,7 @@ tui_loop () {
             tui_result="exit"
             return 0
         fi
+        tui_msg=""
         tui_key_action "$TUI_KEY"
         case $tui_action in
             up|down|top|bottom|pgup|pgdn)
@@ -1153,6 +1503,12 @@ tui_loop () {
                 ;;
             toggle)
                 tui_toggle
+                ;;
+            open)
+                tui_toggle_open
+                ;;
+            unlink)
+                tui_mark_remove
                 ;;
             all)
                 tui_set_all 1
@@ -1237,7 +1593,50 @@ tui_abort () {
     exit 130
 }
 
+# Write the selection back for TYPE to read: one line per node that says
+# something, marked "+" download, "-" unlink, "*" a directory whose selection
+# is on the lines below it, "#" not wanted. A path below the top level carries
+# its own trailing "/" when it is a directory.
+tui_save () {
+    tui_pathw=0
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( ${#TUI_PATH[tui_id]} > tui_pathw )); then
+            tui_pathw=${#TUI_PATH[tui_id]}
+        fi
+    done
+    tui_scratch=$(mktemp "${TMPDIR:-/tmp}/alftp.sel.XXXXXX")
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( TUI_DEPTH[tui_id] > 0 )) && (( TUI_STATE[tui_id] == 0 )) \
+           && (( TUI_SELCNT[tui_id] == 0 )); then
+            continue
+        fi
+        case ${TUI_STATE[tui_id]} in
+            2) tui_mark="-" ;;
+            1) tui_mark="+" ;;
+            *)
+                if (( TUI_SELCNT[tui_id] > 0 )); then
+                    tui_mark="*"
+                else
+                    tui_mark="#"
+                fi
+                ;;
+        esac
+        if [[ -z ${TUI_DATE[tui_id]} ]]; then
+            printf '%s%s\n' "$tui_mark" "${TUI_PATH[tui_id]}"
+        else
+            printf '%s%-*s  %*s  %s\n' "$tui_mark" "$tui_pathw" "${TUI_PATH[tui_id]}" \
+                "$tui_sizew" "${TUI_SIZE[tui_id]}" "${TUI_DATE[tui_id]}"
+        fi
+    done > "$tui_scratch" && mv "$tui_scratch" "$listfile"
+    rm -f "$tui_scratch"
+}
+
 tui_select () {
+    tui_cur=0
+    tui_top=0
+    tui_prompt=""
+    tui_msg=""
+    tui_resized=0
     tui_load
     if (( TUI_N == 0 )); then
         echo "alftp: the listing is empty, nothing to pick."
@@ -1247,18 +1646,16 @@ tui_select () {
         tui_why="cannot open the terminal"
         return 1
     fi
-    tui_cur=0
-    tui_top=0
-    tui_nsel=0
-    tui_prompt=""
-    tui_resized=0
     tui_size
-    tui_widths
     tui_loop
     tui_close
     if [[ $tui_result == save ]]; then
         tui_save
-        echo "alftp: saved $tui_nsel of $TUI_N item(s) to $listfile."
+        if (( tui_nrm > 0 )); then
+            echo "alftp: saved $tui_nsel selection(s) and $tui_nrm unlink(s) to $listfile."
+        else
+            echo "alftp: saved $tui_nsel selection(s) to $listfile."
+        fi
     else
         : > "$listfile"
         echo "alftp: nothing selected."
@@ -1337,31 +1734,66 @@ strip_columns () {
 }
 
 #DETERMINE IF COMMNET, FILE, DIRECTORY
+# Reads the picked list into three: directories to mirror, files to pget, and
+# entries whose source symlink is to be removed. The leading character says
+# which -- "+" download, "-" unlink, "#"/"*" leave alone -- and a line with no
+# marker at all is a download, which is what hand-editing the file produces.
 TYPE () {
-        # Drop the size/date columns FORMAT_LIST appended, leaving the name.
-        LIST=$(cat "$listfile" | grep -v -e "^#" | grep -v -e "^$" | strip_columns | sed 's|@$||')
-        LIST2=$(cat "$listfile2")
+        LIST=$(awk '
+            {
+                line = $0
+                if (line ~ /^[#*]/) { next }
+                if (line ~ /^[ \t]*$/) { next }
+                act = "get"
+                if (substr(line, 1, 1) == "-") { act = "rm"; line = substr(line, 2) }
+                else if (substr(line, 1, 1) == "+") { line = substr(line, 2) }
+                print act "\t" line
+            }
+        ' "$listfile" | strip_columns | sed 's|@$||')
+        LIST2=$(cat "$listfile2" 2> /dev/null) || LIST2=""
 
-        while read -r line; do
+        while IFS=$'\t' read -r act line; do
             if [[ -z $line ]]; then
+                continue
+            fi
+            if [[ $act == rm ]]; then
+                # The name of the symlink to drop, without the "/" the listing
+                # puts on a directory.
+                add_line LINESR "$(echo "${line%/}" | sed 's|\s$|&SsS|')"
+                continue
+            fi
+            # Anything below the top level was never in $listfile2 to be looked
+            # up, so its path carries its own type: a trailing "/" is a
+            # directory. The path is kept whole, which is what puts the
+            # download under the same structure it has on the server.
+            if [[ ${line%/} == */* ]]; then
+                if [[ $line == */ ]]; then
+                    add_line LINESD "$(echo "${line%/}" | sed 's|\s$|&SsS|')"
+                else
+                    add_line LINESF "$(echo "$line" | sed 's|\s$|&SsS|')"
+                fi
                 continue
             fi
 	    # XXX
             lined=$(echo "$LIST2" | grep -F "$line" | grep -e "/$" | sed 's|/$||' | sed 's|\s$|&SsS|') # last portion, handle trailing whitespace
             linef=$(echo "$LIST2" | grep -F "$line" | grep -v -e "/$" | grep -v -e "^$" | sed 's|\s$|&SsS|')
 
-            if [[ ! -z $lined ]] && [[ -z $LINESD ]]; then
-                LINESD="$lined"
-            elif [[ ! -z $lined ]]; then
-                LINESD=$(echo -e "$LINESD\n$lined" )
-            fi
-
-            if [[ ! -z $linef ]] && [[ -z $LINESF ]]; then
-                LINESF="$linef"
-            elif [[ ! -z $linef ]]; then
-                LINESF=$(echo -e "$LINESF\n$linef")
-            fi
+            add_line LINESD "$lined"
+            add_line LINESF "$linef"
         done <<< "$LIST"
+}
+
+# Append to one of the newline-separated LINES* strings, skipping empties.
+# (Plain concatenation, not echo -e, so a backslash in a name survives.)
+add_line () {
+    if [[ -z $2 ]]; then
+        return 0
+    fi
+    if [[ -z ${!1} ]]; then
+        printf -v "$1" '%s' "$2"
+    else
+        printf -v "$1" '%s\n%s' "${!1}" "$2"
+    fi
 }
 
 #INITIATE SESSION AND DOWNLOAD
@@ -1374,6 +1806,7 @@ cd "$remote_dl_dir"
 $(set_opts)
 $(DLDR)
 $(DLFL)
+$(DLRM)
 EOF
 run_lftp_script "$scriptfile"
 }
@@ -1396,53 +1829,88 @@ set_opts () {
 #set sftp:charset UTF-8
 
 #DOWNLOAD DIRECTORIES
+# mirror -c is what makes a run resumable: it picks a partial transfer up where
+# it stopped, and skips what already matches the remote, so re-running after an
+# interruption (or after picking more out of the same directory) costs only
+# what is actually missing. Permissions and timestamps come across with it,
+# which is the rest of what "rsync -a" means here.
 DLDR () {
-    while read -r line; do
-        #line=$(echo "$line" | sed 's|SsS$| |') # handle trailing whitespace and brackets
-        #echo echo "\"$line\""
-        line=$(echo "$line" | sed 's|SsS$| |' | sed 's/\[/"\["/g') # handle trailing whitespace and brackets
-        #line=$(echo "$line" | sed 's|[ \t]*$| |' | sed 's/\[/"\["/g') # handle trailing whitespace and brackets
-        #echo echo "\"$line\""
-        if [[ -z $line ]]; then
+    while read -r rawline; do
+        rawline=$(echo "$rawline" | sed 's|SsS$| |') # handle trailing whitespace
+        if [[ -z $rawline ]]; then
             continue
+        fi
+        line=$(echo "$rawline" | sed 's/\[/"\["/g')  # and brackets, for lftp's glob
+        # A path with a directory in it came from inside an opened directory:
+        # it lands under the same structure locally, and its symlink is not
+        # this run's to remove -- only whole top-level entries have one.
+        if [[ $rawline == */* ]]; then
+            unlink_ok=""
+        else
+            unlink_ok=1
         fi
         if [[ $clean == True ]]; then
             echo "rm -f \"$line\"; !echo REMOVED: \"$line\""
         elif [[ $dry_run == True ]]; then
             echo "mirror -c -P5 --dry-run \"$line\" "$local_dl_dir"/"\"$line\""; !echo DRY-RUN: \"$line\""
-        elif [[ $norm == True ]]; then
+        elif [[ $norm == True ]] || [[ -z $unlink_ok ]]; then
             echo "mirror -c -P5 --log="\"$logfile\"" \"$line\" "$local_dl_dir"/"\"$line\""; !echo COMPLETE: \"$line\""
         else
             echo "mirror -c -P5 --log="\"$logfile\"" \"$line\" "$local_dl_dir"/"\"$line\"" && rm -f \"$line\""
-	    #if [[ $(echo "!echo "$?"") -eq 0 ]]; then
 	    echo "echo "COMPLETE: \"$line\"""
-	    #else
-	    #    echo "echo "ERROR:    \"$line\"""
-            #fi
         fi
     done <<< "$LINESD"
 }
 
 #DOWNLOAD FILES
+# pget -c continues a part-transferred file rather than starting it again.
 DLFL () {
-    #"
-    while read -r line; do
-        #line=$(echo "$line" | sed 's|SsS$| |') # handle trailing whitespace
-        line=$(echo "$line" | sed 's|SsS$| |' | sed 's/\[/"\["/g') # handle trailing whitespace and brackets
-        if [[ -z $line ]]; then
+    while read -r rawline; do
+        rawline=$(echo "$rawline" | sed 's|SsS$| |') # handle trailing whitespace
+        if [[ -z $rawline ]]; then
             continue
+        fi
+        line=$(echo "$rawline" | sed 's/\[/"\["/g')  # and brackets, for lftp's glob
+        if [[ $rawline == */* ]]; then
+            unlink_ok=""
+        else
+            unlink_ok=1
         fi
         if [[ $clean == True ]]; then
             echo "rm -f \"$line\"; !echo REMOVED: \"$line\""
         elif [[ $dry_run == True ]]; then
             echo "!echo DRY-RUN: pget \"$line\" -o "$local_dl_dir"/\"$line\""
-        elif [[ $norm == True ]]; then
-            echo "pget -n 5 \"$line\" -o "$local_dl_dir"/\"$line\"; !echo COMPLETE: \"$line\""
         else
-            echo "pget -n 5 \"$line\" -o "$local_dl_dir"/\"$line\" && rm -f \"$line\""
-            echo "echo "COMPLETE: \"$line\"""
+            # pget will not make the directory a nested file has to go in.
+            if [[ $rawline == */* ]]; then
+                echo "!mkdir -p $(sh_quote "$local_dl_dir/${rawline%/*}")"
+            fi
+            if [[ $norm == True ]] || [[ -z $unlink_ok ]]; then
+                echo "pget -c -n 5 \"$line\" -o "$local_dl_dir"/\"$line\"; !echo COMPLETE: \"$line\""
+            else
+                echo "pget -c -n 5 \"$line\" -o "$local_dl_dir"/\"$line\" && rm -f \"$line\""
+                echo "echo "COMPLETE: \"$line\"""
+            fi
         fi
     done <<< "$LINESF"
+}
+
+#REMOVE SOURCE SYMLINKS
+# The "-" mark in the picker: drop the symlink from the completed directory
+# without downloading anything.
+DLRM () {
+    while read -r rawline; do
+        rawline=$(echo "$rawline" | sed 's|SsS$| |')
+        if [[ -z $rawline ]]; then
+            continue
+        fi
+        line=$(echo "$rawline" | sed 's/\[/"\["/g')
+        if [[ $dry_run == True ]]; then
+            echo "!echo DRY-RUN: rm \"$line\""
+        else
+            echo "rm -f \"$line\"; !echo UNLINKED: \"$line\""
+        fi
+    done <<< "$LINESR"
 }
 
 COMPLETE () {

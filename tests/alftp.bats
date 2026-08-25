@@ -200,71 +200,174 @@ stage() {
     rm -f "$listfile"
 }
 
-@test "tui_load starts everything deselected and drops the comment markers" {
-    listfile=$(mktemp)
-    printf '%s\n' 'file1  4.0K  2026-08-23 17:10' '#file2   753  2026-08-23 14:42' '' \
-                  'dir1/   24K  2026-08-22 09:03' > "$listfile"
-    run stage 'listfile="'"$listfile"'"; tui_load
-               echo "$TUI_N ${TUI_SEL[*]} [${TUI_RAW[1]}]"'
-    rm -f "$listfile"
-    [ "$output" = "3 0 0 0 [file2   753  2026-08-23 14:42]" ]
-}
-
-@test "tui_save comments out everything that was not selected" {
-    listfile=$(mktemp)
-    printf '%s\n' 'file1  4.0K  2026-08-23 17:10' 'file2   753  2026-08-23 14:42' > "$listfile"
-    run stage 'listfile="'"$listfile"'"; tui_load; TUI_SEL[1]=1; tui_save; cat "$listfile"'
-    rm -f "$listfile"
-    [ "${lines[0]}" = "#file1  4.0K  2026-08-23 17:10" ]
-    [ "${lines[1]}" = "file2   753  2026-08-23 14:42" ]
-}
-
-@test "tui_widths measures the columns for the header" {
-    listfile=$(mktemp)
-    printf '%s\n' 'a.file.with.a.long.name  4.0K  2026-08-23 17:10' \
-                  '#dir/                          2026-08-22 09:03' > "$listfile"
-    run stage 'listfile="'"$listfile"'"; tui_widths; echo "$tui_namew $tui_sizew"'
-    rm -f "$listfile"
-    [ "$output" = "23 4" ]
-}
-
-@test "tui_key_action maps letters and escape sequences to the same actions" {
-    run stage 'for k in j "$(printf "\e[B")" k "$(printf "\e[A")" 0 "$(printf "\e[1~")" \
-                        G "$(printf "\e[F")" "$(printf "\e[5~")" "$(printf "\e[6~")" \
-                        " " "$(printf "\r")" a A q "$(printf "\e")" x; do
-                   tui_key_action "$k"; printf "%s " "$tui_action"
-               done'
-    [ "$output" = "down down up up top top bottom bottom pgup pgdn toggle toggle all none quit quit ignore " ]
-}
-
-@test "tui_move clamps at both ends and scrolls to keep the cursor visible" {
-    run stage 'TUI_N=20; TUI_ROWS=5; tui_cur=0; tui_top=0
-               tui_action=up; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
-               for i in 1 2 3 4 5 6; do tui_action=down; tui_move; done
-               printf "%s/%s " "$tui_cur" "$tui_top"
-               tui_action=pgdn; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
-               tui_action=pgup; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
-               tui_action=bottom; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
-               tui_action=down; tui_move; printf "%s/%s " "$tui_cur" "$tui_top"
-               tui_action=top; tui_move; printf "%s/%s" "$tui_cur" "$tui_top"'
-    [ "$output" = "0/0 6/2 11/7 6/6 19/15 19/15 0/0" ]
-}
-
-@test "tui_move never scrolls a list that fits on the screen" {
-    run stage 'TUI_N=3; TUI_ROWS=5; tui_cur=0; tui_top=0
-               tui_action=bottom; tui_move; echo "$tui_cur/$tui_top"'
-    [ "$output" = "2/0" ]
-}
-
-# The event loop, driven by a scripted key source instead of a terminal: the
-# draw goes to /dev/null and tui_read_key pops a key off an array.
-keys () {
+# A small tree, built the way tui_fetch would: three top-level entries, the
+# first one opened with a subdirectory and two files under it.
+# Node ids run in creation order -- 0,1,2 are the top level and 3,4,5 the
+# children -- while the cursor counts visible rows:
+#   row 0 Rel.One-GRP@  1 CD1/  2 movie.mkv  3 movie.nfo  4 Rel.Two-GRP@  5 notes.nfo
+tree () {
     cat <<'SNIP'
     exec {TUI_OUT}>/dev/null
-    TUI_RAW=(one two three four five); TUI_N=5
-    TUI_LINES=10; TUI_COLS=40; TUI_ROWS=5; remote_dl_dir=/remote
-    tui_cur=0; tui_top=0; tui_nsel=0; tui_prompt=""; tui_resized=0
-    TUI_SEL=(0 0 0 0 0); KI=0
+    listfile=$(mktemp); listfile2=$(mktemp)
+    printf '%s\n' 'Rel.One-GRP@   4.1G  2026-08-23 17:10' \
+                  'Rel.Two-GRP@   2.7G  2026-08-23 14:42' \
+                  'notes.nfo      2.1K  2026-08-22 09:03' > "$listfile"
+    printf '%s\n' 'Rel.One-GRP/' 'Rel.Two-GRP/' 'notes.nfo' > "$listfile2"
+    tui_load
+    tui_kidsnew=()
+    tui_add_node 'CD1/'      ''     '2026-08-23 17:10' 0 1; tui_kidsnew+=("$tui_new_id")
+    tui_add_node 'movie.mkv' '4.0G' '2026-08-23 17:10' 0 0; tui_kidsnew+=("$tui_new_id")
+    tui_add_node 'movie.nfo' '2.1K' '2026-08-23 17:10' 0 0; tui_kidsnew+=("$tui_new_id")
+    TUI_ORDER=("${TUI_ORDER[@]:0:1}" "${tui_kidsnew[@]}" "${TUI_ORDER[@]:1}")
+    TUI_LOADED[0]=1; TUI_OPEN[0]=1
+    tui_reindex; tui_rebuild_vis; tui_widths
+    TUI_LINES=12; TUI_COLS=60; TUI_ROWS=9; remote_dl_dir=/remote
+    marks () { m=""; for v in "${TUI_VIS[@]}"; do tui_marker "$v"; m="$m$tui_mark"; done; echo "[$m]"; }
+SNIP
+}
+
+@test "tui_load reads the top level and takes the types from listfile2" {
+    run stage "$(tree)"'
+        echo "$TUI_N ${TUI_ISDIR[0]}${TUI_ISDIR[1]}${TUI_ISDIR[2]} ${TUI_STATE[0]}${TUI_STATE[1]}${TUI_STATE[2]}"'
+    # Six rows visible (three top level, three children), the two symlinked
+    # releases are directories, everything starts deselected.
+    [ "$output" = "6 110 000" ]
+}
+
+@test "a path below the top level drops the listing's classifier" {
+    run stage "$(tree)"'
+        echo "${TUI_PATH[0]} | ${TUI_PATH[3]} | ${TUI_PATH[4]}"'
+    [ "$output" = "Rel.One-GRP@ | Rel.One-GRP/CD1/ | Rel.One-GRP/movie.mkv" ]
+}
+
+@test "one file picked inside a directory marks the directory *" {
+    run stage "$(tree)"'
+        tui_cur=2; tui_toggle; marks; echo "$tui_nsel"'
+    [ "${lines[0]}" = "[* +   ]" ]
+    [ "${lines[1]}" = "1" ]
+}
+
+@test "space on a * directory takes the whole selection back" {
+    run stage "$(tree)"'
+        tui_cur=2; tui_toggle; tui_cur=0; tui_toggle; marks; echo "$tui_nsel"'
+    [ "${lines[0]}" = "[      ]" ]
+    [ "${lines[1]}" = "0" ]
+}
+
+@test "space on a directory takes all of it, and its children show it" {
+    run stage "$(tree)"'
+        tui_cur=0; tui_toggle; marks; echo "$tui_nsel"'
+    [ "${lines[0]}" = "[++++  ]" ]
+    # One selection, not four: the directory is mirrored whole.
+    [ "${lines[1]}" = "1" ]
+}
+
+@test "taking one child back out of a whole directory splits it" {
+    run stage "$(tree)"'
+        tui_cur=0; tui_toggle; tui_cur=3; tui_toggle; marks; echo "$tui_nsel"'
+    [ "${lines[0]}" = "[*++   ]" ]
+    [ "${lines[1]}" = "2" ]
+}
+
+@test "d marks the source symlink, and only at the top level" {
+    run stage "$(tree)"'
+        tui_cur=4; tui_mark_remove; marks; echo "$tui_nrm"
+                        tui_cur=2; tui_msg=""; tui_mark_remove; echo "$tui_msg"
+                        tui_cur=4; tui_mark_remove; marks; echo "$tui_nrm"'
+    [ "${lines[0]}" = "[    - ]" ]
+    [ "${lines[1]}" = "1" ]
+    [ "${lines[2]}" = "only a top-level entry has a symlink to remove" ]
+    [ "${lines[3]}" = "[      ]" ]
+    [ "${lines[4]}" = "0" ]
+}
+
+@test "a and A work on the selection and leave the unlink marks alone" {
+    run stage "$(tree)"'
+        tui_cur=4; tui_mark_remove
+                        tui_set_all 1; marks; echo "$tui_nsel/$tui_nrm"
+                        tui_set_all 0; marks; echo "$tui_nsel/$tui_nrm"'
+    [ "${lines[0]}" = "[++++ +]" ]
+    [ "${lines[1]}" = "2/1" ]
+    [ "${lines[2]}" = "[     -]" ]
+    [ "${lines[3]}" = "0/1" ]
+}
+
+@test "tui_save writes a marker per line and nested paths in full" {
+    run stage "$(tree)"'
+        tui_cur=0; tui_toggle; tui_cur=3; tui_toggle
+                        tui_cur=4; tui_mark_remove; tui_save; cat "$listfile"'
+    # The directory is partial, so it is "*" and its selected children are
+    # listed under it; movie.nfo was taken back out, so it is not written.
+    [ "${lines[0]}" = "*Rel.One-GRP@           4.1G  2026-08-23 17:10" ]
+    [ "${lines[1]}" = "+Rel.One-GRP/CD1/             2026-08-23 17:10" ]
+    [ "${lines[2]}" = "+Rel.One-GRP/movie.mkv  4.0G  2026-08-23 17:10" ]
+    [ "${lines[3]}" = "-Rel.Two-GRP@           2.7G  2026-08-23 14:42" ]
+    [ "${lines[4]}" = "#notes.nfo              2.1K  2026-08-22 09:03" ]
+}
+
+@test "tui_widths counts the indentation of nested names" {
+    run stage "$(tree)"'
+        echo "$tui_namew $tui_sizew"'
+    # "  movie.mkv" is 11, "Rel.One-GRP@" is 12.
+    [ "$output" = "12 4" ]
+}
+
+@test "TYPE splits the picked list into mirrors, pgets and unlinks" {
+    listfile=$(mktemp); listfile2=$(mktemp)
+    printf '%s\n' '*Rel.One-GRP@          4.1G  2026-08-23 17:10' \
+                  '+Rel.One-GRP/CD1/            2026-08-23 17:10' \
+                  '+Rel.One-GRP/movie.mkv 4.0G  2026-08-23 17:10' \
+                  '-Rel.Two-GRP@          2.7G  2026-08-23 14:42' \
+                  '#notes.nfo             2.1K  2026-08-22 09:03' > "$listfile"
+    printf '%s\n' 'Rel.One-GRP/' 'Rel.Two-GRP/' 'notes.nfo' > "$listfile2"
+    run stage 'listfile="'"$listfile"'"; listfile2="'"$listfile2"'"; TYPE
+               echo "D=[$LINESD]"; echo "F=[$LINESF]"; echo "R=[$LINESR]"'
+    rm -f "$listfile" "$listfile2"
+    # The "*" line is a container, not a download; the nested paths keep their
+    # directories and the "-" line only loses its symlink.
+    [ "${lines[0]}" = "D=[Rel.One-GRP/CD1]" ]
+    [ "${lines[1]}" = "F=[Rel.One-GRP/movie.mkv]" ]
+    [ "${lines[2]}" = "R=[Rel.Two-GRP]" ]
+}
+
+@test "TYPE still reads a hand-edited list with no markers" {
+    listfile=$(mktemp); listfile2=$(mktemp)
+    printf '%s\n' 'Rel.One-GRP@   4.1G  2026-08-23 17:10' \
+                  '#notes.nfo      2.1K  2026-08-22 09:03' \
+                  'other.nfo       753  2026-08-22 09:03' > "$listfile"
+    printf '%s\n' 'Rel.One-GRP/' 'notes.nfo' 'other.nfo' > "$listfile2"
+    run stage 'listfile="'"$listfile"'"; listfile2="'"$listfile2"'"; TYPE
+               echo "D=[$LINESD] F=[$LINESF] R=[$LINESR]"'
+    rm -f "$listfile" "$listfile2"
+    [ "$output" = "D=[Rel.One-GRP] F=[other.nfo] R=[]" ]
+}
+
+@test "a nested download keeps the remote structure and the symlink" {
+    run stage 'LINESD="Rel.One-GRP/CD1"; LINESF="Rel.One-GRP/movie.mkv"
+               local_dl_dir=/dl; logfile=/dl/log; DLDR; DLFL'
+    [ "${lines[0]}" = 'mirror -c -P5 --log="/dl/log" "Rel.One-GRP/CD1" /dl/"Rel.One-GRP/CD1"; !echo COMPLETE: "Rel.One-GRP/CD1"' ]
+    # pget will not create the directory, and neither entry may unlink the
+    # release: only whole top-level entries have a symlink of their own.
+    [ "${lines[1]}" = "!mkdir -p '/dl/Rel.One-GRP'" ]
+    [ "${lines[2]}" = 'pget -c -n 5 "Rel.One-GRP/movie.mkv" -o /dl/"Rel.One-GRP/movie.mkv"; !echo COMPLETE: "Rel.One-GRP/movie.mkv"' ]
+}
+
+@test "a whole top-level entry still unlinks itself when it is done" {
+    run stage 'LINESF="notes.nfo"; local_dl_dir=/dl; DLFL'
+    [ "${lines[0]}" = 'pget -c -n 5 "notes.nfo" -o /dl/"notes.nfo" && rm -f "notes.nfo"' ]
+}
+
+@test "DLRM drops the symlink of a - entry without downloading it" {
+    run stage 'LINESR="Rel.Two-GRP"; DLRM'
+    [ "${lines[0]}" = 'rm -f "Rel.Two-GRP"; !echo UNLINKED: "Rel.Two-GRP"' ]
+    run stage 'LINESR="Rel.Two-GRP"; dry_run=True; DLRM'
+    [ "${lines[0]}" = '!echo DRY-RUN: rm "Rel.Two-GRP"' ]
+}
+
+# The event loop, driven by a scripted key source instead of a terminal.
+keys () {
+    cat <<'SNIP'
+    KI=0
     tui_read_key () {
         if (( KI >= ${#KEYS[@]} )); then return 1; fi
         TUI_KEY=${KEYS[KI]}; KI=$(( KI + 1 )); return 0
@@ -272,39 +375,55 @@ keys () {
 SNIP
 }
 
-@test "space and enter toggle the item under the cursor, q then s saves" {
-    run stage "$(keys)"'
-               printf -v NL "\n"
-               KEYS=(" " j "$NL" q s); tui_loop
-               echo "${TUI_SEL[*]} $tui_nsel $tui_result"'
-    [ "$output" = "1 1 0 0 0 2 save" ]
+@test "space and enter toggle the entry under the cursor, q then s saves" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        printf -v NL "\n"
+        KEYS=(" " j "$NL" q s); tui_loop
+        marks; echo "$tui_nsel $tui_result"'
+    [ "${lines[0]}" = "[+ +   ]" ]
+    [ "${lines[1]}" = "2 save" ]
 }
 
-@test "a selects everything and A clears it again" {
-    run stage "$(keys)"'
-               KEYS=(a q s); tui_loop; echo "${TUI_SEL[*]} $tui_nsel"
-               KI=0; KEYS=(a A q s); tui_loop; echo "${TUI_SEL[*]} $tui_nsel"'
-    [ "${lines[0]}" = "1 1 1 1 1 5" ]
-    [ "${lines[1]}" = "0 0 0 0 0 0" ]
+@test "tab opens a directory and closes it again" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        printf -v TAB "\t"
+        KEYS=("$TAB" q e); tui_loop; echo "$TUI_N"'
+    # The tree starts with Rel.One-GRP open; tab on it hides its three children.
+    [ "$output" = "3" ]
+}
+
+@test "tab on something that is not a directory says so" {
+    # Straight at tui_toggle_open: the loop clears the message on the next
+    # keystroke, which is the whole point of it being a footer note.
+    run stage "$(tree)"'
+        tui_cur=2; tui_toggle_open; echo "$tui_msg"; echo "$TUI_N"'
+    [ "${lines[0]}" = "movie.mkv is not a directory" ]
+    [ "${lines[1]}" = "6" ]
+}
+
+@test "d and the quit dialog work from the loop too" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(j j j j d q c q s); tui_loop; marks; echo "$tui_nrm $tui_result"'
+    [ "${lines[0]}" = "[    - ]" ]
+    [ "${lines[1]}" = "1 save" ]
 }
 
 @test "the quit dialog cancels back to the list, saves, or exits" {
-    run stage "$(keys)"'
-               KEYS=(" " q c j " " q s); tui_loop
-               echo "cancel-then-save: ${TUI_SEL[*]} $tui_result"'
-    [ "$output" = "cancel-then-save: 1 1 0 0 0 save" ]
-    run stage "$(keys)"'
-               KEYS=(" " q e); tui_loop; echo "exit: $tui_result"'
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(" " q c j " " q s); tui_loop; echo "cancel-then-save: $tui_nsel $tui_result"'
+    [ "$output" = "cancel-then-save: 2 save" ]
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(" " q e); tui_loop; echo "exit: $tui_result"'
     [ "$output" = "exit: exit" ]
 }
 
-@test "G jumps to the last item and the arrow keys move too" {
-    run stage "$(keys)"'
-               KEYS=(G " " q s); tui_loop; echo "${TUI_SEL[*]}"
-               KI=0; TUI_SEL=(0 0 0 0 0); tui_cur=0; tui_top=0; tui_nsel=0
-               KEYS=("$(printf "\e[B")" "$(printf "\e[B")" " " q s); tui_loop; echo "${TUI_SEL[*]}"'
-    [ "${lines[0]}" = "0 0 0 0 1" ]
-    [ "${lines[1]}" = "0 0 1 0 0" ]
+@test "G jumps to the last row and the arrow keys move too" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(G " " q s); tui_loop; marks
+        KI=0; tui_set_all 0; tui_cur=0; tui_top=0
+        KEYS=($(printf "\e[B") $(printf "\e[B") " " q s); tui_loop; marks'
+    [ "${lines[0]}" = "[     +]" ]
+    [ "${lines[1]}" = "[* +   ]" ]
 }
 
 @test "FORMAT_LIST puts the name first and lines the columns up" {

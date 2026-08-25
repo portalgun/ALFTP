@@ -94,28 +94,68 @@ happens in the terminal UI by default, and in `$editor` where the terminal canno
 
 ### The terminal UI
 ```
- alftp  /remote/dir                                     2 of 27 selected
+ alftp  /remote/dir                                 2 selected, 1 to unlink
   NAME                       SIZE  DATE
-+ Some.Release.2026-GRP/     4.1G  2026-08-23 17:10
-  Another.Release-GRP/       2.7G  2026-08-23 14:42
-+ notes.nfo                  2.1K  2026-08-22 09:03
- j/k move  space toggle  a all  A none  q quit   1-9/27
+* Some.Release.2026-GRP/     4.1G  2026-08-23 17:10
+    CD1/                     2.0G  2026-08-23 17:10
++   CD2/                     2.0G  2026-08-23 17:10
++   release.nfo              2.1K  2026-08-23 17:10
+- Another.Release-GRP/       2.7G  2026-08-23 14:42
+  notes.nfo                  2.1K  2026-08-22 09:03
+ j/k move  space toggle  tab open dir  d unlink  a all  A none  q quit
 ```
-The far-left column is the selection: `+` is going to be downloaded, blank is not. **Everything
-starts deselected** — `a` selects the lot if that is what you want, `A` clears it again.
+The far-left column is what will happen to each entry:
+
+| | |
+| --- | --- |
+| `+` | download it |
+| `-` | leave it, but remove the source symlink from the remote directory |
+| `*` | a directory you have picked *part* of — the parts are the `+` lines under it |
+| blank | leave it alone |
+
+**Everything starts deselected** — `a` selects the lot if that is what you want, `A` clears it again.
 
 | key | |
 | --- | --- |
 | `j` / `k`, `↓` / `↑` | move down / up |
-| `space`, `enter` | toggle the item under the cursor |
+| `space`, `enter` | toggle the entry under the cursor |
+| `tab` | open a directory, or close it again |
+| `d` | mark the source symlink for removal (top-level entries only) |
 | `PgDn` / `PgUp` | move a screen at a time |
 | `0` / `Home`, `G` / `End` | jump to the top / bottom |
-| `a` / `A` | select all / select none |
+| `a` / `A` | select all / select none — the `-` marks are left alone |
 | `q` / `Esc` | quit, which asks first |
 
 `q` asks `(c)ancel`, `(s)ave and download`, or `(e)xit without downloading`. Cancel puts you back in
 the list; save writes your selection to the list file and the download starts; exit leaves the list
 file empty, so nothing is downloaded and the run ends. `Ctrl-C` does the same as exit.
+
+### Opening a directory
+`tab` lists a remote directory and shows what is in it, indented one level per directory deep. Each
+directory is listed once, over a short lftp login of its own — the session that opened the picker is
+sitting inside its `!` waiting for you, so it cannot do the listing itself. If the server refuses
+that second connection the footer says so and the directory stays closed; nothing else is affected.
+
+Inside an open directory you can pick individual entries with `space`. Those are the only two states
+there — `d` is refused below the top level, because the symlink it removes is the top-level entry
+itself. Picking part of a directory turns it into a `*`, and `space` on a `*` takes the whole
+selection back. `space` on a directory that has nothing picked inside it takes the directory whole
+(its contents then show `+` without being listed separately), and taking any one entry back out of
+it turns it into a `*` with everything else still picked.
+
+### Where it lands, and picking up where it left off
+A whole entry mirrors to `<local_dl_dir>/<name>`, as it always has. Anything picked from inside a
+directory keeps the structure it has on the server: `Some.Release-GRP/CD2` lands in
+`<local_dl_dir>/Some.Release-GRP/CD2`, not loose in the download directory.
+
+Transfers resume. Directories go through `mirror -c`, which continues a part-transferred file and
+skips what already matches the server, and single files through `pget -c`, so re-running after an
+interruption — or after coming back for more of the same directory — costs only what is actually
+missing. Permissions and timestamps come across with the files, the rest of what `rsync -a` means
+here.
+
+A `-` entry is never downloaded: its symlink is removed from the remote directory and that is all.
+(`-cl` still does that to everything in one go; `d` is the per-entry version of it.)
 
 ### The editor
 `--editor` (or `-e`), or `picker=editor` in the config, hands the list file to `$editor` instead.
@@ -126,7 +166,8 @@ it fell back if it could not run.
 
 Editing the list file directly, the convention is the reverse of the UI's: a line that is commented
 out is not downloaded, and the file arrives fully commented under `-i` for you to uncomment what you
-want.
+want. A line the UI wrote carries its mark in the first column instead — `+`, `-`, `*` or `#` — and
+those mean in the file exactly what they mean on screen, so a saved list can be re-edited by hand.
 
 Each line is three columns — name, size, modification date:
 ```
