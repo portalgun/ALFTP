@@ -2769,9 +2769,13 @@ tui_upd_clean () {
           "$tui_upd_toplong" "$tui_upd_log" "$tui_upd_script"
     tui_upd_top=""; tui_upd_topdata=""; tui_upd_topsize=""
     tui_upd_toplong=""; tui_upd_log=""; tui_upd_script=""
-    for tui_upd_m in ${!TUI_UPD_RAW[@]+"${!TUI_UPD_RAW[@]}"}; do
-        rm -f "${TUI_UPD_RAW[tui_upd_m]}" "${TUI_UPD_DATA[tui_upd_m]}"
-    done
+    # Guarded with a count rather than the usual ${arr[@]+...}: with "!" in
+    # front of it that is indirect expansion, not an array subscript.
+    if (( ${#TUI_UPD_RAW[@]} > 0 )); then
+        for tui_upd_m in "${!TUI_UPD_RAW[@]}"; do
+            rm -f "${TUI_UPD_RAW[tui_upd_m]}" "${TUI_UPD_DATA[tui_upd_m]}"
+        done
+    fi
     TUI_UPD_RAW=(); TUI_UPD_DATA=()
 }
 

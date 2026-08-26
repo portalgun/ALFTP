@@ -1370,3 +1370,19 @@ SNIP
     [[ "$output" == *"[-]"* ]]
     [[ "$output" == *"[|]"* ]]
 }
+
+@test "closing the picker takes the check's listing files back" {
+    run stage '
+        d=$(mktemp -d)
+        tui_upd_top="$d/top"; tui_upd_log="$d/log"
+        TUI_UPD_RAW=([3]="$d/raw3"); TUI_UPD_DATA=([3]="$d/data3")
+        touch "$d/top" "$d/log" "$d/raw3" "$d/data3"
+        tui_upd_clean
+        echo "$(ls -A "$d" | wc -l) ${#TUI_UPD_RAW[@]}"
+        # And again with nothing left to remove, which is the state every run
+        # that never checked anything closes in.
+        tui_upd_clean; echo "$?"
+        rm -rf "$d"'
+    [ "${lines[0]}" = "0 0" ]
+    [ "${lines[1]}" = "0" ]
+}
