@@ -284,6 +284,24 @@ tui_upd_i0=0; tui_upd_i1=0; tui_upd_j=0; tui_upd_k=0; tui_upd_m=0
 tui_upd_ids=(); tui_upd_old=(); tui_upd_add=()
 tui_upd_nm=(); tui_upd_sz=(); tui_upd_dt=(); tui_upd_kind=()
 TUI_UPD_RAW=(); TUI_UPD_DATA=()
+# The recursive walk of the data directory (see the RECURSE section). One
+# background lftp per root -- one root outside srcs mode, one per src inside it
+# -- whose answer is cached here by absolute data path: TUI_RECKIDS says which
+# directories were walked and what is in them, TUI_RECDIR/SIZE/DATE what each
+# entry is. That cache is what lets Tab open a directory without a login and
+# what gives a directory a real size at last. TUI_RECFILL marks the nodes it
+# built, so the check for remote changes does not re-list a whole tree of them
+# one directory at a time. recursive_listing turns the lot off.
+recursive_listing=True
+tui_rec_pid=""; tui_rec_mode=""; tui_rec_root=""; tui_rec_kicked=0
+tui_rec_out=""; tui_rec_du=""; tui_rec_log=""; tui_rec_script=""
+tui_rec_op=""; tui_rec_abs=""; tui_rec_name=""; tui_rec_isdir=0
+tui_rec_sz=""; tui_rec_dt=""; tui_rec_key=""; tui_rec_par=""; tui_rec_year=""
+tui_rec_rc=0; tui_rec_k=0; tui_rec_id=0; tui_rec_added=0; tui_rec_budget=1000
+tui_rec_queue=()
+declare -A TUI_RECKIDS=(); declare -A TUI_RECDIR=(); declare -A TUI_RECSIZE=()
+declare -A TUI_RECDATE=(); declare -A TUI_RECDONE=()
+TUI_RECFILL=()
 # The download queue (see the TRANSFERS section). One entry per job in the
 # TUI_DL* arrays, TUI_DLJOB mapping a node id to its job number plus one, and
 # concurrent_downloads how many of them may have an lftp of their own at once.
@@ -1556,7 +1574,7 @@ tui_reset () {
     TUI_DEPTH=(); TUI_PARENT=(); TUI_ISDIR=(); TUI_OPEN=(); TUI_LOADED=()
     TUI_STATE=(); TUI_SELCNT=(); TUI_POS=()
     TUI_STATUS=(); TUI_LSTAT=(); TUI_ACC=(); TUI_HASKID=()
-    TUI_LPATH=(); TUI_LHAVE=()
+    TUI_LPATH=(); TUI_LHAVE=(); TUI_RECFILL=()
     TUI_ORDER=(); TUI_VIS=()
     tui_statusw=0
     tui_nodes=0; TUI_N=0; tui_nsel=0; tui_nrm=0; tui_ndel=0
@@ -2343,7 +2361,7 @@ tui_draw () {
     tui_left="alftp  ${remote_dl_dir}"
     # A check is a background login the user cannot otherwise see; the glyph
     # turning is all there is to say that the listing is being asked about.
-    if [[ -n $tui_upd_pid ]]; then
+    if [[ -n $tui_upd_pid ]] || [[ -n $tui_rec_pid ]]; then
         tui_left="$tui_left  [${tui_spin_frames:tui_spin:1}]"
     fi
     tui_right="${tui_nsel} selected"
@@ -2550,6 +2568,18 @@ tui_scroll () {
 # its "!" waiting for the picker to finish, so this is a login of its own --
 # once per directory, since what it finds stays in the tree.
 tui_fetch () {
+    # The recursive walk, where it got this far, has already been told what is
+    # in here -- so this costs no login at all, which is the whole point of it.
+    if tui_rec_fill "$1" "${TUI_POS[$1]}"; then
+        tui_reindex
+        tui_rec_sizes
+        tui_status_scan
+        tui_widths
+        if (( ${#tui_kidsnew[@]} == 0 )); then
+            tui_msg="${TUI_NAME[$1]} is empty"
+        fi
+        return 0
+    fi
     tui_strip_class "${TUI_PATH[$1]}"
     tui_msg="listing ${TUI_NAME[$1]} ..."
     tui_draw
@@ -2660,9 +2690,12 @@ EOF
 # what the update does.
 tui_tick () {
     tui_dl_tick
-    if [[ -n $tui_upd_pid ]]; then
+    tui_rec_tick
+    if [[ -n $tui_upd_pid ]] || [[ -n $tui_rec_pid ]]; then
         tui_spin=$(( (tui_spin + 1) % ${#tui_spin_frames} ))
         tui_dirty=1
+    fi
+    if [[ -n $tui_upd_pid ]]; then
         if ! kill -0 "$tui_upd_pid" 2> /dev/null; then
             tui_upd_reap
         fi
@@ -2725,6 +2758,13 @@ cls -1 -F -h --size > $(lftp_quote "$tui_upd_topsize")
 EOF
     for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
         if (( TUI_LOADED[tui_id] == 0 )); then
+            continue
+        fi
+        # A directory the recursive walk filled in was never opened by anyone
+        # unless it is open now: re-listing a whole cached tree one directory
+        # at a time, every update_interval seconds, is exactly the cost the
+        # walk exists to avoid.
+        if (( ${TUI_RECFILL[tui_id]:-0} == 1 )) && (( TUI_OPEN[tui_id] == 0 )); then
             continue
         fi
         tui_strip_class "${TUI_PATH[tui_id]}"
@@ -2974,6 +3014,9 @@ tui_upd_merge () {
     fi
     link_load_data || true
     tui_load_sizes
+    # tui_load_sizes builds TUI_DUSIZE from scratch, so the walk's totals -- the
+    # only real figure a directory has -- go back on afterwards.
+    tui_rec_sizes
     # The node under the cursor is the one piece of state the tree does not
     # hold, so it is remembered across a merge that may move rows about under
     # it. A cursor on an entry that has just been dropped has nothing to go
@@ -3018,6 +3061,511 @@ tui_update_now () {
     fi
     tui_upd_start
     tui_msg="checking the remote ..."
+}
+
+# ----------------------------------------------------------------- RECURSE --
+# Two costs the picker used to pay disappear together here. Opening a
+# directory with Tab was a whole fresh login of its own (tui_fetch), and a
+# directory's size -- and with it any verdict about whether it has already been
+# downloaded -- was mostly unknowable, because the size a listing gives a
+# directory is the size of the directory entry and lftp's du does not follow
+# symlinks. One recursive listing of the *data* directory answers both, so it
+# is fetched once, in the background, after the picker has drawn.
+#
+# It has to be the data directory. Recursing the completed directory is
+# useless: find and du both stop at the symlinks, and "find Rel.One-GRP/" there
+# comes back with nothing but "Rel.One-GRP/" itself. Entries are mapped onto
+# the data tree the way everything else in the script maps them, through
+# link_entry_path, and the cache is keyed by the absolute data path that gives
+# -- so an entry whose symlink points somewhere the recursion never walked
+# simply misses the cache and falls back to a login, which is the right answer.
+#
+# "ls -R" is the command, because it is the only one that brings back type,
+# size, date and name in a single walk, and its sizes are exact. It is the
+# server's raw LIST output, though, so support varies: a server that ignores
+# -R answers with one flat block, and that is detected (tui_rec_recursive) and
+# retried with find plus "du -a -h". du's figures are block-rounded -- an 11
+# byte file reads 1.0K -- so on that path they fill directory totals and
+# nothing else. Handing a rounded figure to the completeness check as a
+# *file's* size would turn correct "c" verdicts into false "i" ones.
+
+# Whether the reply to "ls -R" really is recursive. A server that ignores -R
+# sends a single block with no "./Sub:" header in it -- but so does a directory
+# that genuinely holds no subdirectories, and that answer is complete. So the
+# question is only ever asked of a listing that has a directory in it and no
+# block describing one.
+tui_rec_recursive () {
+    if [[ ! -s $1 ]]; then
+        return 1
+    fi
+    if grep -q '^\./..*:[[:space:]]*$' "$1"; then
+        return 0
+    fi
+    if grep -q '^d' "$1"; then
+        return 1
+    fi
+    return 0
+}
+
+# "ls -R" into one record per entry. Two kinds come out, tab separated:
+#
+#   D <abs>                         <total> <>   a directory the walk covered
+#   E <parent> <name> <isdir> <size> <date>      an entry inside one
+#
+# The D records come first, so that a directory that turns out to be empty is
+# still known to have been covered -- "covered and empty" and "never walked"
+# are different answers and only the second one is worth a login.
+#
+# What a server puts in front of the name is its business, so the name is taken
+# to be whatever follows a recognised timestamp (the same rule link_targets
+# goes by) and the size the field just before it. A line with no timestamp this
+# recognises is skipped rather than guessed at. A symlink's " -> target" comes
+# off the name, and its type is settled afterwards: anything that also appears
+# as a block header is a directory whatever its own line said.
+#
+# Directory totals are summed here rather than asked for, because ls gives a
+# directory only its own entry size. Summing the exact per-file figures is both
+# cheaper than a second walk and more accurate than du, which rounds to blocks.
+tui_rec_parse_lsr () {
+    awk -v root="$2" -v year="$3" '
+        function norm(s,   f, n) {
+            gsub(/^[ \t]+|[ \t]+$/, "", s)
+            n = split(s, f, /[ \t]+/)
+            if (n < 2) { return s }
+            if (f[1] ~ /^[0-9][0-9][0-9][0-9]-/) { return f[1] " " f[2] }
+            if (!(f[1] in midx)) { return s }
+            # ls drops the time once a file is old enough and prints the year
+            # instead; the other way round it prints no year at all, and this
+            # year is the only guess there is. The date is drawn and nothing
+            # else, so a January listing of a December file costs a wrong year
+            # in one column and no decision anywhere.
+            if (f[3] ~ /^[0-9][0-9]:[0-9][0-9]$/) {
+                return year "-" midx[f[1]] "-" sprintf("%02d", f[2]) " " f[3]
+            }
+            return f[3] "-" midx[f[1]] "-" sprintf("%02d", f[2]) " 00:00"
+        }
+        BEGIN {
+            split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mn, " ")
+            for (i = 1; i <= 12; i++) { midx[mn[i]] = sprintf("%02d", i) }
+            # Anything before the first header belongs to the directory that
+            # was asked about, which is also what a flat reply consists of.
+            cur = root
+            nblk = 1
+            blk[1] = root
+            seen[root] = 1
+        }
+        # A block header names the directory the lines after it belong to. No
+        # entry line can start with "." -- the first character of one is the
+        # file type -- so content cannot be mistaken for one.
+        /^\..*:[ \t]*$/ {
+            hdr = $0
+            sub(/:[ \t]*$/, "", hdr)
+            sub(/^\.\/?/, "", hdr)
+            sub(/\/+$/, "", hdr)
+            cur = (hdr == "") ? root : root "/" hdr
+            if (!(cur in seen)) { seen[cur] = 1; blk[++nblk] = cur }
+            next
+        }
+        /^total[ \t]/ { next }
+        /^[ \t]*$/ { next }
+        /^[-dlbcpsD]/ {
+            line = $0
+            if (match(line, / [A-Za-z][A-Za-z][A-Za-z] +[0-9]+ +([0-9][0-9]:[0-9][0-9]|[0-9][0-9][0-9][0-9]) +/) ||
+                match(line, / [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] +[0-9][0-9]:[0-9][0-9] +/)) {
+                head = substr(line, 1, RSTART)
+                stamp = substr(line, RSTART, RLENGTH)
+                nm = substr(line, RSTART + RLENGTH)
+            } else {
+                next
+            }
+            if (substr(line, 1, 1) == "l") {
+                arrow = index(nm, " -> ")
+                if (arrow > 0) { nm = substr(nm, 1, arrow - 1) }
+            }
+            sub(/[ \t]+$/, "", nm)
+            if (nm == "" || nm == "." || nm == "..") { next }
+            sub(/[ \t]+$/, "", head)
+            n = split(head, hf, /[ \t]+/)
+            key = cur "/" nm
+            order[++cnt] = key
+            par[key] = cur
+            enm[key] = nm
+            esz[key] = (hf[n] ~ /^[0-9]+$/) ? hf[n] : ""
+            edt[key] = norm(stamp)
+            if (substr(line, 1, 1) == "d") { edir[key] = 1 }
+        }
+        END {
+            # A block header is the last word on what is a directory: a symlink
+            # is listed with an "l" whatever it points at.
+            for (i = 1; i <= nblk; i++) { if (blk[i] in par) { edir[blk[i]] = 1 } }
+            # Every file adds its size to every directory above it, which is
+            # the recursive total ls itself never prints.
+            for (i = 1; i <= cnt; i++) {
+                k = order[i]
+                if (edir[k] == 1 || esz[k] == "") { continue }
+                p = par[k]
+                while (p != "") {
+                    tot[p] += esz[k]
+                    if (p == root) { break }
+                    p = (p in par) ? par[p] : ""
+                }
+            }
+            for (i = 1; i <= nblk; i++) {
+                printf "D\t%s\t\t1\t%d\t\n", blk[i], tot[blk[i]] + 0
+            }
+            for (i = 1; i <= cnt; i++) {
+                k = order[i]
+                printf "E\t%s\t%s\t%d\t%s\t%s\n", par[k], enm[k], edir[k] + 0,
+                    (edir[k] == 1) ? tot[k] + 0 : esz[k], edt[k]
+            }
+        }
+    ' "$1"
+}
+
+# The same records out of "find" plus "du -a -h", for a server that would not
+# do -R. find says what is there and which of it is a directory (a trailing
+# "/"); du says how big, cumulatively, for every path in the tree.
+#
+# Only directories are given a size here. du rounds every file up to a block,
+# so an 11 byte file comes back as 1.0K, and a file's size is what the
+# completeness check compares against what is on disk -- a rounded one would
+# read as "downloaded but short" for every small file in the tree. A directory
+# total is rounded the same way, but there the bias is the one tui_has_du
+# already documents and accepts.
+tui_rec_parse_find () {
+    awk -v root="$3" -v dufile="$2" '
+        BEGIN {
+            while ((getline duline < dufile) > 0) {
+                tab = index(duline, "\t")
+                if (tab == 0) { continue }
+                dupath = substr(duline, tab + 1)
+                sub(/^\.\/?/, "", dupath)
+                sub(/\/+$/, "", dupath)
+                du[dupath] = substr(duline, 1, tab - 1)
+            }
+            if (dufile != "") { close(dufile) }
+            printf "D\t%s\t\t1\t%s\t\n", root, du[""]
+        }
+        {
+            p = $0
+            sub(/[ \t]+$/, "", p)
+            if (p == "") { next }
+            isdir = (p ~ /\/$/) ? 1 : 0
+            sub(/\/+$/, "", p)
+            sub(/^\.\/?/, "", p)
+            if (p == "" || p == ".") { next }
+            nm = p
+            sub(/.*\//, "", nm)
+            parent = (index(p, "/") > 0) ? root "/" substr(p, 1, length(p) - length(nm) - 1) : root
+            if (isdir == 1) { printf "D\t%s/%s\t\t1\t%s\t\n", root, p, du[p] }
+            printf "E\t%s\t%s\t%d\t%s\t\n", parent, nm, isdir, (isdir == 1) ? du[p] : ""
+        }
+    ' "$1"
+}
+
+# The records into the cache. TUI_RECKIDS is what says a directory was walked
+# at all -- set even when it is empty, which is why it is tested with "+x"
+# rather than for a value -- and holds its children's names, one per line.
+tui_rec_store () {
+    while IFS=$'\t' read -r tui_rec_op tui_rec_abs tui_rec_name tui_rec_isdir \
+                            tui_rec_sz tui_rec_dt; do
+        if [[ $tui_rec_op == D ]]; then
+            if [[ -z ${TUI_RECKIDS[$tui_rec_abs]+x} ]]; then
+                TUI_RECKIDS[$tui_rec_abs]=""
+            fi
+            TUI_RECDIR[$tui_rec_abs]=1
+            if [[ -n $tui_rec_sz ]]; then
+                TUI_RECSIZE[$tui_rec_abs]=$tui_rec_sz
+            fi
+            continue
+        fi
+        if [[ $tui_rec_op != E ]] || [[ -z $tui_rec_name ]]; then
+            continue
+        fi
+        if [[ -z ${TUI_RECKIDS[$tui_rec_abs]:-} ]]; then
+            TUI_RECKIDS[$tui_rec_abs]=$tui_rec_name
+        else
+            TUI_RECKIDS[$tui_rec_abs]+=$'\n'$tui_rec_name
+        fi
+        tui_rec_key="$tui_rec_abs/$tui_rec_name"
+        TUI_RECDIR[$tui_rec_key]=$tui_rec_isdir
+        if [[ -n $tui_rec_sz ]]; then
+            TUI_RECSIZE[$tui_rec_key]=$tui_rec_sz
+        fi
+        TUI_RECDATE[$tui_rec_key]=$tui_rec_dt
+    done
+}
+
+# One directory's children, out of the cache instead of over a login. $2 is
+# where the node sits in TUI_ORDER, because the caller already knows and
+# reindexing once per directory would make expanding a whole tree quadratic;
+# putting TUI_POS right again is the caller's job, exactly once.
+# A miss is not a failure: it means the recursion never reached here, and
+# tui_fetch's login is still the answer.
+tui_rec_fill () {
+    tui_kidsnew=()
+    if [[ ${recursive_listing,,} != true ]]; then
+        return 1
+    fi
+    tui_strip_class "${TUI_PATH[$1]}"
+    link_entry_path "$tui_stripped"
+    if [[ -z ${TUI_RECKIDS[$link_path]+x} ]]; then
+        return 1
+    fi
+    tui_rec_par=$link_path
+    while IFS= read -r tui_rec_name; do
+        if [[ -z $tui_rec_name ]]; then
+            continue
+        fi
+        tui_rec_key="$tui_rec_par/$tui_rec_name"
+        tui_isdir=${TUI_RECDIR[$tui_rec_key]:-0}
+        # The trailing "/" is what a cls -F listing would have put there, and
+        # tui_add_node reads it the same way whichever listing it came from.
+        if (( tui_isdir == 1 )); then
+            tui_rec_name="$tui_rec_name/"
+        fi
+        tui_add_node "$tui_rec_name" "${TUI_RECSIZE[$tui_rec_key]:-}" \
+            "${TUI_RECDATE[$tui_rec_key]:-}" "$1" "$tui_isdir"
+        tui_kidsnew+=("$tui_new_id")
+    done <<< "${TUI_RECKIDS[$tui_rec_par]}"
+    if (( ${#tui_kidsnew[@]} > 0 )); then
+        TUI_ORDER=("${TUI_ORDER[@]:0:$2 + 1}" "${tui_kidsnew[@]}" \
+                   "${TUI_ORDER[@]:$2 + 1}")
+    fi
+    TUI_LOADED[$1]=1
+    TUI_RECFILL[$1]=1
+    return 0
+}
+
+# Every directory the recursion covered, filled in behind its parent, so that
+# Tab opens it with no login at all. Walking TUI_ORDER forwards is all the
+# ordering this needs: children are spliced in directly behind the node being
+# filled, so the loop reaches them next and a subtree stays one contiguous run.
+# A directory the user has already opened keeps what it has -- relisting it
+# underneath itself would double every entry in it.
+# The budget is there because this runs from a tick, which may not block: a
+# tree far bigger than the picker will ever show stops being expanded and is
+# served out of the cache by tui_fetch instead, one directory at a time.
+tui_rec_expand () {
+    tui_rec_added=0
+    tui_rec_k=0
+    while (( tui_rec_k < ${#TUI_ORDER[@]} )); do
+        tui_rec_id=${TUI_ORDER[tui_rec_k]}
+        if (( TUI_ISDIR[tui_rec_id] == 1 )) && (( TUI_LOADED[tui_rec_id] == 0 )) \
+           && (( tui_rec_added < tui_rec_budget )); then
+            if tui_rec_fill "$tui_rec_id" "$tui_rec_k"; then
+                tui_rec_added=$(( tui_rec_added + ${#tui_kidsnew[@]} ))
+            fi
+        fi
+        tui_rec_k=$(( tui_rec_k + 1 ))
+    done
+    tui_reindex
+}
+
+# The recursive totals, onto the tree. A directory's own listed size says
+# nothing about what is in it, so this is the first real figure it has ever
+# had: straight into TUI_SIZE for the column, and for the top level into
+# TUI_DUSIZE as well, which is where tui_has_du and tui_dl_expected look for a
+# directory's expected size. Files are left alone -- what they already have
+# came from $listfile5 or from a cls listing, and on the fallback path a du
+# figure would be worse than either.
+# It runs again after a check for remote changes, because tui_load_sizes builds
+# TUI_DUSIZE from scratch every time.
+tui_rec_sizes () {
+    if (( ${#TUI_RECSIZE[@]} == 0 )); then
+        return 0
+    fi
+    for tui_rec_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( TUI_ISDIR[tui_rec_id] != 1 )); then
+            continue
+        fi
+        tui_strip_class "${TUI_PATH[tui_rec_id]}"
+        link_entry_path "$tui_stripped"
+        tui_rec_sz=${TUI_RECSIZE[$link_path]:-}
+        if [[ -z ${TUI_RECKIDS[$link_path]+x} ]] || [[ -z $tui_rec_sz ]]; then
+            continue
+        fi
+        TUI_SIZE[tui_rec_id]=$tui_rec_sz
+        if (( TUI_DEPTH[tui_rec_id] == 0 )); then
+            tui_strip_class "${TUI_NAME[tui_rec_id]}"
+            TUI_DUSIZE[$tui_stripped]=$tui_rec_sz
+        fi
+    done
+}
+
+# A data directory worth walking, once. Roots are queued rather than started,
+# because srcs mode has one per source directory and only ever wants the one
+# the user just opened; the tick starts the next when the last has finished.
+tui_rec_want () {
+    if [[ ${recursive_listing,,} != true ]] || [[ -z $1 ]]; then
+        return 0
+    fi
+    if [[ -n ${TUI_RECDONE[$1]:-} ]]; then
+        return 0
+    fi
+    TUI_RECDONE[$1]=1
+    tui_rec_queue+=("$1")
+}
+
+# The walk is started only once the picker has drawn, so that opening it is no
+# slower than it was. Outside srcs mode there is one data directory and it is
+# the run's own; in srcs mode there is one per source directory and walking
+# every one of them up front could be the whole server, so each waits until its
+# src is opened (see tui_toggle_open).
+tui_rec_kick () {
+    if (( tui_rec_kicked == 1 )); then
+        return 0
+    fi
+    tui_rec_kicked=1
+    if [[ ${recursive_listing,,} != true ]] || [[ $srcs_mode == True ]]; then
+        return 0
+    fi
+    link_normalize "$data_dir$dirname"
+    tui_rec_want "$link_norm"
+}
+
+# One of the walk's files, made once and reused: a root per src in srcs mode
+# would otherwise leave a pile of them behind.
+tui_rec_tmp () {
+    if [[ -n $1 ]]; then
+        tui_rec_name=$1
+        : > "$tui_rec_name"
+        return 0
+    fi
+    new_tmp "${TMPDIR:-/tmp}/alftp.rec.XXXXXX" || return 1
+    tui_rec_name=$tmpfile_new
+}
+
+# Ask the server to walk $tui_rec_root, in the background. $1 is "lsr" for the
+# one command that answers everything at once, or "find" for the pair that
+# replaces it on a server that will not do -R. cmd:fail-exit is what makes a cd
+# to a directory that has gone stop the script instead of listing wherever lftp
+# happened to be; stdin and stdout are closed off for the reasons every other
+# background login here closes them -- a prompt would eat the user's keystrokes
+# and lftp's chatter would be painted over the list.
+tui_rec_start () {
+    if [[ -n $tui_rec_pid ]]; then
+        return 1
+    fi
+    tui_rec_mode=$1
+    tui_rec_tmp "$tui_rec_out";    tui_rec_out=$tui_rec_name
+    tui_rec_tmp "$tui_rec_du";     tui_rec_du=$tui_rec_name
+    tui_rec_tmp "$tui_rec_log";    tui_rec_log=$tui_rec_name
+    tui_rec_tmp "$tui_rec_script"; tui_rec_script=$tui_rec_name
+    #DO NOT INDENT CONTENTS
+    cat > "$tui_rec_script" << EOF
+$(open_cmd)
+$(set_opts)
+set cmd:fail-exit yes
+cd $(lftp_quote "$tui_rec_root")
+EOF
+    if [[ $tui_rec_mode == lsr ]]; then
+        printf 'ls -R > %s\n' "$(lftp_quote "$tui_rec_out")" >> "$tui_rec_script"
+    else
+        printf 'find > %s\n' "$(lftp_quote "$tui_rec_out")" >> "$tui_rec_script"
+        printf 'du -a -h > %s\n' "$(lftp_quote "$tui_rec_du")" >> "$tui_rec_script"
+    fi
+    printf 'quit\n' >> "$tui_rec_script"
+    lftp -f "$tui_rec_script" < /dev/null > "$tui_rec_log" 2>&1 &
+    tui_rec_pid=$!
+    tui_spin=0
+    tui_dirty=1
+    return 0
+}
+
+# The walk finished. Whether it worked is decided by its own listing, the same
+# rule tui_fetch and the remote check go by, and a walk that came back with
+# nothing changes nothing at all: everything it would have answered is still
+# answerable with a login. A reply to "ls -R" that is not recursive is not a
+# failure either -- it is a server that ignores the flag, and the find/du pair
+# is started for the same root instead. Which of the two was used is only worth
+# saying under ALFTP_DEBUG; in the picker it would be noise in the one line
+# there is for messages.
+tui_rec_reap () {
+    tui_rec_rc=0
+    wait "$tui_rec_pid" 2> /dev/null || tui_rec_rc=$?
+    tui_rec_pid=""
+    tui_dirty=1
+    if [[ $tui_rec_mode == lsr ]] && [[ -s $tui_rec_out ]] \
+       && ! tui_rec_recursive "$tui_rec_out"; then
+        if [[ -n ${ALFTP_DEBUG:-} ]]; then
+            tui_msg="$tui_rec_root: ls -R was not recursive, trying find"
+        fi
+        tui_rec_start find
+        return 0
+    fi
+    if [[ ! -s $tui_rec_out ]]; then
+        if [[ -n ${ALFTP_DEBUG:-} ]]; then
+            tui_rec_sz=$(head -n 1 "$tui_rec_log" 2> /dev/null) || tui_rec_sz=""
+            tui_msg="could not walk $tui_rec_root${tui_rec_sz:+: $tui_rec_sz}"
+        fi
+        return 0
+    fi
+    tui_rec_merge
+}
+
+# What came back, into the tree. The order matters: the cache is filled first,
+# then every directory it covers is spliced in, then the sizes go on -- a
+# directory only gets its total once its node is there to take it -- and the
+# status column is refolded last, out of children that now have real sizes to
+# be judged by.
+tui_rec_merge () {
+    printf -v tui_rec_year '%(%Y)T' -1
+    if [[ $tui_rec_mode == lsr ]]; then
+        tui_rec_store < <(tui_rec_parse_lsr "$tui_rec_out" "$tui_rec_root" "$tui_rec_year")
+    else
+        tui_rec_store < <(tui_rec_parse_find "$tui_rec_out" "$tui_rec_du" "$tui_rec_root")
+    fi
+    tui_rec_expand
+    tui_rec_sizes
+    tui_status_scan
+    tui_widths
+    # Nothing was removed and nothing visible moved -- children spliced in
+    # behind a closed directory are not on screen -- so the cursor stays where
+    # it is and only the rows need rebuilding.
+    tui_rebuild_vis
+    if [[ -n ${ALFTP_DEBUG:-} ]]; then
+        tui_msg="walked $tui_rec_root ($tui_rec_mode): ${#TUI_RECKIDS[@]} directories"
+    fi
+}
+
+# The recursion's half of the tick: reap what has finished, then start the next
+# root that is waiting for a turn.
+tui_rec_tick () {
+    if [[ -n $tui_rec_pid ]]; then
+        if ! kill -0 "$tui_rec_pid" 2> /dev/null; then
+            tui_rec_reap
+        fi
+        return 0
+    fi
+    if (( ${#tui_rec_queue[@]} > 0 )); then
+        tui_rec_root=${tui_rec_queue[0]}
+        tui_rec_queue=("${tui_rec_queue[@]:1}")
+        tui_rec_start lsr
+    fi
+}
+
+# A walk still running has nothing left to report to, and its login is this
+# run's to close.
+tui_rec_stop () {
+    tui_rec_queue=()
+    if [[ -z $tui_rec_pid ]]; then
+        return 0
+    fi
+    kill -TERM "$tui_rec_pid" 2> /dev/null
+    wait "$tui_rec_pid" 2> /dev/null
+    tui_rec_pid=""
+}
+
+# The files the walk wrote, once nobody is going to read them. They are
+# registered with new_tmp, so an interrupted run takes them back anyway -- but
+# a run that ends normally never calls the signal handler.
+tui_rec_clean () {
+    if [[ -n ${ALFTP_DEBUG:-} ]]; then
+        return 0
+    fi
+    rm -f "$tui_rec_out" "$tui_rec_du" "$tui_rec_log" "$tui_rec_script"
+    tui_rec_out=""; tui_rec_du=""; tui_rec_log=""; tui_rec_script=""
 }
 
 # --------------------------------------------------------------- TRANSFERS --
@@ -3524,6 +4072,16 @@ tui_toggle_open () {
         tui_rebuild_vis
         return 0
     fi
+    # srcs mode has a data directory per source directory, and walking every
+    # one of them up front could be the whole server, so a src's walk waits
+    # until the src is opened. It is queued, not waited for: what is on screen
+    # now still comes from tui_fetch, and the walk pays for every release
+    # opened after it.
+    if [[ $srcs_mode == True ]] && (( TUI_DEPTH[tui_node] == 0 )); then
+        tui_strip_class "${TUI_PATH[tui_node]}"
+        link_entry_path "$tui_stripped"
+        tui_rec_want "$link_path"
+    fi
     if (( TUI_LOADED[tui_node] == 0 )); then
         if ! tui_fetch "$tui_node"; then
             return 0
@@ -3576,6 +4134,11 @@ tui_loop () {
             printf '%s' "$t_clear" >&"$TUI_OUT"
         fi
         tui_draw
+        # The recursive walk of the data directory starts here rather than
+        # before the loop, so that the first frame is on screen before a
+        # background login is asked for and opening the picker is no slower
+        # than it was.
+        tui_rec_kick
         # Wait for a key, but not for ever: every expiry of the read's timeout
         # is one tick, which is where the background check is started, animated
         # and reaped. Only a redraw the tick asked for is done here -- an idle
@@ -3700,6 +4263,10 @@ tui_close () {
     # this run's to close.
     tui_upd_stop
     tui_upd_clean
+    # The same for the recursive walk: it is a login of this run's, and there
+    # is nothing left for it to answer.
+    tui_rec_stop
+    tui_rec_clean
     # Every transfer of this session's own goes with it, whether the picker was
     # quit, interrupted or lost its terminal. What is on disk stays there: it
     # is a partial download, and the parent session's mirror -c finishes it.
@@ -3815,6 +4382,15 @@ tui_select () {
     TUI_DLID=(); TUI_DLPATH=(); TUI_DLKIND=(); TUI_DLSTATE=(); TUI_DLPID=()
     TUI_DLSCRIPT=(); TUI_DLLOG=(); TUI_DLTARGET=(); TUI_DLPRE=(); TUI_DLEXP=()
     TUI_DLJOB=()
+    # Anything but a plain True/False leaves the walk on, which is the
+    # default and the setting that costs the fewest logins.
+    if [[ ${recursive_listing,,} != false ]]; then
+        recursive_listing=True
+    fi
+    tui_rec_kicked=0
+    tui_rec_pid=""; tui_rec_mode=""; tui_rec_root=""; tui_rec_queue=()
+    unset TUI_RECKIDS TUI_RECDIR TUI_RECSIZE TUI_RECDATE TUI_RECDONE
+    declare -gA TUI_RECKIDS=() TUI_RECDIR=() TUI_RECSIZE=() TUI_RECDATE=() TUI_RECDONE=()
     tui_upd_last=$SECONDS
     tui_prompt=""
     tui_msg=""
