@@ -511,3 +511,83 @@ PICK
     [ -n "$second" ]
     [ "$first" -lt "$second" ]
 }
+
+# The picker's check for remote changes, against the real thing: a background
+# lftp login of its own, driven from tui_loop the way a keystroke drives it.
+# $1 is run once the tree is loaded and before "u" is pressed -- that is where
+# the test changes the server under the picker.
+picker_check () {
+    cat <<'SNIP'
+    oldfile=$(mktemp)
+    # The listing session's own chatter is not what these tests are reading.
+    { CREATE_LIST; FORMAT_LIST; LOAD_LINKS; VALIDATE_LINKS; } > /dev/null 2>&1
+    exec {TUI_OUT}>/dev/null
+    tui_load
+    order () { n=""; for v in "${TUI_ORDER[@]}"; do n="$n ${TUI_NAME[v]}"; done; echo "[${n# }]"; }
+    # "u", then a timeout on every read until the check has been reaped, then
+    # quit -- which is exactly the sequence tui_loop sees from a terminal where
+    # the user pressed u and waited.
+    KI=0; MSG=""
+    tui_read_key () {
+        if (( KI == 0 )); then KI=1; TUI_KEY=u; return 0; fi
+        if [[ -n $tui_upd_pid ]]; then sleep 0.1; TUI_KEYRC=2; return 1; fi
+        # The loop clears the footer on the next keystroke, so what the merge
+        # had to say is taken before quitting rather than after.
+        if (( KI == 1 )); then KI=2; MSG=$tui_msg; TUI_KEY=q; return 0; fi
+        TUI_KEY=e
+        return 0
+    }
+SNIP
+}
+
+@test "u picks up a release that appeared while the picker was open" {
+    run srv_stage "$(picker_check)"'
+        echo "$(order)"
+        tui_cur=1; tui_toggle              # mark notes.nfo for download
+        tui_cur=0; tui_move_node down      # and put the release below it
+        printf "extra\n" > "$SRV/data/TV/late.nfo"
+        ln -s ../../data/TV/late.nfo "$SRV/complete/TV/late.nfo"
+        tui_loop
+        echo "$(order)"; echo "$tui_nsel $MSG"'
+    [ "$status" -eq 0 ]
+    # The broken symlink is not in the tree to start with, and the check does
+    # not put it back.
+    [ "${lines[0]}" = "[Rel.One-GRP@ notes.nfo@]" ]
+    # The reorder and the mark both survived, and what appeared is at the end.
+    [ "${lines[1]}" = "[notes.nfo@ Rel.One-GRP@ late.nfo@]" ]
+    [[ "${lines[2]}" == "1 checked: 1 new, 0 gone" ]]
+}
+
+@test "u drops a release that went away, and keeps a marked one" {
+    run srv_stage "$(picker_check)"'
+        tui_cur=1; tui_toggle              # notes.nfo is wanted whatever happens
+        rm -f "$SRV/complete/TV/Rel.One-GRP" "$SRV/complete/TV/notes.nfo"
+        rm -rf "$SRV/data/TV/Rel.One-GRP" "$SRV/data/TV/notes.nfo"
+        tui_loop
+        echo "$(order)"; echo "$tui_nsel $MSG"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "[notes.nfo@]" ]
+    [[ "${lines[1]}" == "1 checked: 0 new, 1 gone, 1 marked but no longer on the server" ]]
+}
+
+@test "a check that cannot log in says so and changes nothing" {
+    run srv_stage "$(picker_check)"'
+        server="file:///"; remote_dl_dir="$SRV/nowhere"
+        tui_loop
+        echo "$(order)"; echo "$MSG"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "[Rel.One-GRP@ notes.nfo@]" ]
+    [[ "${lines[1]}" == "could not check the remote"* ]]
+}
+
+@test "the check lists a directory the user has already opened" {
+    run srv_stage "$(picker_check)"'
+        tui_cur=0; tui_toggle_open         # a real tab: lists Rel.One-GRP
+        printf "late\n" > "$SRV/data/TV/Rel.One-GRP/late.bin"
+        tui_loop
+        echo "$(order)"'
+    [ "$status" -eq 0 ]
+    # The new file is inside the opened release, at the end of its own sibling
+    # group rather than at the end of the list.
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv release.nfo late.bin notes.nfo@]" ]
+}

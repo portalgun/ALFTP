@@ -1319,6 +1319,52 @@ link_entry_path () {
     fi
 }
 
+# The data directory's own listing as a set, in LINK_DATA, and the directory it
+# is a listing of, in $link_datadir. Both are what says whether a target is
+# still there, and both are re-read after the picker's check for remote changes
+# fetches the listing again.
+link_load_data () {
+    unset LINK_DATA
+    declare -gA LINK_DATA=()
+    if [[ -z $listfile2 ]] || [[ ! -s $listfile2 ]]; then
+        return 1
+    fi
+    while IFS= read -r link_key || [[ -n $link_key ]]; do
+        if [[ -n $link_key ]]; then
+            LINK_DATA[${link_key%/}]=1
+        fi
+    done < "$listfile2"
+    link_normalize "$data_dir$dirname"
+    link_datadir=$link_norm
+    return 0
+}
+
+# Whether entry $1 points at data that is no longer there. Every answer but a
+# proven "yes" is no: an entry whose target "ls -l" could not be parsed has no
+# record at all, and one pointing outside the data directory, or deeper into it
+# than the data listing goes, is a target neither listing covers. Nothing is
+# ever removed on the strength of a question this could not answer.
+link_is_broken () {
+    if [[ ${prune_broken,,} != true ]]; then
+        return 1
+    fi
+    if [[ -z ${LINK_TARGET[${1%[/@*]}]:-} ]] || [[ ${#LINK_DATA[@]} -eq 0 ]]; then
+        return 1
+    fi
+    link_data_path "$1"
+    if [[ $link_path != "$link_datadir"/* ]]; then
+        return 1
+    fi
+    link_rel=${link_path#"$link_datadir"/}
+    if [[ -z $link_rel ]] || [[ $link_rel == */* ]]; then
+        return 1
+    fi
+    if [[ -n ${LINK_DATA[$link_rel]:-} ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # Take the broken symlinks out of the listing and line them up for removal
 # ($LINESB, which DLPRUNE emits). A target is only ever judged against the one
 # listing we have: $listfile2 covers the top level of $data_dir$dirname, so a
@@ -1334,31 +1380,13 @@ VALIDATE_LINKS () {
     if [[ ${prune_broken,,} != true ]]; then
         return 0
     fi
-    if [[ ${#LINK_TARGET[@]} -eq 0 ]] || [[ -z $listfile2 ]] || [[ ! -s $listfile2 ]]; then
+    if [[ ${#LINK_TARGET[@]} -eq 0 ]] || ! link_load_data; then
         return 0
     fi
-    unset LINK_DATA
-    declare -gA LINK_DATA=()
-    while IFS= read -r link_key || [[ -n $link_key ]]; do
-        if [[ -n $link_key ]]; then
-            LINK_DATA[${link_key%/}]=1
-        fi
-    done < "$listfile2"
-    link_normalize "$data_dir$dirname"
-    link_datadir=$link_norm
     for link_name in "${!LINK_TARGET[@]}"; do
-        link_data_path "$link_name"
-        if [[ $link_path != "$link_datadir"/* ]]; then
-            continue
+        if link_is_broken "$link_name"; then
+            link_broken+=("$link_name")
         fi
-        link_rel=${link_path#"$link_datadir"/}
-        if [[ -z $link_rel ]] || [[ $link_rel == */* ]]; then
-            continue
-        fi
-        if [[ -n ${LINK_DATA[$link_rel]:-} ]]; then
-            continue
-        fi
-        link_broken+=("$link_name")
     done
     if [[ ${#link_broken[@]} -eq 0 ]]; then
         return 0
@@ -2669,10 +2697,17 @@ tui_upd_start () {
     tui_upd_tmp "$tui_upd_toplong"; tui_upd_toplong=$tui_upd_name
     tui_upd_tmp "$tui_upd_log";     tui_upd_log=$tui_upd_name
     tui_upd_tmp "$tui_upd_script";  tui_upd_script=$tui_upd_name
+    # cmd:fail-exit is what makes a failure detectable at all: a "cd" to a
+    # directory that has gone leaves lftp where it was and the listing that
+    # follows would come back describing somewhere else entirely, which would
+    # then be merged into the tree. It bites where it should and nowhere else
+    # -- the top-level listing is the first thing written, so a later command
+    # the server will not do costs only itself.
     #DO NOT INDENT CONTENTS
     cat > "$tui_upd_script" << EOF
 $(open_cmd)
 $(set_opts)
+set cmd:fail-exit yes
 cd "$remote_dl_dir"
 cls -1 -F -h --size --date --time-style="%Y-%m-%d %H:%M" > $(lftp_quote "$tui_upd_top")
 ls -l > $(lftp_quote "$tui_upd_toplong")
@@ -2810,6 +2845,14 @@ tui_upd_group () {
         if (( $1 < 0 )) && ! tui_upd_srcs_ok "$tui_stripped"; then
             continue
         fi
+        # A broken symlink was taken out of the listing before the picker ever
+        # saw it (VALIDATE_LINKS), and a check must not put it back. Judging it
+        # here rather than after the fact also covers the other direction: an
+        # entry whose data went away while the picker was open reads as gone,
+        # and is dropped or kept on the same terms as anything else.
+        if (( $1 < 0 )) && link_is_broken "$tui_stripped"; then
+            continue
+        fi
         tui_isdir=0
         if [[ $tui_nm == */ ]] || [[ -n ${TUI_UPD_SUB[$tui_stripped]:-} ]]; then
             tui_isdir=1
@@ -2898,6 +2941,7 @@ tui_upd_merge () {
         cp -f "$tui_upd_toplong" "$listfile4"
         LOAD_LINKS
     fi
+    link_load_data || true
     tui_load_sizes
     # The node under the cursor is the one piece of state the tree does not
     # hold, so it is remembered across a merge that may move rows about under
