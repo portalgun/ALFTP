@@ -284,6 +284,19 @@ tui_upd_i0=0; tui_upd_i1=0; tui_upd_j=0; tui_upd_k=0; tui_upd_m=0
 tui_upd_ids=(); tui_upd_old=(); tui_upd_add=()
 tui_upd_nm=(); tui_upd_sz=(); tui_upd_dt=(); tui_upd_kind=()
 TUI_UPD_RAW=(); TUI_UPD_DATA=()
+# The download queue (see the TRANSFERS section). One entry per job in the
+# TUI_DL* arrays, TUI_DLJOB mapping a node id to its job number plus one, and
+# concurrent_downloads how many of them may have an lftp of their own at once.
+# Priority is not kept here: the scheduler reads it off TUI_POS every time it
+# runs, so reordering the list reorders a queue that is already moving.
+concurrent_downloads=2
+TUI_DLID=(); TUI_DLPATH=(); TUI_DLKIND=(); TUI_DLSTATE=(); TUI_DLPID=()
+TUI_DLSCRIPT=(); TUI_DLLOG=(); TUI_DLTARGET=(); TUI_DLPRE=(); TUI_DLEXP=()
+TUI_DLJOB=(); declare -A TUI_DLSIZE=()
+tui_dl_n=0; tui_dl_order=(); tui_dl_targets=(); tui_dl_j=0; tui_dl_k=0
+tui_dl_slot=0; tui_dl_pos=0; tui_dl_id=0; tui_dl_rc=0; tui_dl_have=0
+tui_dl_exp=-1; tui_dl_bytes=0; tui_dl_pct=0; tui_dl_sz=""; tui_dl_line=""
+tui_dl_poll_last=-1; tui_dl_running=0; tui_dl_queued=0
 declare -A TUI_UPD_SUB=(); declare -A TUI_UPD_IDX=(); declare -A TUI_UPD_HAVE=()
 declare -A TUI_DEAD=()
 TUI_NAME=(); TUI_PATH=(); TUI_SIZE=(); TUI_DATE=(); TUI_DEPTH=(); TUI_PARENT=()
@@ -1936,24 +1949,7 @@ tui_mark_remove () {
 # footer, with the list still visible behind it, the way the quit dialog is.
 # Only "Y" confirms; every other key, and a terminal that went away, cancels.
 tui_delete_prompt () {
-    tui_prompt="delete ${TUI_NAME[$1]} and the data behind it? (Y confirms, any other key cancels)"
-    tui_answer=no
-    while true; do
-        tui_draw
-        TUI_KEYRC=1
-        if tui_read_key; then
-            if [[ $TUI_KEY == Y ]]; then
-                tui_answer=yes
-            fi
-            break
-        fi
-        # A timeout is not an answer: tick, redraw and go on waiting for one.
-        if (( TUI_KEYRC != 2 )); then
-            break
-        fi
-        tui_tick
-    done
-    tui_prompt=""
+    tui_confirm "delete ${TUI_NAME[$1]} and the data behind it?"
 }
 
 tui_mark_delete () {
@@ -2196,10 +2192,14 @@ tui_status_node () {
         tui_compare_size "$1"
     fi
     TUI_LSTAT[$1]=$tui_stat
-    case $tui_stat in
-        c|i) TUI_STATUS[$1]=$tui_stat ;;
-        *)   TUI_STATUS[$1]="" ;;
-    esac
+    # What a transfer of this session's own is doing outranks what the local
+    # directory looks like: only a job that has finished lets the scan speak.
+    if ! tui_dl_status_keep "$1"; then
+        case $tui_stat in
+            c|i) TUI_STATUS[$1]=$tui_stat ;;
+            *)   TUI_STATUS[$1]="" ;;
+        esac
+    fi
     tui_p=${TUI_PARENT[$1]}
     if (( tui_p >= 0 )); then
         TUI_HASKID[tui_p]=1
@@ -2352,6 +2352,10 @@ tui_draw () {
     if (( tui_ndel > 0 )); then
         tui_right="$tui_right, $tui_ndel to delete"
     fi
+    if (( tui_dl_n > 0 )); then
+        tui_dl_counts
+        tui_right="$tui_right  ${tui_dl_running} running, ${tui_dl_queued} queued"
+    fi
     # Only worth saying where there is something to hide; a listing with no
     # STATUS column has no "t" to press either.
     if (( tui_statusw > 0 )); then
@@ -2418,11 +2422,11 @@ tui_draw () {
         if [[ -n $tui_msg ]]; then
             tui_line=$tui_msg
         elif (( TUI_COLS >= 100 )); then
-            tui_line="j/k move  M-j/k reorder  space pick  tab open  d unlink  x delete  r/R clear  t done  u check  a/A  q quit"
+            tui_line="j/k  M-j/k order  space pick  enter go  c cancel  tab open  d/x mark  r/R clear  t  u  a/A  q quit"
         elif (( TUI_COLS >= 74 )); then
-            tui_line="j/k move  M-j/k order  space pick  tab open  d/x mark  r/R clear  t  u  q quit"
+            tui_line="j/k  M-j/k  space  enter go  c cancel  tab  d/x  r/R  t  u  q quit"
         else
-            tui_line="j/k  M-j/k  space  tab  d  x  r/R  t  u  q"
+            tui_line="j/k  space  enter  c  tab  d  x  r/R  t  u  q"
         fi
         if (( TUI_N > TUI_ROWS )); then
             printf -v tui_line '%s   %s-%s/%s' "$tui_line" \
@@ -2488,12 +2492,14 @@ tui_key_action () {
         $'\e[6~')                              tui_action=pgdn ;;
         $'\ej'|$'\e[1;3B')                      tui_action=movedn ;;
         $'\ek'|$'\e[1;3A')                      tui_action=moveup ;;
-        ' '|$'\n'|$'\r')                       tui_action=toggle ;;
+        ' ')                                   tui_action=toggle ;;
+        $'\n'|$'\r')                           tui_action=start ;;
         $'\t')                                 tui_action=open ;;
         d)                                     tui_action="unlink" ;;
         x|$'\e[3~')                             tui_action=delete ;;
         r)                                     tui_action=clear ;;
         t)                                     tui_action=showdone ;;
+        c)                                     tui_action=cancelxfer ;;
         u)                                     tui_action=update ;;
         R)                                     tui_action=clearall ;;
         a)                                     tui_action=all ;;
@@ -2652,6 +2658,7 @@ EOF
 # any time at all belongs in a background job that a later tick reaps, which is
 # what the update does.
 tui_tick () {
+    tui_dl_tick
     if [[ -n $tui_upd_pid ]]; then
         tui_spin=$(( (tui_spin + 1) % ${#tui_spin_frames} ))
         tui_dirty=1
@@ -3012,6 +3019,486 @@ tui_update_now () {
     tui_msg="checking the remote ..."
 }
 
+# --------------------------------------------------------------- TRANSFERS --
+# Enter starts downloading, rather than waiting for the picker to close and the
+# parent session to do it. The session that spawned the picker is no use for
+# that -- it is blocked in the "!" that started this -- so every transfer is a
+# background lftp login of its own, generated exactly the way tui_fetch
+# generates its listing login, running the very command dldr_line/dlfl_line
+# would have emitted for the same entry. That is deliberate: there is one
+# definition of "download this entry", including the "&& rm -f" that drops a
+# completed top-level entry's symlink and the srcs-mode rule that says a source
+# directory never has one.
+#
+# The queue is a set of parallel arrays indexed by job number, plus TUI_DLJOB,
+# which maps a node id to its job (+1, so 0 means none). A node is queued at
+# most once. Priority is *not* stored: it is read off TUI_POS every time the
+# scheduler runs, which is what makes Alt-j/Alt-k re-prioritise a queue that is
+# already moving. A job is in one of six states:
+#
+#   queued    waiting for a slot
+#   running   an lftp of its own, pid in TUI_DLPID
+#   paused    started, stopped again to give its slot to something higher up;
+#             mirror -c / pget -c pick it up where it left off
+#   done      finished, exit status 0
+#   failed    finished, exit status not 0
+#   cancelled the user pressed "c"
+#
+# The first three are "live" and are what the scheduler ranks; the last three
+# are terminal and only decide what tui_save writes.
+
+# Does this job still want a slot?
+tui_dl_live () {
+    case ${TUI_DLSTATE[$1]} in
+        queued|running|paused) return 0 ;;
+    esac
+    return 1
+}
+
+# Is anything left to finish? Quitting asks about these, and tui_close stops
+# them.
+tui_dl_busy () {
+    for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+        if tui_dl_live "$tui_dl_j"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# How much is still in flight, for the title bar and the quit dialog: what has
+# an lftp of its own in $tui_dl_running, and everything still waiting for one
+# (queued and paused alike -- a paused transfer is waiting for a slot like any
+# other) in $tui_dl_queued.
+tui_dl_counts () {
+    tui_dl_running=0
+    tui_dl_queued=0
+    for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+        case ${TUI_DLSTATE[tui_dl_j]} in
+            running)       tui_dl_running=$(( tui_dl_running + 1 )) ;;
+            queued|paused) tui_dl_queued=$(( tui_dl_queued + 1 )) ;;
+        esac
+    done
+}
+
+# A byte count as something that fits in the STATUS column. Used only where no
+# expected size is known and a percentage would be an invention, so it is the
+# transferred figure itself and nothing more.
+tui_dl_human () {
+    if (( $1 >= 1073741824 )); then
+        printf -v tui_dl_sz '%dG' $(( $1 / 1073741824 ))
+    elif (( $1 >= 1048576 )); then
+        printf -v tui_dl_sz '%dM' $(( $1 / 1048576 ))
+    elif (( $1 >= 1024 )); then
+        printf -v tui_dl_sz '%dK' $(( $1 / 1024 ))
+    else
+        printf -v tui_dl_sz '%dB' "$1"
+    fi
+}
+
+# How big the entry is expected to be locally once it has arrived, in
+# $tui_dl_exp, or -1 where that cannot be known. A file's listed size is a real
+# figure -- the top level takes it from the data directory's own listing and a
+# fetched subdirectory lists the data itself -- but a *directory's* is the size
+# of the directory entry and says nothing about what is in it, so the only
+# usable total for one is --dir-sizes' recursive du, where that came back.
+tui_dl_expected () {
+    tui_dl_exp=-1
+    if (( TUI_ISDIR[$1] == 1 )); then
+        if ! tui_has_du "$1"; then
+            return 0
+        fi
+        tui_strip_class "${TUI_NAME[$1]}"
+        tui_size_bytes "${TUI_DUSIZE[$tui_stripped]}"
+    else
+        tui_size_bytes "${TUI_SIZE[$1]}"
+    fi
+    if (( tui_bytes > 0 )); then
+        tui_dl_exp=$tui_bytes
+    fi
+}
+
+# Enter: queue every entry marked "+", in the order the list has them. Only a
+# node that holds the mark itself is queued -- a child showing "+" because its
+# directory is selected is downloaded by that directory's mirror, exactly as it
+# would be by TYPE. Marks made after this are not queued until Enter is pressed
+# again, which is what makes Enter a decision rather than a mode.
+tui_dl_enqueue () {
+    tui_dl_have=0
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( TUI_STATE[tui_id] != 1 )); then
+            continue
+        fi
+        if (( ${TUI_DLJOB[tui_id]:-0} > 0 )); then
+            continue
+        fi
+        tui_strip_class "${TUI_PATH[tui_id]}"
+        local_target_for "$tui_stripped"
+        TUI_DLID[tui_dl_n]=$tui_id
+        TUI_DLPATH[tui_dl_n]=$tui_stripped
+        if (( TUI_ISDIR[tui_id] == 1 )); then
+            TUI_DLKIND[tui_dl_n]=dir
+        else
+            TUI_DLKIND[tui_dl_n]="file"
+        fi
+        TUI_DLSTATE[tui_dl_n]=queued
+        TUI_DLPID[tui_dl_n]=""
+        TUI_DLSCRIPT[tui_dl_n]=""
+        TUI_DLLOG[tui_dl_n]=""
+        TUI_DLTARGET[tui_dl_n]=$target
+        # Whether the destination was there before this session touched it is
+        # the whole of what "c" is allowed to delete afterwards, and it can
+        # only be asked now: once the transfer has started, the answer is yes
+        # whatever it was.
+        if [[ -e $target ]]; then
+            TUI_DLPRE[tui_dl_n]=1
+        else
+            TUI_DLPRE[tui_dl_n]=0
+        fi
+        tui_dl_expected "$tui_id"
+        TUI_DLEXP[tui_dl_n]=$tui_dl_exp
+        TUI_DLJOB[tui_id]=$(( tui_dl_n + 1 ))
+        TUI_STATUS[tui_id]=queued
+        tui_dl_n=$(( tui_dl_n + 1 ))
+        tui_dl_have=$(( tui_dl_have + 1 ))
+    done
+    if (( tui_dl_have == 0 )); then
+        if tui_dl_busy; then
+            tui_msg="everything marked is already queued"
+        else
+            tui_msg="nothing is marked for download"
+        fi
+        return 0
+    fi
+    tui_status_width
+    if (( tui_dl_have == 1 )); then
+        tui_msg="queued 1 entry"
+    else
+        tui_msg="queued $tui_dl_have entries"
+    fi
+    tui_dl_sched
+}
+
+# One transfer, as its own login. The command is whatever the emitters would
+# have written for this entry, so nothing about a download changes according to
+# where it was started from. cmd:fail-exit is what makes failure visible: it is
+# the exit status of this lftp that decides "done" or "failed", and without it
+# a mirror that could not even cd would still exit 0.
+tui_dl_run () {
+    if [[ -z ${TUI_DLSCRIPT[$1]} ]]; then
+        new_tmp "${TMPDIR:-/tmp}/alftp.xfer.XXXXXX" || return 1
+        TUI_DLSCRIPT[$1]=$tmpfile_new
+        new_tmp "${TMPDIR:-/tmp}/alftp.xferlog.XXXXXX" || return 1
+        TUI_DLLOG[$1]=$tmpfile_new
+    fi
+    : > "${TUI_DLLOG[$1]}"
+    case ${TUI_DLKIND[$1]} in
+        dir) tui_dl_line=$(dldr_line "${TUI_DLPATH[$1]}") ;;
+        *)   tui_dl_line=$(dlfl_line "${TUI_DLPATH[$1]}") ;;
+    esac
+    #DO NOT INDENT CONTENTS
+    cat > "${TUI_DLSCRIPT[$1]}" << EOF
+$(open_cmd)
+$(set_opts)
+set cmd:fail-exit yes
+cd "$remote_dl_dir"
+$tui_dl_line
+quit
+EOF
+    # Same two reasons as everywhere else in the picker: lftp's chatter would
+    # be painted over the list, and a prompt it decided to ask would eat the
+    # user's keystrokes.
+    lftp -f "${TUI_DLSCRIPT[$1]}" < /dev/null > "${TUI_DLLOG[$1]}" 2>&1 &
+    TUI_DLPID[$1]=$!
+    TUI_DLSTATE[$1]=running
+    TUI_STATUS[${TUI_DLID[$1]}]="0%"
+    return 0
+}
+
+# Stop a running transfer without deciding what it means. TERM is enough --
+# lftp forks a child only for "!" lines, not for transfers -- and what is on
+# disk is left where it is, which is what lets mirror -c / pget -c carry on
+# from there. The wait is what keeps the reaper from seeing this as a transfer
+# that finished on its own.
+tui_dl_kill () {
+    if [[ -z ${TUI_DLPID[$1]} ]]; then
+        return 0
+    fi
+    kill -TERM "${TUI_DLPID[$1]}" 2> /dev/null
+    wait "${TUI_DLPID[$1]}" 2> /dev/null
+    TUI_DLPID[$1]=""
+}
+
+# The live jobs, best first, in $tui_dl_order. Priority is read off TUI_POS
+# rather than remembered, so moving an entry with Alt-j re-orders a queue that
+# is already running -- an insertion sort, because there are as many jobs as
+# the user marked entries and a fork to sort(1) five times a second would cost
+# more than the sort.
+tui_dl_prio () {
+    tui_dl_order=()
+    for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+        if ! tui_dl_live "$tui_dl_j"; then
+            continue
+        fi
+        tui_dl_pos=${TUI_POS[${TUI_DLID[tui_dl_j]}]}
+        tui_dl_k=${#tui_dl_order[@]}
+        while (( tui_dl_k > 0 )) \
+              && (( TUI_POS[${TUI_DLID[${tui_dl_order[tui_dl_k - 1]}]}] > tui_dl_pos )); do
+            tui_dl_order[tui_dl_k]=${tui_dl_order[tui_dl_k - 1]}
+            tui_dl_k=$(( tui_dl_k - 1 ))
+        done
+        tui_dl_order[tui_dl_k]=$tui_dl_j
+    done
+}
+
+# Give the slots to the best jobs there are. Everything inside the first
+# concurrent_downloads places should be running and everything outside them
+# should not, which is one rule covering three things: a queued job starting,
+# a paused job resuming, and a running job that something has been moved above
+# being stopped again to hand its slot over.
+tui_dl_sched () {
+    tui_dl_prio
+    for (( tui_dl_slot = 0; tui_dl_slot < ${#tui_dl_order[@]}; tui_dl_slot++ )); do
+        tui_dl_j=${tui_dl_order[tui_dl_slot]}
+        if (( tui_dl_slot < concurrent_downloads )); then
+            if [[ ${TUI_DLSTATE[tui_dl_j]} != running ]]; then
+                if ! tui_dl_run "$tui_dl_j"; then
+                    TUI_DLSTATE[tui_dl_j]=failed
+                    TUI_STATUS[${TUI_DLID[tui_dl_j]}]=failed
+                    tui_msg="could not start ${TUI_NAME[${TUI_DLID[tui_dl_j]}]}"
+                fi
+                tui_dirty=1
+            fi
+        elif [[ ${TUI_DLSTATE[tui_dl_j]} == running ]]; then
+            tui_dl_kill "$tui_dl_j"
+            TUI_DLSTATE[tui_dl_j]=paused
+            TUI_STATUS[${TUI_DLID[tui_dl_j]}]=paused
+            tui_dirty=1
+        fi
+    done
+    tui_status_width
+}
+
+# What has arrived. One du for every running transfer at once rather than a
+# fork each: du -sb answers for a file and for a directory alike, and says
+# nothing at all about a destination that is not there yet, which reads as
+# nothing transferred. Only ever a percentage where there is a real expected
+# size to divide by (see tui_dl_expected); everywhere else the figure itself,
+# because a percentage of an unknown is a guess dressed up as a fact.
+tui_dl_progress () {
+    tui_dl_targets=()
+    for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+        if [[ ${TUI_DLSTATE[tui_dl_j]} == running ]]; then
+            tui_dl_targets+=("${TUI_DLTARGET[tui_dl_j]}")
+        fi
+    done
+    if (( ${#tui_dl_targets[@]} == 0 )); then
+        return 0
+    fi
+    unset TUI_DLSIZE
+    declare -gA TUI_DLSIZE=()
+    while IFS=$'\t' read -r tui_dl_bytes tui_dl_line; do
+        if [[ -n $tui_dl_line ]] && [[ -n $tui_dl_bytes ]]; then
+            TUI_DLSIZE[$tui_dl_line]=$tui_dl_bytes
+        fi
+    done < <(printf '%s\0' "${tui_dl_targets[@]}" | du -sb --files0-from=- 2> /dev/null)
+    for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+        if [[ ${TUI_DLSTATE[tui_dl_j]} != running ]]; then
+            continue
+        fi
+        tui_dl_bytes=${TUI_DLSIZE[${TUI_DLTARGET[tui_dl_j]}]:-0}
+        if (( TUI_DLEXP[tui_dl_j] > 0 )); then
+            tui_dl_pct=$(( tui_dl_bytes * 100 / TUI_DLEXP[tui_dl_j] ))
+            # 100% is what "done" means, and only the exit status says that: a
+            # rounded expected size is quite capable of being reached before
+            # the transfer is over.
+            if (( tui_dl_pct > 99 )); then
+                tui_dl_pct=99
+            fi
+            TUI_STATUS[${TUI_DLID[tui_dl_j]}]="${tui_dl_pct}%"
+        else
+            tui_dl_human "$tui_dl_bytes"
+            TUI_STATUS[${TUI_DLID[tui_dl_j]}]=$tui_dl_sz
+        fi
+    done
+    tui_status_width
+    tui_dirty=1
+}
+
+# Whatever has finished since the last tick. The exit status is the only thing
+# that says whether a transfer worked -- there is no success line to read back
+# out of lftp -- and a job stopped on purpose has already been waited for, so
+# nothing here can mistake a pause or a cancellation for a failure.
+tui_dl_reap () {
+    for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+        if [[ ${TUI_DLSTATE[tui_dl_j]} != running ]]; then
+            continue
+        fi
+        if kill -0 "${TUI_DLPID[tui_dl_j]}" 2> /dev/null; then
+            continue
+        fi
+        tui_dl_rc=0
+        wait "${TUI_DLPID[tui_dl_j]}" 2> /dev/null || tui_dl_rc=$?
+        TUI_DLPID[tui_dl_j]=""
+        tui_dl_id=${TUI_DLID[tui_dl_j]}
+        if (( tui_dl_rc == 0 )); then
+            TUI_DLSTATE[tui_dl_j]="done"
+            TUI_STATUS[tui_dl_id]="done"
+        else
+            TUI_DLSTATE[tui_dl_j]=failed
+            TUI_STATUS[tui_dl_id]=failed
+            tui_dl_line=$(head -n 1 "${TUI_DLLOG[tui_dl_j]}" 2> /dev/null) || tui_dl_line=""
+            tui_msg="${TUI_NAME[tui_dl_id]} failed${tui_dl_line:+: $tui_dl_line}"
+        fi
+        tui_dl_have=1
+    done
+}
+
+# The download half of the tick. Reaping first, so a slot that has just come
+# free is handed on in the same tick rather than the next one, and the polling
+# throttled: du over a part-mirrored release is not free, and five times a
+# second buys nothing a once-a-second figure does not.
+tui_dl_tick () {
+    if (( tui_dl_n == 0 )); then
+        return 0
+    fi
+    tui_dl_have=0
+    tui_dl_reap
+    if (( tui_dl_have == 1 )); then
+        tui_status_width
+        tui_dirty=1
+        tui_dl_sched
+    fi
+    if (( SECONDS != tui_dl_poll_last )); then
+        tui_dl_poll_last=$SECONDS
+        tui_dl_progress
+    fi
+}
+
+# A yes/no question drawn as the footer with the list still behind it. Only "Y"
+# is yes; every other key, and a terminal that went away, is no. It is a single
+# blocking read rather than a loop, so a test drives it with one extra key --
+# except that a tick is not an answer, and waiting for one goes on ticking.
+tui_confirm () {
+    tui_prompt="$1 (Y confirms, any other key cancels)"
+    tui_answer=no
+    while true; do
+        tui_draw
+        TUI_KEYRC=1
+        if tui_read_key; then
+            if [[ $TUI_KEY == Y ]]; then
+                tui_answer=yes
+            fi
+            break
+        fi
+        if (( TUI_KEYRC != 2 )); then
+            break
+        fi
+        tui_tick
+    done
+    tui_prompt=""
+}
+
+# "c": take the entry under the cursor out of the queue, wherever it had got
+# to. A transfer that had already started may have left part of a release on
+# disk, and the only files this is allowed to offer to delete are the ones it
+# put there itself -- whether the destination existed beforehand was recorded
+# when the job was queued, precisely so that a cancellation can never take away
+# something that was already downloaded.
+tui_dl_cancel () {
+    tui_node=${TUI_VIS[tui_cur]}
+    tui_dl_j=$(( ${TUI_DLJOB[tui_node]:-0} - 1 ))
+    if (( tui_dl_j < 0 )); then
+        tui_msg="${TUI_NAME[tui_node]} is not queued"
+        return 0
+    fi
+    if ! tui_dl_live "$tui_dl_j"; then
+        tui_msg="${TUI_NAME[tui_node]} is already ${TUI_DLSTATE[tui_dl_j]}"
+        return 0
+    fi
+    # A job that never got a slot cannot have put anything on disk, so there is
+    # nothing to ask about.
+    tui_dl_have=0
+    if [[ ${TUI_DLSTATE[tui_dl_j]} != queued ]]; then
+        tui_dl_have=1
+    fi
+    tui_dl_kill "$tui_dl_j"
+    TUI_DLSTATE[tui_dl_j]=cancelled
+    TUI_STATUS[tui_node]=cancelled
+    tui_status_width
+    tui_msg="${TUI_NAME[tui_node]} cancelled"
+    if (( tui_dl_have == 1 )) && (( TUI_DLPRE[tui_dl_j] == 0 )) \
+       && [[ -e ${TUI_DLTARGET[tui_dl_j]} ]]; then
+        tui_confirm "delete the part of ${TUI_NAME[tui_node]} already downloaded?"
+        if [[ $tui_answer == yes ]]; then
+            rm -rf -- "${TUI_DLTARGET[tui_dl_j]}"
+            tui_msg="${TUI_NAME[tui_node]} cancelled and removed"
+        else
+            tui_msg="${TUI_NAME[tui_node]} cancelled, what arrived is still there"
+        fi
+    fi
+    tui_dl_sched
+}
+
+# Every transfer stopped, and nothing decided about it: this runs when the
+# picker closes, and what it leaves on disk is a partial download that the
+# parent session's own mirror -c / pget -c will finish.
+tui_dl_stop_all () {
+    for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+        if [[ ${TUI_DLSTATE[tui_dl_j]} == running ]]; then
+            tui_dl_kill "$tui_dl_j"
+            TUI_DLSTATE[tui_dl_j]=paused
+        fi
+    done
+}
+
+# The scripts and logs, once nobody is going to read them. They are registered
+# with new_tmp, so an interrupted run takes them back anyway -- but a run that
+# ends normally never calls the signal handler.
+tui_dl_clean () {
+    if [[ -n ${ALFTP_DEBUG:-} ]]; then
+        return 0
+    fi
+    for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+        if [[ -n ${TUI_DLSCRIPT[tui_dl_j]} ]]; then
+            rm -f "${TUI_DLSCRIPT[tui_dl_j]}" "${TUI_DLLOG[tui_dl_j]}"
+            TUI_DLSCRIPT[tui_dl_j]=""; TUI_DLLOG[tui_dl_j]=""
+        fi
+    done
+}
+
+# Whether the STATUS column's rescan may have its way with this entry. A job
+# that is queued, running, or has ended badly is saying something the local
+# directory cannot: it is about this session, not about what is on disk. A job
+# that finished is the one exception -- "done" and the scan's own "c" are the
+# same fact, and the scan has the better claim to it.
+tui_dl_status_keep () {
+    tui_dl_j=$(( ${TUI_DLJOB[$1]:-0} - 1 ))
+    if (( tui_dl_j < 0 )); then
+        return 1
+    fi
+    if [[ ${TUI_DLSTATE[tui_dl_j]} == "done" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# What tui_save should write for an entry, where the queue has an opinion. An
+# entry this session has already downloaded must not be fetched a second time
+# by the parent session, so it goes out commented; everything else -- including
+# a transfer that was cancelled, failed, or never got a slot -- is written the
+# way it always was, so the parent finishes the job.
+tui_dl_saved_done () {
+    tui_dl_j=$(( ${TUI_DLJOB[$1]:-0} - 1 ))
+    if (( tui_dl_j < 0 )); then
+        return 1
+    fi
+    if [[ ${TUI_DLSTATE[tui_dl_j]} == "done" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 tui_toggle_open () {
     tui_node=${TUI_VIS[tui_cur]}
     if (( TUI_ISDIR[tui_node] == 0 )); then
@@ -3036,6 +3523,12 @@ tui_toggle_open () {
 # normal screen, so the list stays visible behind the question.
 tui_quit_prompt () {
     tui_prompt="quit: (c)ancel   (s)ave and download   (e)xit without downloading"
+    # Leaving stops every transfer that has not finished, which is worth saying
+    # before it happens rather than after.
+    if tui_dl_busy; then
+        tui_dl_counts
+        tui_prompt="${tui_dl_running} running and ${tui_dl_queued} queued will be stopped -- $tui_prompt"
+    fi
     tui_answer=""
     while [[ -z $tui_answer ]]; do
         tui_draw
@@ -3094,6 +3587,12 @@ tui_loop () {
                 ;;
             toggle)
                 tui_toggle
+                ;;
+            start)
+                tui_dl_enqueue
+                ;;
+            cancelxfer)
+                tui_dl_cancel
                 ;;
             open)
                 tui_toggle_open
@@ -3187,6 +3686,11 @@ tui_close () {
     # this run's to close.
     tui_upd_stop
     tui_upd_clean
+    # Every transfer of this session's own goes with it, whether the picker was
+    # quit, interrupted or lost its terminal. What is on disk stays there: it
+    # is a partial download, and the parent session's mirror -c finishes it.
+    tui_dl_stop_all
+    tui_dl_clean
     printf '%s%s%s' "$t_sgr0" "$t_cnorm" "$t_rmcup" >&"$TUI_OUT"
     if [[ -n $tui_saved_stty ]]; then
         stty "$tui_saved_stty" <&"$TUI_IN" 2> /dev/null
@@ -3230,18 +3734,26 @@ tui_save () {
            && (( TUI_SELCNT[tui_id] == 0 )); then
             continue
         fi
-        case ${TUI_STATE[tui_id]} in
-            3) tui_mark="x" ;;
-            2) tui_mark="-" ;;
-            1) tui_mark="+" ;;
-            *)
-                if (( TUI_SELCNT[tui_id] > 0 )); then
-                    tui_mark="*"
-                else
-                    tui_mark="#"
-                fi
-                ;;
-        esac
+        if tui_dl_saved_done "$tui_id"; then
+            # Downloaded here already: the parent session must not fetch it a
+            # second time. Everything else the queue did -- cancelled, failed,
+            # or never started -- is written as it always was, so the parent
+            # finishes what this did not.
+            tui_mark="#"
+        else
+            case ${TUI_STATE[tui_id]} in
+                3) tui_mark="x" ;;
+                2) tui_mark="-" ;;
+                1) tui_mark="+" ;;
+                *)
+                    if (( TUI_SELCNT[tui_id] > 0 )); then
+                        tui_mark="*"
+                    else
+                        tui_mark="#"
+                    fi
+                    ;;
+            esac
+        fi
         if [[ -z ${TUI_DATE[tui_id]} ]]; then
             printf '%s%s\n' "$tui_mark" "${TUI_PATH[tui_id]}"
         else
@@ -3280,6 +3792,15 @@ tui_select () {
     if [[ ! $update_interval =~ ^[0-9]+$ ]]; then
         update_interval=0
     fi
+    # Nothing at all in the config would mean no transfer ever gets a slot, so
+    # anything that is not a positive whole number falls back to the default.
+    if [[ ! $concurrent_downloads =~ ^[1-9][0-9]*$ ]]; then
+        concurrent_downloads=2
+    fi
+    tui_dl_n=0
+    TUI_DLID=(); TUI_DLPATH=(); TUI_DLKIND=(); TUI_DLSTATE=(); TUI_DLPID=()
+    TUI_DLSCRIPT=(); TUI_DLLOG=(); TUI_DLTARGET=(); TUI_DLPRE=(); TUI_DLEXP=()
+    TUI_DLJOB=()
     tui_upd_last=$SECONDS
     tui_prompt=""
     tui_msg=""

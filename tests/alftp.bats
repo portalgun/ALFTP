@@ -592,6 +592,29 @@ SNIP
     [[ "$output" == *"completed=T"* ]]
 }
 
+# The queue without lftp. A transfer is a "sleep", which is a real process with
+# a real pid, so kill -0, kill -TERM and wait all behave exactly as they do for
+# the login this stands in for -- only nothing is downloaded and nothing has to
+# be slowed down to be caught half-finished (a file:// transfer cannot be: the
+# rate limits do not apply to it).
+fakerun () {
+    cat <<'SNIP'
+    local_dl_dir=/nonexistent/dl; srcs_mode=False; concurrent_downloads=2
+    tui_dl_run () {
+        sleep 30 < /dev/null > /dev/null 2>&1 &
+        TUI_DLPID[$1]=$!
+        TUI_DLSTATE[$1]=running
+        TUI_STATUS[${TUI_DLID[$1]}]="0%"
+        return 0
+    }
+    states () {
+        s=""
+        for (( i = 0; i < tui_dl_n; i++ )); do s="$s ${TUI_DLSTATE[i]}"; done
+        echo "[${s# }]"
+    }
+SNIP
+}
+
 # The event loop, driven by a scripted key source instead of a terminal.
 keys () {
     cat <<'SNIP'
@@ -603,13 +626,24 @@ keys () {
 SNIP
 }
 
-@test "space and enter toggle the entry under the cursor, q then s saves" {
+@test "space toggles the entry under the cursor, q then s saves" {
     run stage "$(tree)"$'\n'"$(keys)"'
-        printf -v NL "\n"
-        KEYS=(" " j "$NL" q s); tui_loop
+        KEYS=(" " j " " q s); tui_loop
         marks; echo "$tui_nsel $tui_result"'
     [ "${lines[0]}" = "[* ++  ]" ]
     [ "${lines[1]}" = "2 save" ]
+}
+
+# Enter used to be a synonym for space. It starts the download queue now, and
+# the mark it lands on is the one space already made -- deliberately changed
+# with the transfer manager.
+@test "enter no longer toggles: it queues what is marked" {
+    run stage "$(tree)"$'\n'"$(keys)"$'\n'"$(fakerun)"'
+        printf -v NL "\n"
+        KEYS=(" " "$NL" q e); tui_loop
+        marks; echo "$tui_nsel $tui_dl_n ${TUI_DLSTATE[0]} ${TUI_STATUS[0]}"'
+    [ "${lines[0]}" = "[++++  ]" ]
+    [ "${lines[1]}" = "1 1 running 0%" ]
 }
 
 @test "tab opens a directory and closes it again" {
