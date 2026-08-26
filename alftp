@@ -241,7 +241,9 @@ tui_action=""; tui_fitted=""; tui_scratch=""; tui_line=""; tui_out=""
 tui_left=""; tui_right=""; tui_pad=0; tui_i=0; tui_id=0; tui_node=0
 tui_cur=0; tui_top=0; tui_nsel=0; tui_nrm=0; tui_ndel=0; tui_resized=0
 tui_open_flag=0
-tui_namew=0; tui_sizew=0; tui_pathw=0; tui_saved_stty=""
+tui_namew=0; tui_sizew=0; tui_pathw=0; tui_namefld=0; tui_metaw=0
+tui_sizedw=0; tui_datedw=0; tui_statusdw=0
+tui_saved_stty=""
 tui_saved_int=""; tui_saved_term=""; tui_saved_winch=""
 tui_nodes=0; tui_new_id=0; tui_stripped=""; tui_mark=""; tui_anc=-1
 tui_old=0; tui_delta=0; tui_p=0; tui_d=0; tui_r0=0; tui_r1=0; tui_skipd=-1
@@ -295,6 +297,7 @@ TUI_UPD_RAW=(); TUI_UPD_DATA=()
 recursive_listing=True
 tui_rec_pid=""; tui_rec_mode=""; tui_rec_root=""; tui_rec_kicked=0
 tui_rec_out=""; tui_rec_du=""; tui_rec_log=""; tui_rec_script=""
+tui_rec_lsl=""; tui_rec_dirs=(); tui_rec_rel=""; tui_rec_lsl_max=400
 tui_rec_op=""; tui_rec_abs=""; tui_rec_name=""; tui_rec_isdir=0
 tui_rec_sz=""; tui_rec_dt=""; tui_rec_key=""; tui_rec_par=""; tui_rec_year=""
 tui_rec_rc=0; tui_rec_k=0; tui_rec_id=0; tui_rec_added=0; tui_rec_budget=1000
@@ -2330,6 +2333,39 @@ tui_widths () {
     tui_status_width
 }
 
+# SIZE, DATE and STATUS sit against the right-hand edge, so the name column is
+# whatever is left over rather than just wide enough for the longest name --
+# which used to strand the columns in the middle of a wide terminal. Recomputed
+# on every draw, because it depends on the width of the terminal as well as on
+# the widths of the columns. On a terminal too narrow for that the columns pack
+# against the name the way they always did.
+tui_name_field () {
+    # A column is never narrower than its own heading. That did not matter when
+    # the columns packed against the name and the slack was all on the right,
+    # but pinned to the edge a heading wider than its column pushes the line
+    # past the edge and gets cut off there.
+    tui_sizedw=$tui_sizew
+    if (( tui_sizedw < 4 )); then
+        tui_sizedw=4
+    fi
+    tui_datedw=$tui_datew
+    if (( tui_datedw < 4 )); then
+        tui_datedw=4
+    fi
+    tui_statusdw=$tui_statusw
+    if (( tui_statusw > 0 )) && (( tui_statusdw < 6 )); then
+        tui_statusdw=6
+    fi
+    tui_metaw=$(( 2 + tui_sizedw + 2 + tui_datedw ))
+    if (( tui_statusw > 0 )); then
+        tui_metaw=$(( tui_metaw + 2 + tui_statusdw ))
+    fi
+    tui_namefld=$(( TUI_COLS - 2 - tui_metaw ))
+    if (( tui_namefld < tui_namew )); then
+        tui_namefld=$tui_namew
+    fi
+}
+
 tui_marker () {
     if (( TUI_STATE[$1] == 3 )); then
         tui_mark="x"
@@ -2365,6 +2401,7 @@ tui_fit () {
 # addressing (that would be a tput fork per row) and no flicker. Every line is
 # padded and cleared to the right edge, so what was there before is covered.
 tui_draw () {
+    tui_name_field
     tui_left="alftp  ${remote_dl_dir}"
     # A check is a background login the user cannot otherwise see; the glyph
     # turning is all there is to say that the listing is being asked about.
@@ -2403,10 +2440,11 @@ tui_draw () {
 
     # Column header, lined up with the two-column selection gutter.
     if (( tui_statusw > 0 )); then
-        printf -v tui_line '  %-*s  %*s  %-*s  %*s' "$tui_namew" "NAME" \
-            "$tui_sizew" "SIZE" "$tui_datew" "DATE" "$tui_statusw" "STATUS"
+        printf -v tui_line '  %-*s  %*s  %-*s  %*s' "$tui_namefld" "NAME" \
+            "$tui_sizedw" "SIZE" "$tui_datedw" "DATE" "$tui_statusdw" "STATUS"
     else
-        printf -v tui_line '  %-*s  %*s  %s' "$tui_namew" "NAME" "$tui_sizew" "SIZE" "DATE"
+        printf -v tui_line '  %-*s  %*s  %-*s' "$tui_namefld" "NAME" \
+            "$tui_sizedw" "SIZE" "$tui_datedw" "DATE"
     fi
     tui_fit "$tui_line" "$TUI_COLS"
     tui_out+="${t_bold}${tui_fitted}${t_sgr0}${t_el}"$'\n'
@@ -2416,17 +2454,24 @@ tui_draw () {
             tui_id=${TUI_VIS[tui_i]}
             tui_marker "$tui_id"
             if (( tui_statusw > 0 )); then
+                # The name is cut to its own field rather than allowed to push
+                # the columns off the right edge, which is where they live now.
+                tui_fit "${TUI_NAME[tui_id]}" \
+                    "$(( tui_namefld - TUI_DEPTH[tui_id] * 2 ))"
                 printf -v tui_line '%s %*s%-*s  %*s  %-*s  %*s' "$tui_mark" \
                     "$(( TUI_DEPTH[tui_id] * 2 ))" "" \
-                    "$(( tui_namew - TUI_DEPTH[tui_id] * 2 ))" "${TUI_NAME[tui_id]}" \
-                    "$tui_sizew" "${TUI_SIZE[tui_id]}" \
-                    "$tui_datew" "${TUI_DATE[tui_id]}" \
-                    "$tui_statusw" "${TUI_STATUS[tui_id]}"
+                    "$(( tui_namefld - TUI_DEPTH[tui_id] * 2 ))" "$tui_fitted" \
+                    "$tui_sizedw" "${TUI_SIZE[tui_id]}" \
+                    "$tui_datedw" "${TUI_DATE[tui_id]}" \
+                    "$tui_statusdw" "${TUI_STATUS[tui_id]}"
             else
-                printf -v tui_line '%s %*s%-*s  %*s  %s' "$tui_mark" \
+                tui_fit "${TUI_NAME[tui_id]}" \
+                    "$(( tui_namefld - TUI_DEPTH[tui_id] * 2 ))"
+                printf -v tui_line '%s %*s%-*s  %*s  %-*s' "$tui_mark" \
                     "$(( TUI_DEPTH[tui_id] * 2 ))" "" \
-                    "$(( tui_namew - TUI_DEPTH[tui_id] * 2 ))" "${TUI_NAME[tui_id]}" \
-                    "$tui_sizew" "${TUI_SIZE[tui_id]}" "${TUI_DATE[tui_id]}"
+                    "$(( tui_namefld - TUI_DEPTH[tui_id] * 2 ))" "$tui_fitted" \
+                    "$tui_sizedw" "${TUI_SIZE[tui_id]}" \
+                    "$tui_datedw" "${TUI_DATE[tui_id]}"
             fi
             tui_fit "$tui_line" "$TUI_COLS"
             if (( tui_i == tui_cur )); then
@@ -3470,6 +3515,26 @@ cd $(lftp_quote "$tui_rec_root")
 EOF
     if [[ $tui_rec_mode == lsr ]]; then
         printf 'ls -R > %s\n' "$(lftp_quote "$tui_rec_out")" >> "$tui_rec_script"
+    elif [[ $tui_rec_mode == lsl ]]; then
+        # A server that ignores -R still lists one directory at a time, and
+        # "find" has just said which ones there are. Asking for each of them in
+        # this one session reproduces exactly the output ls -R would have given,
+        # headers included, so tui_rec_parse_lsr reads it unchanged -- and the
+        # walk keeps its dates and its exact per-file sizes, neither of which
+        # find or du can supply.
+        tui_rec_tmp "$tui_rec_lsl"; tui_rec_lsl=$tui_rec_name
+        for tui_rec_rel in ${tui_rec_dirs[@]+"${tui_rec_dirs[@]}"}; do
+            if [[ $tui_rec_rel == . ]]; then
+                printf 'echo ".:" >> %s\nls -l >> %s\n' \
+                    "$(lftp_quote "$tui_rec_lsl")" "$(lftp_quote "$tui_rec_lsl")" \
+                    >> "$tui_rec_script"
+            else
+                printf 'echo "./%s:" >> %s\nls -l %s >> %s\n' "$tui_rec_rel" \
+                    "$(lftp_quote "$tui_rec_lsl")" "$(lftp_quote "$tui_rec_rel")" \
+                    "$(lftp_quote "$tui_rec_lsl")" >> "$tui_rec_script"
+            fi
+            printf 'echo "" >> %s\n' "$(lftp_quote "$tui_rec_lsl")" >> "$tui_rec_script"
+        done
     else
         printf 'find > %s\n' "$(lftp_quote "$tui_rec_out")" >> "$tui_rec_script"
         printf 'du -a -h > %s\n' "$(lftp_quote "$tui_rec_du")" >> "$tui_rec_script"
@@ -3490,6 +3555,30 @@ EOF
 # is started for the same root instead. Which of the two was used is only worth
 # saying under ALFTP_DEBUG; in the picker it would be noise in the one line
 # there is for messages.
+# The directories "find" reported, relative to the root and with the root
+# itself first, for the ls -l pass to ask about. Capped: that pass costs one
+# listing per directory, and past a certain size the find/du answer already in
+# hand is the better trade, even without dates.
+tui_rec_dirlist () {
+    tui_rec_dirs=(.)
+    while IFS= read -r tui_rec_rel; do
+        if [[ $tui_rec_rel != */ ]]; then
+            continue
+        fi
+        tui_rec_rel=${tui_rec_rel%/}
+        tui_rec_rel=${tui_rec_rel#./}
+        if [[ -z $tui_rec_rel ]] || [[ $tui_rec_rel == . ]]; then
+            continue
+        fi
+        tui_rec_dirs+=("$tui_rec_rel")
+        if (( ${#tui_rec_dirs[@]} > tui_rec_lsl_max )); then
+            tui_rec_dirs=()
+            return 1
+        fi
+    done < "$1"
+    return 0
+}
+
 tui_rec_reap () {
     tui_rec_rc=0
     wait "$tui_rec_pid" 2> /dev/null || tui_rec_rc=$?
@@ -3503,11 +3592,20 @@ tui_rec_reap () {
         tui_rec_start find
         return 0
     fi
+    if [[ $tui_rec_mode == lsl ]] && [[ ! -s $tui_rec_lsl ]]; then
+        # The per-directory pass gave nothing back. The find/du answer is still
+        # in hand, so fall back to it rather than lose the walk over a date.
+        tui_rec_mode="find"
+    fi
     if [[ ! -s $tui_rec_out ]]; then
         if [[ -n ${ALFTP_DEBUG:-} ]]; then
             tui_rec_sz=$(head -n 1 "$tui_rec_log" 2> /dev/null) || tui_rec_sz=""
             tui_msg="could not walk $tui_rec_root${tui_rec_sz:+: $tui_rec_sz}"
         fi
+        return 0
+    fi
+    if [[ $tui_rec_mode == find ]] && tui_rec_dirlist "$tui_rec_out"; then
+        tui_rec_start lsl
         return 0
     fi
     tui_rec_merge
@@ -3522,6 +3620,8 @@ tui_rec_merge () {
     printf -v tui_rec_year '%(%Y)T' -1
     if [[ $tui_rec_mode == lsr ]]; then
         tui_rec_store < <(tui_rec_parse_lsr "$tui_rec_out" "$tui_rec_root" "$tui_rec_year")
+    elif [[ $tui_rec_mode == lsl ]]; then
+        tui_rec_store < <(tui_rec_parse_lsr "$tui_rec_lsl" "$tui_rec_root" "$tui_rec_year")
     else
         tui_rec_store < <(tui_rec_parse_find "$tui_rec_out" "$tui_rec_du" "$tui_rec_root")
     fi
@@ -3573,8 +3673,8 @@ tui_rec_clean () {
     if [[ -n ${ALFTP_DEBUG:-} ]]; then
         return 0
     fi
-    rm -f "$tui_rec_out" "$tui_rec_du" "$tui_rec_log" "$tui_rec_script"
-    tui_rec_out=""; tui_rec_du=""; tui_rec_log=""; tui_rec_script=""
+    rm -f "$tui_rec_out" "$tui_rec_du" "$tui_rec_lsl" "$tui_rec_log" "$tui_rec_script"
+    tui_rec_out=""; tui_rec_du=""; tui_rec_lsl=""; tui_rec_log=""; tui_rec_script=""
 }
 
 # --------------------------------------------------------------- TRANSFERS --

@@ -245,6 +245,12 @@ that ignores `-R` answers with one flat block, which alftp notices and retries a
 else — a rounded file size compared against what is on disk would report every small file as
 incomplete for ever.
 
+Where a server ignores `-R`, alftp asks `find` which directories exist and then requests `ls -l`
+for each of them in the same login, which reproduces what `ls -R` would have returned — so the
+walk keeps its modification dates and its exact file sizes either way. That costs a second
+listing per directory, so past a few hundred directories it settles for `find` and `du` alone,
+which know the sizes but not the dates.
+
 The walk runs in the background and the picker stays usable throughout: the title bar carries the
 same turning `[-]` `[\]` `[|]` `[/]` a remote check does, and anything the walk has not reached yet
 still opens the old way, with a login. In srcs mode there is a data directory per source directory,

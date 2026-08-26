@@ -770,3 +770,42 @@ COUNTER
     [ "$status" -eq 0 ]
     [ "$(wc -l < "$SRV/walks")" -eq 1 ]
 }
+
+@test "the fallback walk still gets dates and exact sizes from one login" {
+    # What happens on a server that ignores "ls -R": "find" enumerates the
+    # directories and a second pass asks each of them for "ls -l" in the same
+    # session, which reproduces ls -R's output -- so the walk keeps the dates
+    # and the exact per-file sizes that find and du cannot supply.
+    mkdir -p "$SRV/data/TV/Rel.One-GRP/CD1"
+    printf 'xx\n' > "$SRV/data/TV/Rel.One-GRP/CD1/p.bin"
+    run srv_stage 'tui_rec_root="$SRV/data/TV"
+        tui_rec_start find; wait "$tui_rec_pid"; tui_rec_pid=""
+        tui_rec_dirlist "$tui_rec_out" || echo "DIRLIST-FAILED"
+        echo "dirs=${tui_rec_dirs[*]}"
+        tui_rec_start lsl; wait "$tui_rec_pid"; tui_rec_pid=""
+        printf -v tui_rec_year "%(%Y)T" -1
+        tui_rec_parse_lsr "$tui_rec_lsl" "$tui_rec_root" "$tui_rec_year" | tr "\037" "\t"
+        tui_rec_clean'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"DIRLIST-FAILED"* ]]
+    # find named the root and both directories under it.
+    [[ "$output" == *"dirs=. Rel.One-GRP Rel.One-GRP/CD1"* ]]
+    # A file keeps its exact size and, crucially, its date.
+    [[ "$output" == *$'\tnotes.nfo\t0\t11\t20'* ]]
+    [[ "$output" == *$'\tp.bin\t0\t3\t20'* ]]
+    # A directory gets the recursive total of what is under it, with a date.
+    [[ "$output" == *$'\tCD1\t1\t12\t20'* ]]
+}
+
+@test "the walk falls back to find/du when there are too many directories" {
+    run srv_stage 'tui_rec_lsl_max=1
+        tui_rec_root="$SRV/data/TV"
+        tui_rec_start find; wait "$tui_rec_pid"; tui_rec_pid=""
+        if tui_rec_dirlist "$tui_rec_out"; then echo "took-lsl"; else echo "kept-find"; fi
+        echo "dirs=${#tui_rec_dirs[@]}"
+        tui_rec_clean'
+    # Past the cap the ls -l pass is not worth its listings, and the find/du
+    # answer already in hand is used instead.
+    [[ "$output" == *"kept-find"* ]]
+    [[ "$output" == *"dirs=0"* ]]
+}

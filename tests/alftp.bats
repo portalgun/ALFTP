@@ -1857,3 +1857,39 @@ SNIP
     [[ "${lines[4]}" == "find > "* ]]
     [[ "${lines[5]}" == "du -a -h > "* ]]
 }
+
+@test "SIZE, DATE and STATUS are pinned to the right-hand edge" {
+    run stage "$(tree)"'
+        TUI_COLS=80; tui_statusw=0; tui_widths; tui_name_field
+        echo "$(( 2 + tui_namefld + tui_metaw )) $tui_metaw"
+        TUI_COLS=120; tui_name_field
+        echo "$(( 2 + tui_namefld + tui_metaw )) $tui_metaw"'
+    # The row reaches the right-hand edge exactly, at either width: the
+    # metadata block keeps its size and the name column takes up the slack.
+    # (The 2 is the mark gutter.)
+    [ "${lines[0]}" = "80 ${lines[0]#* }" ]
+    [ "${lines[1]}" = "120 ${lines[1]#* }" ]
+    # ... and the block itself did not change size between the two.
+    [ "${lines[0]#* }" = "${lines[1]#* }" ]
+}
+
+@test "a column is never narrower than its own heading" {
+    run stage "$(tree)"'
+        TUI_COLS=80
+        TUI_SIZE=([0]=1 [1]=2 [2]=3 [3]=4 [4]=5 [5]=6)
+        TUI_STATUS=([0]=c)
+        tui_widths; tui_status_width; tui_name_field
+        echo "size=$tui_sizew/$tui_sizedw status=$tui_statusw/$tui_statusdw"'
+    # One-character sizes and a one-character status would otherwise leave the
+    # "SIZE" and "STATUS" headings hanging off the right-hand edge.
+    [ "$output" = "size=1/4 status=1/6" ]
+}
+
+@test "a name too long for its field is cut, not allowed to shove the columns off" {
+    run stage "$(tree)"'
+        TUI_COLS=40; tui_widths; tui_name_field
+        TUI_NAME[0]="a.very.long.release.name.that.will.not.fit-GRP"
+        tui_draw > /dev/null 2>&1
+        tui_fit "${TUI_NAME[0]}" "$tui_namefld"; echo "${#tui_fitted} <= $tui_namefld"'
+    [ "${lines[0]}" = "$(echo "${lines[0]}" | awk -F" <= " "{print (\$1 <= \$2) ? \$0 : \"OVERFLOW\"}")" ]
+}
