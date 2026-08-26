@@ -665,3 +665,97 @@ SNIP
     [ ! -e "$DL/notes.nfo" ]
     [ -L "$SRV/complete/TV/notes.nfo" ]
 }
+
+# ------------------------------------------------- the recursive listing --
+#
+# The walk is one background login that answers what used to take one login per
+# directory opened, so the tests that matter are about logins as much as about
+# what is on screen. srv_lftp_counter puts a wrapper for lftp on the PATH which
+# records what kind of script each login was asked to run -- the temp file's
+# name says which, and every one of them comes from a different new_tmp
+# template -- and then execs the real thing, so the run is entirely real.
+srv_lftp_counter() {
+    mkdir -p "$SRV/bin"
+    cat > "$SRV/bin/lftp" <<COUNTER
+#!/bin/sh
+case "\$2" in
+    *alftp.subcmd.*) echo fetch >> "$SRV/fetches" ;;
+    *alftp.rec.*)    echo walk  >> "$SRV/walks" ;;
+esac
+exec $(command -v lftp) "\$@"
+COUNTER
+    chmod +x "$SRV/bin/lftp"
+}
+
+@test "the walk gives a directory a real size, and Tab then costs no login" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    srv_lftp_counter
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    # A pause before Tab, so the walk that started after the first frame has
+    # come back by the time the directory is opened.
+    run env HOME="$home" TERM=xterm-256color PATH="$SRV/bin:$PATH" \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\x0c \t q e' --delay 1.0 -- "$ALFTP" -i TV -t -nu -do
+    [ "$status" -eq 0 ]
+    # The release is 15 + 13 + 9 bytes of content. Its own listing gives it the
+    # length of the symlink pointing at it (25) and the data directory gives it
+    # the size of a directory entry, so 37 is a figure the picker could not
+    # show at all before the walk.
+    [[ "$output" =~ Rel\.One-GRP@[[:space:]]+37[[:space:]] ]]
+    [ -f "$SRV/walks" ]
+    # Tab opened it out of the walk's answer: every file inside is on screen
+    # and not one extra login was made to put it there.
+    [[ "$output" == *"movie.mkv"* ]]
+    [[ "$output" == *"CD1/"* ]]
+    [ ! -f "$SRV/fetches" ]
+}
+
+@test "recursive_listing=False leaves Tab paying for its own login" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    srv_lftp_counter
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\nrecursive_listing=False\n' "$SRV/alftp.lock" \
+        >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" TERM=xterm-256color PATH="$SRV/bin:$PATH" \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\x0c \t q e' --delay 1.0 -- "$ALFTP" -i TV -t -nu -do
+    [ "$status" -eq 0 ]
+    # Exactly as it behaved before there was a walk: no walk, one login for the
+    # directory, and the symlink's own length back in the size column.
+    [ ! -f "$SRV/walks" ]
+    [ -f "$SRV/fetches" ]
+    [[ "$output" == *"movie.mkv"* ]]
+    [[ "$output" =~ Rel\.One-GRP@[[:space:]]+25[[:space:]] ]]
+}
+
+@test "srcs mode waits for a src to be opened before walking it" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    srv_lftp_counter
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    # Quitting without opening anything: each src has a data directory of its
+    # own and walking every one of them up front could be the whole server, so
+    # nothing is walked at all.
+    run env HOME="$home" TERM=xterm-256color PATH="$SRV/bin:$PATH" \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\x0c q e' --delay 1.0 -- "$ALFTP" -i -t -nu -do
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"films"* ]]
+    [ ! -f "$SRV/walks" ]
+    # Opening TV asks for TV's data directory and for nothing else.
+    run env HOME="$home" TERM=xterm-256color PATH="$SRV/bin:$PATH" \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\t \x0c q e' --delay 1.0 -- "$ALFTP" -i -t -nu -do
+    [ "$status" -eq 0 ]
+    [ "$(wc -l < "$SRV/walks")" -eq 1 ]
+}

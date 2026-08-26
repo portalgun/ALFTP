@@ -1549,3 +1549,284 @@ SNIP
     [ "${lines[0]}" = "0 0" ]
     [ "${lines[1]}" = "0" ]
 }
+
+# --------------------------------------------------- the recursive listing --
+
+# An "ls -R" reply as a server sends one, with the three things that break a
+# naive parser in it: a name with spaces, a symlink (whose " -> target" is not
+# part of its name), and a date in the other format ls uses once a file is old
+# enough to lose its time. $lsr is the file.
+lsr () {
+    cat <<'SNIP'
+    lsr=$(mktemp)
+    cat > "$lsr" <<'LSR'
+.:
+total 8
+-rw-r--r--   1 u  g        11 Aug 26 12:13 notes.nfo
+drwxr-xr-x   3 u  g       100 Aug 26 12:13 Rel.One-GRP
+lrwxrwxrwx   1 u  g        23 Aug 26 12:13 latest -> ./Rel.One-GRP
+-rw-r--r--   1 u  g       100 Jan  5  2019 old file.txt
+
+./Rel.One-GRP:
+total 8
+drwxr-xr-x   2 u  g        60 Aug 26 12:13 CD1
+-rw-r--r--   1 u  g        15 Aug 26 12:13 movie.mkv
+
+./Rel.One-GRP/CD1:
+total 4
+-rw-r--r--   1 u  g         9 Aug 26 12:13 part1.bin
+LSR
+    recs () { tui_rec_parse_lsr "$lsr" /data/TV 2026; }
+SNIP
+}
+
+@test "the ls -R parser reads a walk, spaces, symlinks and old dates alike" {
+    run stage "$(lsr)"'
+        recs | grep -c "^D"
+        recs | grep "^E	/data/TV	old file.txt"
+        recs | grep "^E	/data/TV	latest"
+        recs | grep "^E	/data/TV	Rel.One-GRP"'
+    # Three directories were walked: the root and the two blocks under it.
+    [ "${lines[0]}" = "3" ]
+    # A name with spaces survives, and "Jan  5  2019" is a date with no time.
+    [ "${lines[1]}" = $'E\t/data/TV\told file.txt\t0\t100\t2019-01-05 00:00' ]
+    # The symlink keeps its own name and nothing of its target.
+    [ "${lines[2]}" = $'E\t/data/TV\tlatest\t0\t23\t2026-08-26 12:13' ]
+    # A directory's size is the recursive total of what is under it -- 15 for
+    # movie.mkv plus 9 for part1.bin -- not the 100 ls gave the directory entry.
+    [ "${lines[3]}" = $'E\t/data/TV\tRel.One-GRP\t1\t24\t2026-08-26 12:13' ]
+}
+
+@test "a directory the walk covered is known even when it is empty" {
+    run stage '
+        lsr=$(mktemp)
+        printf "%s\n" ".:" "total 0" "" "./Empty:" "total 0" > "$lsr"
+        tui_rec_parse_lsr "$lsr" /data/TV 2026'
+    # No entries at all, but both blocks are still reported, which is what
+    # stops tui_fetch spending a login on a directory known to hold nothing.
+    [ "${lines[0]}" = $'D\t/data/TV\t\t1\t0\t' ]
+    [ "${lines[1]}" = $'D\t/data/TV/Empty\t\t1\t0\t' ]
+}
+
+@test "a reply that is not recursive is spotted, and an empty tree is not" {
+    run stage '
+        f=$(mktemp)
+        # What a server that ignores -R sends: one flat block with a directory
+        # in it and no block describing that directory.
+        printf "%s\n" ".:" "drwxr-xr-x 2 u g 60 Aug 26 12:13 Sub" > "$f"
+        tui_rec_recursive "$f"; echo "flat=$?"
+        # The same listing with no directory in it is a complete answer.
+        printf "%s\n" ".:" "-rw-r--r-- 1 u g 11 Aug 26 12:13 a.txt" > "$f"
+        tui_rec_recursive "$f"; echo "leaf=$?"
+        printf "%s\n" ".:" "drwxr-xr-x 2 u g 60 Aug 26 12:13 Sub" "" "./Sub:" > "$f"
+        tui_rec_recursive "$f"; echo "deep=$?"
+        : > "$f"; tui_rec_recursive "$f"; echo "empty=$?"'
+    [ "${lines[0]}" = "flat=1" ]
+    [ "${lines[1]}" = "leaf=0" ]
+    [ "${lines[2]}" = "deep=0" ]
+    [ "${lines[3]}" = "empty=1" ]
+}
+
+@test "the find/du fallback sizes directories and deliberately not files" {
+    run stage '
+        f=$(mktemp); d=$(mktemp)
+        printf "%s\n" "./" "./Rel.One-GRP/" "./Rel.One-GRP/movie.mkv" "./notes.nfo" > "$f"
+        printf "%s\t%s\n" 1.0K ./notes.nfo 1.0K ./Rel.One-GRP/movie.mkv \
+                          2.0K ./Rel.One-GRP 3.0K . > "$d"
+        tui_rec_parse_find "$f" "$d" /data/TV'
+    [ "${lines[0]}" = $'D\t/data/TV\t\t1\t3.0K\t' ]
+    [ "${lines[1]}" = $'D\t/data/TV/Rel.One-GRP\t\t1\t2.0K\t' ]
+    [ "${lines[2]}" = $'E\t/data/TV\tRel.One-GRP\t1\t2.0K\t' ]
+    # du rounds a file up to a block, and a file size is what the completeness
+    # check compares against what is on disk: an 11 byte file reported as 1.0K
+    # would read as "downloaded but short" for ever. So files get no size here.
+    [ "${lines[3]}" = $'E\t/data/TV/Rel.One-GRP\tmovie.mkv\t0\t\t' ]
+    [ "${lines[4]}" = $'E\t/data/TV\tnotes.nfo\t0\t\t' ]
+}
+
+# The tree the picker has, plus a walk of the data behind it already cached.
+# data_dir/dirname is what link_data_path falls back to for an entry with no
+# parsed symlink target, which is every entry here.
+rec () {
+    cat <<'SNIP'
+    data_dir=/data/; dirname=TV; remote_dl_dir=/complete/TV
+    order () { n=""; for v in "${TUI_ORDER[@]}"; do n="$n ${TUI_NAME[v]}"; done; echo "[${n# }]"; }
+    depths () { d=""; for v in "${TUI_ORDER[@]}"; do d="$d${TUI_DEPTH[v]}"; done; echo "$d"; }
+    tui_rec_store <<'RECS'
+D	/data/TV		1	158
+D	/data/TV/Rel.One-GRP		1	24
+D	/data/TV/Rel.One-GRP/CD1		1	9
+E	/data/TV	Rel.One-GRP	1	24	2026-08-26 12:13
+E	/data/TV	Rel.Two-GRP	1	0	2026-08-26 12:13
+E	/data/TV	notes.nfo	0	11	2026-08-26 12:13
+E	/data/TV/Rel.One-GRP	CD1	1	9	2026-08-26 12:13
+E	/data/TV/Rel.One-GRP	movie.mkv	0	15	2026-08-26 12:13
+E	/data/TV/Rel.One-GRP/CD1	part1.bin	0	9	2026-08-26 12:13
+RECS
+SNIP
+}
+
+@test "the cache is read back by absolute data path, empty directories and all" {
+    run stage "$(rec)"'
+        echo "${#TUI_RECKIDS[@]} ${TUI_RECSIZE[/data/TV/Rel.One-GRP]}"
+        echo "${TUI_RECKIDS[/data/TV]//$'"'"'\n'"'"'/ }"
+        # Rel.Two-GRP was listed as a directory but no block describes it, so
+        # it is not covered and is still worth a login.
+        echo "kids=[${TUI_RECKIDS[/data/TV/Rel.One-GRP/CD1]}] two=${TUI_RECKIDS[/data/TV/Rel.Two-GRP]:-<none>}"'
+    [ "${lines[0]}" = "3 24" ]
+    [ "${lines[1]}" = "Rel.One-GRP Rel.Two-GRP notes.nfo" ]
+    [ "${lines[2]}" = "kids=[part1.bin] two=<none>" ]
+}
+
+@test "the walk fills in the tree, and Tab then costs no login at all" {
+    run stage "$(tree)"$'\n'"$(rec)"'
+        # The tree helper opens Rel.One-GRP by hand; start again with nothing
+        # loaded, which is what the picker has when the walk comes back.
+        TUI_LOADED[0]=0; TUI_OPEN[0]=0
+        TUI_ORDER=(0 1 2); tui_reindex; tui_rebuild_vis
+        tui_rec_expand; tui_rec_sizes
+        echo "$(order)"; echo "$(depths)"
+        echo "loaded=${TUI_LOADED[0]}${TUI_LOADED[6]} open=${TUI_OPEN[0]}"
+        # A subtree has to stay one contiguous run of TUI_ORDER.
+        tui_subtree "${TUI_POS[0]}"; echo "run=$tui_r0-$tui_r1"
+        # And opening it now goes nowhere near a login.
+        LOGINS=0; lftp () { LOGINS=$(( LOGINS + 1 )); return 1; }
+        tui_cur=0; tui_toggle_open; echo "logins=$LOGINS $(names)"'
+    # The whole walked tree is there, each directory directly behind its parent.
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ part1.bin movie.mkv Rel.Two-GRP@ notes.nfo]" ]
+    [ "${lines[1]}" = "012100" ]
+    [ "${lines[2]}" = "loaded=11 open=0" ]
+    [ "${lines[3]}" = "run=1-4" ]
+    [ "${lines[4]}" = "logins=0 [Rel.One-GRP@ CD1/ movie.mkv Rel.Two-GRP@ notes.nfo]" ]
+}
+
+@test "a directory already opened keeps what it has" {
+    run stage "$(tree)"$'\n'"$(rec)"'
+        tui_rec_expand
+        echo "$(order)"'
+    # Rel.One-GRP was open before the walk landed, so it keeps exactly what it
+    # had -- movie.nfo, which the walk does not know about, is neither lost nor
+    # listed twice. CD1 underneath it was never opened, so it is filled in.
+    # Rel.Two-GRP the walk never reached, and notes.nfo is not a directory.
+    [ "$output" = "[Rel.One-GRP@ CD1/ part1.bin movie.mkv movie.nfo Rel.Two-GRP@ notes.nfo]" ]
+}
+
+@test "a directory finally has a real size, and a file keeps the one it had" {
+    run stage "$(tree)"$'\n'"$(rec)"'
+        echo "before=${TUI_SIZE[0]} ${TUI_SIZE[4]} ${TUI_DUSIZE[Rel.One-GRP]:-<none>}"
+        TUI_LOADED[0]=0; TUI_OPEN[0]=0; TUI_ORDER=(0 1 2)
+        tui_reindex; tui_rec_expand; tui_rec_sizes
+        echo "after=${TUI_SIZE[0]} ${TUI_DUSIZE[Rel.One-GRP]}"
+        # The top-level file keeps the figure $listfile5 gave it, and the file
+        # inside the release keeps the exact one the walk gave it.
+        echo "files=${TUI_SIZE[2]} ${TUI_SIZE[7]}"
+        # A real total is what tui_has_du was waiting for.
+        tui_has_du 0; echo "hasdu=$?"'
+    # 4.1G is the length of the symlink dressed up as a size: it is the
+    # completed directory's own listing and says nothing about the release.
+    [ "${lines[0]}" = "before=4.1G 4.0G <none>" ]
+    [ "${lines[1]}" = "after=24 24" ]
+    [ "${lines[2]}" = "files=2.1K 15" ]
+    [ "${lines[3]}" = "hasdu=0" ]
+}
+
+@test "the expansion stops at its budget rather than blocking the tick" {
+    run stage "$(tree)"$'\n'"$(rec)"'
+        TUI_LOADED[0]=0; TUI_OPEN[0]=0; TUI_ORDER=(0 1 2); tui_reindex
+        tui_rec_budget=1; tui_rec_expand
+        echo "$(order)"; echo "added=$tui_rec_added loaded=${TUI_LOADED[0]}"'
+    # One directory's worth of children is over the budget, so CD1 is left for
+    # tui_fetch to serve out of the same cache when the user opens it.
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv Rel.Two-GRP@ notes.nfo]" ]
+    [ "${lines[1]}" = "added=2 loaded=1" ]
+}
+
+@test "a root is walked once, and srcs mode waits for the src to be opened" {
+    run stage '
+        data_dir=/data/; dirname=TV
+        tui_rec_want /data/TV; tui_rec_want /data/TV; tui_rec_want /data/films
+        echo "${#tui_rec_queue[@]} ${tui_rec_queue[0]} ${tui_rec_queue[1]}"
+        tui_rec_queue=(); TUI_RECDONE=()
+        srcs_mode=True; tui_rec_kick; echo "srcs=${#tui_rec_queue[@]}"
+        tui_rec_kicked=0; srcs_mode=""; tui_rec_kick
+        echo "plain=${#tui_rec_queue[@]} ${tui_rec_queue[0]}"
+        # Kicking twice is one walk: the queue is the record of what was asked
+        # for, not of what has finished.
+        tui_rec_kicked=0; tui_rec_kick; echo "again=${#tui_rec_queue[@]}"
+        tui_rec_kicked=0; recursive_listing=False; TUI_RECDONE=()
+        tui_rec_queue=(); tui_rec_kick; echo "off=${#tui_rec_queue[@]}"'
+    [ "${lines[0]}" = "2 /data/TV /data/films" ]
+    [ "${lines[1]}" = "srcs=0" ]
+    [ "${lines[2]}" = "plain=1 /data/TV" ]
+    [ "${lines[3]}" = "again=1" ]
+    [ "${lines[4]}" = "off=0" ]
+}
+
+@test "recursive_listing=False leaves the picker exactly as it was" {
+    run stage "$(tree)"$'\n'"$(rec)"'
+        recursive_listing=False
+        TUI_LOADED[0]=0; TUI_OPEN[0]=0; TUI_ORDER=(0 1 2); tui_reindex
+        tui_rec_expand; echo "$(order) loaded=${TUI_LOADED[0]}"
+        tui_rec_fill 0 0; echo "fill=$?"'
+    [ "${lines[0]}" = "[Rel.One-GRP@ Rel.Two-GRP@ notes.nfo] loaded=0" ]
+    [ "${lines[1]}" = "fill=1" ]
+}
+
+@test "the title bar turns while the walk is running, and closing stops it" {
+    run stage "$(tree)"'
+        TUI_OUT=1; tui_rec_pid=999; tui_spin=1; tui_draw; echo
+        d=$(mktemp -d)
+        tui_rec_out="$d/out"; tui_rec_du="$d/du"
+        tui_rec_log="$d/log"; tui_rec_script="$d/script"
+        touch "$d/out" "$d/du" "$d/log" "$d/script"
+        tui_rec_pid=""; tui_rec_queue=(/data/TV)
+        tui_rec_stop; tui_rec_clean
+        echo "CLEANED left=$(ls -A "$d" | wc -l) queued=${#tui_rec_queue[@]}"
+        tui_rec_clean; echo "AGAIN=$?"
+        rm -rf "$d"'
+    # tui_draw writes a whole screen, so the checks below name what they want
+    # rather than counting lines.
+    [[ "$output" == *'[\]'* ]]
+    [[ "$output" == *"CLEANED left=0 queued=0"* ]]
+    [[ "$output" == *"AGAIN=0"* ]]
+}
+
+@test "a walk that came back with nothing changes nothing" {
+    run stage "$(tree)"'
+        order () { n=""; for v in "${TUI_ORDER[@]}"; do n="$n ${TUI_NAME[v]}"; done; echo "[${n# }]"; }
+        tui_rec_out=$(mktemp); tui_rec_log=$(mktemp); : > "$tui_rec_out"
+        tui_rec_mode=lsr; tui_rec_pid=$$
+        # wait on a pid that is not a child of this shell is a no-op failure,
+        # which is exactly the "the login went wrong" case.
+        tui_rec_reap
+        echo "$(order) pid=[$tui_rec_pid] cached=${#TUI_RECKIDS[@]}"'
+    [ "$output" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo Rel.Two-GRP@ notes.nfo] pid=[] cached=0" ]
+}
+
+@test "an ls -R the server ignored starts the find/du pair for the same root" {
+    run stage '
+        tui_rec_root=/data/TV; tui_rec_mode=lsr; tui_rec_pid=$$
+        tui_rec_out=$(mktemp); tui_rec_log=$(mktemp)
+        printf "%s\n" ".:" "drwxr-xr-x 2 u g 60 Aug 26 12:13 Sub" > "$tui_rec_out"
+        # The walk is not really run: its script is all this needs to see.
+        tui_rec_start () { echo "restarted as $1"; tui_rec_mode=$1; }
+        tui_rec_reap'
+    [ "$output" = "restarted as find" ]
+}
+
+@test "the generated walk asks the server for one command, or for the pair" {
+    run stage '
+        server=example.com; username=u; password=pw; port=21
+        tui_rec_root="/data/T V"
+        lftp () { :; }
+        tui_rec_start lsr; grep -E "^(cd|ls|find|du|set cmd)" "$tui_rec_script"
+        echo "--"
+        tui_rec_pid=""; tui_rec_start find
+        grep -E "^(find|du)" "$tui_rec_script"'
+    [ "${lines[0]}" = "set cmd:fail-exit yes" ]
+    [ "${lines[1]}" = 'cd "/data/T V"' ]
+    [[ "${lines[2]}" == "ls -R > "* ]]
+    [ "${lines[3]}" = "--" ]
+    [[ "${lines[4]}" == "find > "* ]]
+    [[ "${lines[5]}" == "du -a -h > "* ]]
+}
