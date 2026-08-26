@@ -1629,6 +1629,13 @@ tui_add_node () {
 # Split a formatted listing into name/size/date records. Any marker written by
 # a previous pass comes off here: a reloaded list starts deselected like any
 # other.
+#
+# The fields are separated by \037, not by a tab, and every reader below must
+# use the same. Tab is IFS *whitespace*, so `IFS=$'\t' read a b c` folds a run
+# of tabs into one delimiter and drops empty fields entirely -- and the size
+# field is empty for every directory on a server that does not report one, so
+# the date would land in the size column and the date column would come up
+# blank. \037 is not whitespace, so an empty field stays an empty field.
 tui_parse_listing () {
     awk '
         {
@@ -1646,7 +1653,7 @@ tui_parse_listing () {
             }
             sub(/[ \t]+$/, "", nm)
             if (nm == "" || nm == "." || nm == ".." || nm == "./" || nm == "../") { next }
-            print nm "\t" sz "\t" dt
+            print nm "\037" sz "\037" dt
         }
     ' "$1"
 }
@@ -1681,7 +1688,7 @@ tui_load () {
         done < "$listfile2"
     fi
     tui_load_sizes
-    while IFS=$'\t' read -r tui_nm tui_sz tui_dt; do
+    while IFS=$'\037' read -r tui_nm tui_sz tui_dt; do
         tui_isdir=0
         tui_strip_class "$tui_nm"
         if [[ $tui_nm == */ ]] || [[ -n ${TUI_DIRMAP[$tui_stripped]:-} ]]; then
@@ -2630,7 +2637,7 @@ EOF
         done < "$tui_rawdata"
     fi
     tui_kidsnew=()
-    while IFS=$'\t' read -r tui_nm tui_sz tui_dt; do
+    while IFS=$'\037' read -r tui_nm tui_sz tui_dt; do
         tui_isdir=0
         tui_strip_class "$tui_nm"
         if [[ $tui_nm == */ ]] || [[ -n ${TUI_SUBDIR[$tui_stripped]:-} ]]; then
@@ -2911,7 +2918,7 @@ tui_upd_group () {
         done < "$3"
     fi
     tui_upd_nm=(); tui_upd_sz=(); tui_upd_dt=(); tui_upd_kind=()
-    while IFS=$'\t' read -r tui_nm tui_sz tui_dt; do
+    while IFS=$'\037' read -r tui_nm tui_sz tui_dt; do
         tui_strip_class "$tui_nm"
         if (( $1 < 0 )) && ! tui_upd_srcs_ok "$tui_stripped"; then
             continue
@@ -3211,11 +3218,11 @@ tui_rec_parse_lsr () {
                 }
             }
             for (i = 1; i <= nblk; i++) {
-                printf "D\t%s\t\t1\t%d\t\n", blk[i], tot[blk[i]] + 0
+                printf "D\037%s\037\0371\037%d\037\n", blk[i], tot[blk[i]] + 0
             }
             for (i = 1; i <= cnt; i++) {
                 k = order[i]
-                printf "E\t%s\t%s\t%d\t%s\t%s\n", par[k], enm[k], edir[k] + 0,
+                printf "E\037%s\037%s\037%d\037%s\037%s\n", par[k], enm[k], edir[k] + 0,
                     (edir[k] == 1) ? tot[k] + 0 : esz[k], edt[k]
             }
         }
@@ -3244,7 +3251,7 @@ tui_rec_parse_find () {
                 du[dupath] = substr(duline, 1, tab - 1)
             }
             if (dufile != "") { close(dufile) }
-            printf "D\t%s\t\t1\t%s\t\n", root, du[""]
+            printf "D\037%s\037\0371\037%s\037\n", root, du[""]
         }
         {
             p = $0
@@ -3257,8 +3264,8 @@ tui_rec_parse_find () {
             nm = p
             sub(/.*\//, "", nm)
             parent = (index(p, "/") > 0) ? root "/" substr(p, 1, length(p) - length(nm) - 1) : root
-            if (isdir == 1) { printf "D\t%s/%s\t\t1\t%s\t\n", root, p, du[p] }
-            printf "E\t%s\t%s\t%d\t%s\t\n", parent, nm, isdir, (isdir == 1) ? du[p] : ""
+            if (isdir == 1) { printf "D\037%s/%s\037\0371\037%s\037\n", root, p, du[p] }
+            printf "E\037%s\037%s\037%d\037%s\037\n", parent, nm, isdir, (isdir == 1) ? du[p] : ""
         }
     ' "$1"
 }
@@ -3267,7 +3274,9 @@ tui_rec_parse_find () {
 # at all -- set even when it is empty, which is why it is tested with "+x"
 # rather than for a value -- and holds its children's names, one per line.
 tui_rec_store () {
-    while IFS=$'\t' read -r tui_rec_op tui_rec_abs tui_rec_name tui_rec_isdir \
+    # \037, not a tab: a D record has an empty name and an empty date, and a
+    # tab delimiter would collapse them away (see tui_parse_listing).
+    while IFS=$'\037' read -r tui_rec_op tui_rec_abs tui_rec_name tui_rec_isdir \
                             tui_rec_sz tui_rec_dt; do
         if [[ $tui_rec_op == D ]]; then
             if [[ -z ${TUI_RECKIDS[$tui_rec_abs]+x} ]]; then

@@ -241,6 +241,29 @@ SNIP
     [ "$output" = "6 110 000" ]
 }
 
+@test "a directory with no size keeps its date in the date column" {
+    # Most FTP servers report no size for a directory, so the size field of its
+    # record is empty. The fields are separated by \037 rather than by a tab
+    # precisely so that empty field survives being read back: tab is IFS
+    # whitespace, so `IFS=$'\t' read nm sz dt` folds the two delimiters into
+    # one, the date lands in $sz and $dt comes up empty -- which showed up as
+    # dates drawn in the SIZE column, and then as directory dates vanishing
+    # entirely once the recursive walk overwrote the size the date was sitting
+    # in.
+    listfile=$(mktemp); listfile2=$(mktemp)
+    printf '%s\n' 'Some.Release-GRP/       2026-08-23 14:42' \
+                  'somefile.mkv     4.0K  2026-08-22 09:03' > "$listfile"
+    printf '%s\n' 'Some.Release-GRP/' 'somefile.mkv' > "$listfile2"
+    run stage 'exec {TUI_OUT}>/dev/null
+               listfile="'"$listfile"'"; listfile2="'"$listfile2"'"; listfile5=""
+               tui_load
+               echo "dir  size=[${TUI_SIZE[0]}] date=[${TUI_DATE[0]}]"
+               echo "file size=[${TUI_SIZE[1]}] date=[${TUI_DATE[1]}]"'
+    rm -f "$listfile" "$listfile2"
+    [ "${lines[0]}" = "dir  size=[] date=[2026-08-23 14:42]" ]
+    [ "${lines[1]}" = "file size=[4.0K] date=[2026-08-22 09:03]" ]
+}
+
 @test "a path below the top level drops the listing's classifier" {
     run stage "$(tree)"'
         echo "${TUI_PATH[0]} | ${TUI_PATH[3]} | ${TUI_PATH[4]}"'
@@ -1576,7 +1599,10 @@ drwxr-xr-x   2 u  g        60 Aug 26 12:13 CD1
 total 4
 -rw-r--r--   1 u  g         9 Aug 26 12:13 part1.bin
 LSR
-    recs () { tui_rec_parse_lsr "$lsr" /data/TV 2026; }
+    # The parsers separate fields with \037, not a tab, so that an empty field
+    # survives being read back (see tui_parse_listing). Translated to tabs here
+    # so the expectations stay readable.
+    recs () { tui_rec_parse_lsr "$lsr" /data/TV 2026 | tr "\037" "\t"; }
 SNIP
 }
 
@@ -1601,7 +1627,7 @@ SNIP
     run stage '
         lsr=$(mktemp)
         printf "%s\n" ".:" "total 0" "" "./Empty:" "total 0" > "$lsr"
-        tui_rec_parse_lsr "$lsr" /data/TV 2026'
+        tui_rec_parse_lsr "$lsr" /data/TV 2026 | tr "\037" "\t"'
     # No entries at all, but both blocks are still reported, which is what
     # stops tui_fetch spending a login on a directory known to hold nothing.
     [ "${lines[0]}" = $'D\t/data/TV\t\t1\t0\t' ]
@@ -1633,7 +1659,7 @@ SNIP
         printf "%s\n" "./" "./Rel.One-GRP/" "./Rel.One-GRP/movie.mkv" "./notes.nfo" > "$f"
         printf "%s\t%s\n" 1.0K ./notes.nfo 1.0K ./Rel.One-GRP/movie.mkv \
                           2.0K ./Rel.One-GRP 3.0K . > "$d"
-        tui_rec_parse_find "$f" "$d" /data/TV'
+        tui_rec_parse_find "$f" "$d" /data/TV | tr "\037" "\t"'
     [ "${lines[0]}" = $'D\t/data/TV\t\t1\t3.0K\t' ]
     [ "${lines[1]}" = $'D\t/data/TV/Rel.One-GRP\t\t1\t2.0K\t' ]
     [ "${lines[2]}" = $'E\t/data/TV\tRel.One-GRP\t1\t2.0K\t' ]
@@ -1652,7 +1678,7 @@ rec () {
     data_dir=/data/; dirname=TV; remote_dl_dir=/complete/TV
     order () { n=""; for v in "${TUI_ORDER[@]}"; do n="$n ${TUI_NAME[v]}"; done; echo "[${n# }]"; }
     depths () { d=""; for v in "${TUI_ORDER[@]}"; do d="$d${TUI_DEPTH[v]}"; done; echo "$d"; }
-    tui_rec_store <<'RECS'
+    tui_rec_store < <(tr '\t' '\037' <<'RECS'
 D	/data/TV		1	158
 D	/data/TV/Rel.One-GRP		1	24
 D	/data/TV/Rel.One-GRP/CD1		1	9
@@ -1663,6 +1689,7 @@ E	/data/TV/Rel.One-GRP	CD1	1	9	2026-08-26 12:13
 E	/data/TV/Rel.One-GRP	movie.mkv	0	15	2026-08-26 12:13
 E	/data/TV/Rel.One-GRP/CD1	part1.bin	0	9	2026-08-26 12:13
 RECS
+)
 SNIP
 }
 
