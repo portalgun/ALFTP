@@ -7,23 +7,7 @@ portability, and suggested improvements. Line numbers refer to the current
 working-tree version of =alftp=.
 
 * Critical / Confirmed Bugs
-** X SSH key configuration (~keyfile~) never reaches lftp
-   :PROPERTIES:
-   :LOCATION: alftp:368-370
-   :END:
-   #+begin_src bash
-   if [[ ! -z $keyfile ]]; then
-         set sftp:connect-program "ssh -a -x -i $keyfile"
-   fi
-   #+end_src
-   This ~set~ runs as a plain bash statement in ~ARGSC~, not inside an lftp
-   heredoc. Bash's builtin ~set~ with non-flag arguments just reassigns the
-   script's own positional parameters (~$1~, ~$2~, …); it does not configure
-   lftp in any way. The intended lftp directive is silently dropped, so
-   ~keyfile~-based SFTP key auth does not work.
-   - *Fix*: emit this as an ~echo "set sftp:connect-program ..."~ line inside
-     ~set_opts~ (conditionally on ~$keyfile~), the same way every other lftp
-     option is set.
+  Nothing open.
 
 * Missing / Incomplete Features
   These are flags or config keys that are parsed and stored but never acted
@@ -32,28 +16,6 @@ working-tree version of =alftp=.
   dangling since the help text and =alftp.conf.template= advertise them as
   real, working options:
 
-  - X *Session locking* — the help text's default-action description promises
-    "Lock the current session" / "Check for previous session's download and
-    prompt for its check/completion" (alftp:55-56), and ~COMPLETE~ removes
-    the lock file (now ~/tmp/alftp.lock~) — but nothing ever creates that lock
-    file or checks for its existence at startup. ~WELCOME~'s ~ON=0~ /
-    ~prevsession=0~ (alftp:375-376) look like leftover scaffolding for this
-    and are never read again. Net effect: nothing stops two concurrent alftp
-    runs from clobbering the same list files / lftp session.
-  - X *~-n~ (new_only)* — variable is set (alftp:310) but never consulted
-    anywhere else in the script.
-        - see next item
-  - X *~-o~ (old_only)* — only effect is to skip the entire
-    download/list-creation block in ~NEW_SESSION~ (alftp:405); there is no
-    actual "resume/finish old session" logic, so ~-o~ just does nothing
-    rather than the "checks/finishes old download only" behavior the help
-    text describes.
-        - remove -n and -o and opt for -c or --continue, which reads last sessions listfile if it exists and continue where it left off.
-        
-  - X *~-fs~ (print_fs / filesize)* — variable set (alftp:320) but unused; the
-    TODO block (alftp:30-38) contains the intended ~awk~/~numfmt~/~df~/~bc~
-    pseudocode for computing and displaying transfer sizes, never wired up.
-        - replace with -ls which shows filenames, their size, and creation date.
   - *~-rm~ (rm_remote)* — variable set (alftp:330) but unused; nothing in
     ~DLDR~/~DLFL~/~DOWNLD~ issues a remote delete beyond removing the
     completion symlink, so "remove files from remote location once download
@@ -63,61 +25,12 @@ working-tree version of =alftp=.
     successfully downloaded"), and ~-r~ is supposed to suppress appending to
     it, but no code anywhere reads ~$record~ or appends to any such file.
     Both the base feature and its suppression flag are entirely absent.
-  - X *~errors~ / ~verify~ config keys* — documented in
-    ~alftp.conf.template~ ("where to log errors" / "store xfer verify logs to
-    verify data once downloaded") but never referenced in ~alftp~.
-  - X *~autoUncompress~ config key* — documented in
-    ~alftp.conf.template~ as the way to opt in to automatic decompression,
-    but the actual code path unrars *unconditionally* unless ~-nu~ is passed
-    (alftp:430), and ~$autoUncompress~ is never read. Behavior is inverted
-    from what's documented, and the documented knob is dead.
-        - make the default for this False if it isnt already
-  - X *GPG-encrypted config* — the help text's default action list literally
-    says "Read config file and *gpg file* variables" (alftp:53), but no gpg
-    invocation exists anywhere in the script. Passwords are plain text only
-    (see Security section).
-        - add gpg_file config variable, which specifies is specified by a path
   - *~chkrmd~ / ~chkrmf~* (alftp:558-568) — defined, never called from
     anywhere. Likely meant to clean up stale local directories/files (maybe
     tied to the missing "old session" handling) but currently dead code.
-  - X *checksum verification* — listed in the TODO block, not implemented; ties
-    into the also-unused ~verify~ config key above.
-        - make this "checsum=True/False' variable in config, and default it to False.
 
 * Security Concerns
-
-  - X *Password exposure via process list*: ~lftp -p $port -u
-    $username,$password $server~ put the plaintext password on the command
-    line, visible to any local user via ~ps~/~/proc~. *Fixed*: every session
-    now starts with an ~open --user ... --password ...~ line inside the
-    generated script, and ~-jl~ passes the same line via ~lftp --rcfile~, so
-    nothing lands in ~ps~. The password does briefly exist in a ~mktemp~ file
-    (mode 0600) instead.
-    Still open: the config file stores ~password=~ in plaintext
-    (alftp.conf.template), so there's no path to a non-plaintext credential
-    despite the help text implying gpg-backed secrets were intended.
-    Consider: lftp's ~.netrc~ support, prompting interactively when password
-    is unset, or actually implementing the gpg-file idea from the help text.
-        - prompt for password if no keyfile, gpg-file doesn't provide password, and no password is provided
-       
-  - X *~eval~ over untrusted-ish input*: ~eval_local_config~ and
-    ~eval_remote_config~ (alftp:169-197) both ~eval~ chunks of
-    ~alftp.src.conf~ built via ~awk~/~sed~ text surgery. This is inherent to
-    the "profiles are bash snippets" design (documented in README), so it's
-    not necessarily wrong, but it does mean a corrupted or maliciously edited
-    profile file is arbitrary code execution with no sandboxing — worth a
-    one-line callout in the README/config template so users don't treat
-    ~alftp.src.conf~ as inert data.
-  - X *~chmod -R 777~ on downloaded directories* (alftp:433, and in ~DLDR~'s
-    ~norm~ branch messaging) makes downloaded content world-writable. This is
-    unusually permissive for content just pulled from a remote server;
-    ~755~/~775~ would cover the typical "I want to read/browse this as
-    another local user" use case without making it group/world-writable too.
-        - Add the ability to specify what permissions should be applied to downloaded files and directories via perms_dirs, and perms_files in the config.  These should be the three digits, unix format and should default to 744 for directories and 644 for files. A third option should toggle whether these are applied altogether chmod=True or chmod=False. Also add the ability to specify whether the owner should be changed for files and directories via option 'owner', and to toggle whether this is applied via chown=True or chown=False. 
-  - X *Regex-injection via hostname / default_server*: see the "Unescaped
-    values embedded into awk regex" bug below — while not exploitable
-    remotely, a server name or hostname containing regex metacharacters can
-    silently corrupt profile matching.
+  Nothing open.
 
 * Correctness / Robustness Issues (non-critical)
    - *Done*: ~config_template~ holds a real, commented default config;
@@ -134,26 +47,6 @@ working-tree version of =alftp=.
    but the feature they were scaffolding is still missing (see "Session
    locking" above), so this stays open until locking is implemented or the
    help text stops promising it.
-
-** X No traps set despite ~COMPLETE~ clearing them
-   :PROPERTIES:
-   :LOCATION: alftp:548
-   :END:
-   #+begin_src bash
-   trap - SIGINT SIGTERM
-   #+end_src
-   clears traps for those signals, but the script never installs a trap on
-   them in the first place, so there's no cleanup (temp files, lock file,
-   partial list files) if the user Ctrl-C's mid-transfer.
-
-** X No strict-mode / typo protection
-   Several of the bugs above (~sourcelfag~, ~$list_file~) are exactly the
-   class of error ~set -u~ (nounset) catches immediately at runtime instead
-   of silently misbehaving. ~set -u~ is now on (see Completed); ~-e~ and
-   ~pipefail~ are still off, and full ~-e~ may well be too aggressive given
-   how much of the control flow relies on commands "failing" as normal
-   control flow (e.g. grep with no matches). Worth revisiting per-pipeline
-   rather than globally.
 
 * Portability
 
@@ -173,15 +66,231 @@ working-tree version of =alftp=.
     implement the documented behavior or remove the flag/config key and its
     mention in the help text and ~alftp.conf.template~ so the documented
     surface area matches what actually works.
-  - X *Structured logging*: right now the "record"/"errors" story is entirely
-    aspirational (see above); a real implementation could log
-    profile/timestamp/file/status lines to ~$record~, giving users an actual
-    audit trail of what was downloaded when — which is explicitly promised in
-    the config template's comments already.
 
 * Completed
   Items resolved on 2026-08-23. Line numbers in the ~:LOCATION:~ drawers refer
   to the pre-fix version of =alftp=.
+
+** DONE SSH key configuration (~keyfile~) never reaches lftp
+   :PROPERTIES:
+   :LOCATION: alftp:368-370
+   :END:
+   The ~set sftp:connect-program "ssh -a -x -i $keyfile"~ in ~ARGSC~ was a bash
+   builtin reassigning the script's own positional parameters, not an lftp
+   directive, so key-based SFTP auth silently did nothing.
+   - *Done*: ~set_opts~ emits it as an lftp directive (quoted with
+     ~lftp_quote~) when ~$keyfile~ is set, and the bogus ~set~ is gone. A real
+     ~alftp.src.conf~ spells the key ~keyFile=~, so ~resolve_keyfile~ (called
+     from ~WELCOME~) accepts either spelling and both are initialised in
+     DEFAULTS. Covered by a bats test on ~set_opts~ for both spellings.
+
+** DONE Session locking was promised but never implemented
+   :PROPERTIES:
+   :LOCATION: alftp:55-56, 375-376
+   :END:
+   The help text promised "Lock the current session" and ~COMPLETE~ removed
+   ~/tmp/alftp.lock~, but nothing ever created or checked it, so two concurrent
+   runs would clobber each other's list files.
+   - *Done*: ~WELCOME~ takes the lock (~take_lock~), writing its pid with a
+     ~noclobber~ redirect so the create is atomic. A lock whose pid is still
+     alive refuses the run by name ("another run (pid N) is in progress"); one
+     whose pid is gone is reported as stale and taken over. ~release_lock~ (only
+     for a lock this process took) runs from ~COMPLETE~ *before* its ~exitflag~
+     early return, so ~-jl~ gives it back too, and from the signal handler. The
+     path is the new ~lockfile~ config key, default ~/tmp/alftp.lock~ -- the
+     tests set it elsewhere so they cannot disturb a real run. The in-session
+     helper (~ALFTP_EMIT_DL~) deliberately does not take it: its parent holds
+     it. Covered by unit tests (live pid, stale pid, release) and an end-to-end
+     test against the fake server.
+
+** DONE ~-n~ (new_only) and ~-o~ (old_only) did nothing; ~-c~/~--continue~ replaces them
+   :PROPERTIES:
+   :LOCATION: alftp:310, 405
+   :END:
+   ~new_only~ was set and never read; ~old_only~ only skipped the whole
+   download block, so neither flag did what the help text described.
+   - *Done*: both flags and both globals are gone, and ~-c~/~--continue~ takes
+     their place: ~CONTINUE_LIST~ (from ~EDIT_LIST~, right after ~FORMAT_LIST~)
+     merges the marks in ~$oldfile~ -- the copy of the previous session's list
+     that ~CREATE_LIST~/~SINGLE_SESSION~ take before the fresh listing
+     overwrites it -- into this run's listing, so an entry marked last time
+     comes up marked (~+~ or ~-~) if it is still on the server, and it says how
+     many marks it carried over. ~$oldfile~ moved to ~WELCOME~ so the in-session
+     helper, which never runs the session functions, agrees on it.
+     ~marked_entries~ is the shared "what does this list file say" reader;
+     ~tui_apply_marks~ puts the marks back into the picker's tree (~tui_load~
+     strips markers on purpose), and the editor path leaves ~+~/~-~ lines
+     uncommented under ~-c~. ~-ns~ still works -- it only ever needed
+     ~suspend_old~ -- and ~COMPLETE~ now checks the old file exists before
+     restoring it.
+
+** DONE ~-fs~ (print_fs / filesize) was dead; ~-ls~ replaces it
+   :PROPERTIES:
+   :LOCATION: alftp:320, 30-38
+   :END:
+   ~print_fs~ was set and never read; the intended size arithmetic never got
+   past the TODO block.
+   - *Done*: ~-fs~ and ~print_fs~ are gone. ~-ls~ runs everything up to and
+     including the picker, then prints each marked entry's name, size and date
+     (~LIST_MARKED~, straight out of the columnar list file) and stops without
+     transferring. In the single-session path the helper writes an empty emit
+     file so the session has nothing to source, and the parent prints the list
+     instead of running ~TYPE~/~POST_PROCESS~. Covered by a unit test and an
+     end-to-end test that checks nothing was transferred or unlinked.
+
+** DONE ~record~ / ~errors~ / ~verify~ config keys, and structured logging
+   :PROPERTIES:
+   :LOCATION: alftp.conf.template
+   :END:
+   All three were documented in ~alftp.conf.template~ and referenced nowhere in
+   the script.
+   - *Done*: ~POST_PROCESS~ now logs one tab-separated
+     ~time<TAB>profile<TAB>entry<TAB>status~ line per entry -- greppable, and
+     ~cut~-able by column. Entries that arrived go to ~$record~ (unless ~-r~ /
+     ~no_append~), entries that did not go to ~$errors~, and ~checksum=True~
+     writes what it verified to ~$verify~. All three default to
+     ~$HOME/.cache/alftp/alftp.{record,errors,verify}~, alongside the existing
+     ~listfile~/~logfile~ defaults, and their directories are created in
+     ~WELCOME~. Whether an entry arrived is decided locally, by looking for it
+     under ~$local_dl_dir~: lftp's own output goes to the terminal (and shares
+     it with the picker in the single-session path), so there is no success line
+     to read back. ~--dry-run~ and ~-cl~ skip the stage entirely, since neither
+     downloaded anything. The profile name is kept in a new ~profile~ global,
+     set in ~ARGSB~, so a line says which profile it came from.
+
+** DONE ~autoUncompress~ was documented but inverted and unread
+   :PROPERTIES:
+   :LOCATION: alftp:430
+   :END:
+   The unrar path ran unconditionally unless ~-nu~ was passed, and
+   ~$autoUncompress~ was never read.
+   - *Done*: ~autoUncompress~ defaults to ~False~ and is what decides:
+     ~UNRAR_FUN~ runs only when it is true (compared case-insensitively, like
+     ~data~), and ~-nu~ still forces it off for a run where the config asked for
+     it. Covered by a bats test with ~UNRAR_FUN~ stubbed, in all three
+     combinations.
+
+** DONE Checksum verification
+   :PROPERTIES:
+   :LOCATION: alftp:39 (TODO block)
+   :END:
+   Listed in the TODO block, never implemented, and tied to the unused
+   ~verify~ config key.
+   - *Done*: new ~checksum~ config key, default ~False~. When it is true,
+     ~verify_entry~ writes a line per downloaded entry to ~$verify~ holding the
+     size in bytes and, for a single file, its sha256 -- so what is on disk can
+     be checked later against what was fetched.
+     Two things it deliberately does *not* do, both found by trying them: it
+     does not compare against the size in the listing, because the completed
+     directory is full of symlinks and a server that reports the size of the
+     link rather than of the file behind it (which is exactly what the file://
+     test server does) makes every entry look wrong; and it does not use lftp's
+     ~xfer:verify~, because its ~verify-file~ helper needs perl modules that are
+     frequently missing (~String::CRC32~ here), and when it fails it fails the
+     transfer -- which also swallows the ~&& rm -f~ that drops the symlink of a
+     completed entry.
+
+** DONE GPG-encrypted config
+   :PROPERTIES:
+   :LOCATION: alftp:53
+   :END:
+   The help text promised "Read config file and gpg file variables" and no gpg
+   invocation existed anywhere in the script.
+   - *Done*: new ~gpg_file~ config key naming a gpg-encrypted file of settings
+     (typically one ~password=~ line). ~eval_gpg_config~ runs between the two
+     config passes and the argument passes -- so either config file can name it
+     and a CLI flag still wins -- decrypts with ~gpg --batch --quiet --decrypt~
+     and ~eval~s the plaintext the way the rest of the config is eval'd, then
+     drops it from the variable it came in. A missing file, a missing gpg or a
+     failed decrypt each abort with a message naming the file rather than
+     falling back to whatever credentials were lying around. Covered by bats
+     tests with ~gpg~ stubbed (success and failure) and a missing file.
+
+** DONE Password exposure and no non-plaintext credential path
+   :PROPERTIES:
+   :LOCATION: alftp.conf.template, alftp:511
+   :END:
+   The password no longer reaches ~ps~ (that part was already fixed), but the
+   config file still had to hold it in plaintext.
+   - *Done*: there are now three ways not to store it: ~keyfile~ (see above),
+     ~gpg_file~ (see above), and prompting. ~prompt_password~ (in ~WELCOME~)
+     asks with ~read -s~ when there is a username, no password and no keyfile --
+     but only when stdin is a terminal, so a cron run keeps the current
+     behaviour of an empty password rather than hanging. A password typed at the
+     prompt reaches the in-session helper through ~ALFTP_PASSWORD~ on the ~!env~
+     line (~child_env~), since the helper re-derives everything else from config
+     plus argv and would otherwise have no credentials for the listing logins
+     ~tab~ does; a child's environment is readable only by its owner, and the
+     generated script already holds the same secret.
+
+** DONE ~eval~ over untrusted-ish input
+   :PROPERTIES:
+   :LOCATION: alftp:169-197
+   :END:
+   ~eval_local_config~/~eval_remote_config~ ~eval~ chunks of ~alftp.src.conf~,
+   which is inherent to the "profiles are bash snippets" design but worth
+   saying out loud.
+   - *Done*: no code change, as the audit suggested -- a callout instead, in
+     both ~README.md~ (a block quote right where the file's bash-ness is first
+     explained) and ~alftp.conf.template~: the file is code, not inert data, it
+     runs with your privileges every time alftp starts, keep it ~chmod 600~ and
+     do not paste profile blocks from anywhere you would not run a script from.
+
+** DONE ~chmod -R 777~ on downloaded directories
+   :PROPERTIES:
+   :LOCATION: alftp:433
+   :END:
+   Post-processing made everything downloaded world-writable.
+   - *Done*: replaced by ~apply_perms~ and five config keys: ~chmod~
+     (~True~/~False~, default ~False~) decides whether permissions are touched
+     at all, ~perms_dirs~ (default ~744~) and ~perms_files~ (default ~644~) say
+     what to; ~chown~ (default ~False~) and ~owner~ do the same for ownership.
+     The default is therefore to change nothing at all -- content keeps the
+     permissions and owner it arrived with. Covered by a unit test (nothing
+     changes unless asked) and an end-to-end test.
+
+** DONE Regex-injection via hostname / default_server
+   - *Done*: verified -- ~ere_escape~ escapes ERE metacharacters for both the
+     hostname and ~default_server~ before they are spliced into the ~awk~
+     patterns, and the bats test that distinguishes ~example.com~ from
+     ~exampleXcom~ in the fixture passes. Nothing further to do; this is the
+     same fix already recorded under "Unescaped values embedded into awk regex".
+
+** DONE No traps set despite ~COMPLETE~ clearing them
+   :PROPERTIES:
+   :LOCATION: alftp:548
+   :END:
+   ~COMPLETE~ cleared traps the script never installed, so a Ctrl-C mid-run
+   left its temp files and (once locking existed) its lock behind.
+   - *Done*: ~install_traps~ (from ~WELCOME~) installs INT/TERM/HUP handlers
+     that release the lock, remove the temp files the run created, and re-raise
+     the signal after clearing the trap, so the caller sees an interrupted
+     process rather than exit 0. To make "the temp files the run created"
+     knowable, every ~mktemp~ now goes through ~new_tmp~, which records the name
+     in ~$tmpfiles~ (it returns the name in ~$tmpfile_new~ rather than on
+     stdout, because a ~$(...)~ would put the array append in a subshell);
+     ~ALFTP_DEBUG~ still keeps them. ~COMPLETE~ clears the same three signals it
+     now installs. The picker's own INT handling is unaffected: ~tui_open~ saves
+     and ~tui_close~ restores whatever traps were in place. Covered by two bats
+     tests that send the running shell INT and TERM and check the lock and the
+     temp file are gone and the exit status is 130/143.
+
+** DONE No strict-mode / typo protection
+   - *Done*: audited, and the answer is that ~pipefail~ stays off, deliberately.
+     ~set -u~ is on and every optional flag and config key is initialised in the
+     DEFAULTS block. ~-e~ stays off for the reason already recorded: too much of
+     the control flow uses a command "failing" as a normal outcome. For
+     ~pipefail~, the pipelines in this script fall into two groups, and neither
+     wants it: the config and list transforms
+     (~eval_local_config~/~eval_remote_config~/~TYPE~/~marked_entries~) end in
+     ~grep~/~sed~ whose "failure" is simply "nothing matched", which is a normal
+     result here; and no pipeline in the script has its exit status consumed --
+     the places that do check a status (~run_lftp_script~, ~FORMAT_LIST~'s
+     ~... > tmp && mv~, ~tui_fetch~) run a single command, so they already
+     report the failure that matters. Turning ~pipefail~ on globally would
+     therefore change nothing except to make the deliberate empty-grep cases
+     look like errors. Worth revisiting if a pipeline whose status is checked
+     ever appears.
 
 ** DONE ~-ld~/~-rd~ set the wrong flags, breaking non-profile CLI usage
    :PROPERTIES:
