@@ -518,6 +518,10 @@ PICK
 # the test changes the server under the picker.
 picker_check () {
     cat <<'SNIP'
+    # Everything these tests create lands inside the fake server, so that the
+    # teardown takes the check's listing files with it: the picker removes them
+    # in tui_close, which a test driving tui_loop by hand never reaches.
+    export TMPDIR="$SRV"
     oldfile=$(mktemp)
     # The listing session's own chatter is not what these tests are reading.
     { CREATE_LIST; FORMAT_LIST; LOAD_LINKS; VALIDATE_LINKS; } > /dev/null 2>&1
@@ -600,6 +604,7 @@ SNIP
     printf '#!/bin/sh\nsleep 1\nexec %s "$@"\n' "$(command -v lftp)" > "$SRV/bin/lftp"
     chmod +x "$SRV/bin/lftp"
     run srv_stage '
+        export TMPDIR="$SRV"
         oldfile=$(mktemp)
         { CREATE_LIST; FORMAT_LIST; LOAD_LINKS; VALIDATE_LINKS; } > /dev/null 2>&1
         exec {TUI_OUT}>"$SRV/frames"
