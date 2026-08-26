@@ -20,11 +20,6 @@ working-tree version of =alftp=.
     ~DLDR~/~DLFL~/~DOWNLD~ issues a remote delete beyond removing the
     completion symlink, so "remove files from remote location once download
     is complete" doesn't happen.
-  - *~-r~ (no_append) and the "record" feature* — ~alftp.conf.template~
-    documents a ~record~ option ("list of everything that has been
-    successfully downloaded"), and ~-r~ is supposed to suppress appending to
-    it, but no code anywhere reads ~$record~ or appends to any such file.
-    Both the base feature and its suppression flag are entirely absent.
   - *~chkrmd~ / ~chkrmf~* (alftp:558-568) — defined, never called from
     anywhere. Likely meant to clean up stale local directories/files (maybe
     tied to the missing "old session" handling) but currently dead code.
@@ -37,16 +32,6 @@ working-tree version of =alftp=.
      ~mkdir -p "$(dirname "$config")"~ runs first and aborts with a clear error if
      it fails; the file is written with ~printf '%s'~. Verified end to end against
      a throwaway ~$HOME~.
-
-** Dead/unused variables from the locking design that never landed
-   :PROPERTIES:
-   :LOCATION: alftp:375-376
-   :END:
-   ~ON=0~ and ~prevsession=0~ were set in ~WELCOME~ and never read again.
-   They have since been dropped along with the rest of the ~WELCOME~ rewrite,
-   but the feature they were scaffolding is still missing (see "Session
-   locking" above), so this stays open until locking is implemented or the
-   help text stops promising it.
 
 * Portability
 
@@ -577,3 +562,23 @@ DO BOTH
      sessions are now generated into a temp script (~mktemp~) that is fed to
      ~lftp~ on stdin and *kept*, with its path printed, when lftp exits non-zero
      or when ~ALFTP_DEBUG~ is set.
+
+** DONE ~-r~ (no_append) and the "record" feature
+   The base feature and its suppression flag were both absent: nothing read
+   ~$record~ or appended to it.
+   - *Done*: implemented alongside the structured-logging item. ~record_result~
+     appends a tab-separated ~time profile entry status~ line per entry to
+     ~$record~, suppressed by ~-r~/~no_append~, with failures going to
+     ~$errors~ instead. Covered by an integration test that runs a profile
+     twice and checks the second run with ~-r~ adds no line.
+
+** DONE Dead/unused variables from the locking design that never landed
+   :PROPERTIES:
+   :LOCATION: alftp:375-376
+   :END:
+   ~ON=0~ and ~prevsession=0~ were set in ~WELCOME~ and never read again. They
+   were dropped in the ~WELCOME~ rewrite, but the item stayed open on its own
+   terms — "until locking is implemented or the help text stops promising it".
+   - *Done*: locking is implemented (see "Session locking" above), so the
+     condition this item was left open under is met. ~take_lock~/~release_lock~
+     hold ~$lockfile~ with the running pid; neither variable exists any more.
