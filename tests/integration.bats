@@ -115,6 +115,57 @@ PICK
     [ ! -e "$DL/notes.nfo" ]
 }
 
+@test "an x entry loses its symlink and the data behind it" {
+    run srv_stage 'CREATE_LIST; LOAD_LINKS; LINESX="Rel.One-GRP"; DOWNLD'
+    [ "$status" -eq 0 ]
+    # Both ends of the symlink are gone, and nothing was downloaded first.
+    [ ! -e "$SRV/complete/TV/Rel.One-GRP" ]
+    [ ! -e "$SRV/data/TV/Rel.One-GRP" ]
+    [ ! -e "$DL/Rel.One-GRP" ]
+    # Everything else is untouched.
+    [ -L "$SRV/complete/TV/notes.nfo" ]
+    [ -f "$SRV/data/TV/notes.nfo" ]
+}
+
+@test "a - entry next to it still loses only its symlink" {
+    run srv_stage 'CREATE_LIST; LOAD_LINKS; LINESX="Rel.One-GRP"; LINESR="notes.nfo"; DOWNLD'
+    [ "$status" -eq 0 ]
+    [ ! -e "$SRV/data/TV/Rel.One-GRP" ]
+    [ ! -e "$SRV/complete/TV/notes.nfo" ]
+    [ -f "$SRV/data/TV/notes.nfo" ]
+}
+
+@test "deleting a single file inside a release leaves the release alone" {
+    run srv_stage 'CREATE_LIST; LOAD_LINKS; LINESX="Rel.One-GRP/movie.mkv"; DOWNLD'
+    [ "$status" -eq 0 ]
+    [ ! -e "$SRV/data/TV/Rel.One-GRP/movie.mkv" ]
+    [ -f "$SRV/data/TV/Rel.One-GRP/release.nfo" ]
+    # A nested entry has no symlink of its own, so the release keeps its.
+    [ -L "$SRV/complete/TV/Rel.One-GRP" ]
+}
+
+@test "--dry-run deletes neither the symlink nor the data" {
+    run srv_stage 'dry_run=True; CREATE_LIST; LOAD_LINKS; LINESX="Rel.One-GRP"; DOWNLD'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DRY-RUN: rm -r"* ]]
+    [ -L "$SRV/complete/TV/Rel.One-GRP" ]
+    [ -d "$SRV/data/TV/Rel.One-GRP" ]
+}
+
+@test "the download runs in the order the list had, not directories first" {
+    run srv_stage 'LINESO="file'$'\t''notes.nfo
+dir'$'\t''Rel.One-GRP"; DOWNLD'
+    [ "$status" -eq 0 ]
+    [ -f "$DL/notes.nfo" ]
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+    # The file was picked above the directory, so it transferred first.
+    first=$(printf '%s\n' "$output" | grep -n 'COMPLETE: notes.nfo' | head -n 1 | cut -d: -f1)
+    second=$(printf '%s\n' "$output" | grep -n 'COMPLETE: Rel.One-GRP' | head -n 1 | cut -d: -f1)
+    [ -n "$first" ]
+    [ -n "$second" ]
+    [ "$first" -lt "$second" ]
+}
+
 # A stand-in for $editor that keeps a copy of what it was shown and then picks
 # nothing, so a run costs one listing and no transfers: what is being tested is
 # the list the picker was handed and what the session did to the remote.
@@ -192,4 +243,51 @@ PICK
     # Nothing was picked, so the second login exists only to do the pruning.
     [ ! -L "$SRV/complete/TV/broken.link" ]
     [ -L "$SRV/complete/TV/notes.nfo" ]
+}
+
+@test "x asks under a real terminal, and Y deletes both ends of the symlink" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys 'x Y q s' --delay 0.5 -- "$ALFTP" -a TV -t -nu
+    [[ "$output" == *"delete Rel.One-GRP"* ]]      # the confirmation was drawn
+    [[ "$output" == *"1 deletion(s)"* ]]
+    [ ! -e "$SRV/complete/TV/Rel.One-GRP" ]
+    [ ! -e "$SRV/data/TV/Rel.One-GRP" ]
+    [ ! -e "$DL/Rel.One-GRP" ]
+}
+
+@test "anything but Y cancels the delete under a real terminal" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys 'x y q s' --delay 0.5 -- "$ALFTP" -a TV -t -nu
+    [[ "$output" == *"left alone"* ]]
+    [ -L "$SRV/complete/TV/Rel.One-GRP" ]
+    [ -d "$SRV/data/TV/Rel.One-GRP" ]
+}
+
+@test "alt-down reorders under a real terminal and the order is the download order" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    # Take both entries, then move Rel.One-GRP below notes.nfo with Alt-Down.
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys 'a \e[1;3B q s' --delay 0.5 -- "$ALFTP" -a TV -t -nu
+    [[ "$output" == *"2 selection(s)"* ]]
+    [ -f "$DL/notes.nfo" ]
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+    first=$(printf '%s\n' "$output" | grep -n 'COMPLETE: notes.nfo' | head -n 1 | cut -d: -f1)
+    second=$(printf '%s\n' "$output" | grep -n 'COMPLETE: Rel.One-GRP' | head -n 1 | cut -d: -f1)
+    [ -n "$first" ]
+    [ -n "$second" ]
+    [ "$first" -lt "$second" ]
 }

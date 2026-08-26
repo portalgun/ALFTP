@@ -229,6 +229,7 @@ tree () {
     tui_reindex; tui_rebuild_vis; tui_widths
     TUI_LINES=12; TUI_COLS=60; TUI_ROWS=9; remote_dl_dir=/remote
     marks () { m=""; for v in "${TUI_VIS[@]}"; do tui_marker "$v"; m="$m$tui_mark"; done; echo "[$m]"; }
+    names () { n=""; for v in "${TUI_VIS[@]}"; do n="$n ${TUI_NAME[v]}"; done; echo "[${n# }]"; }
 SNIP
 }
 
@@ -433,6 +434,182 @@ SNIP
         KEYS=($(printf "\e[B") $(printf "\e[B") " " q s); tui_loop; marks'
     [ "${lines[0]}" = "[     +]" ]
     [ "${lines[1]}" = "[* +   ]" ]
+}
+
+@test "alt-j moves an entry down its sibling group and the cursor follows" {
+    run stage "$(tree)"'
+        tui_cur=4; tui_move_node down; names; echo "$tui_cur"'
+    # Rel.Two-GRP swaps with notes.nfo; the cursor stays on Rel.Two-GRP.
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo notes.nfo Rel.Two-GRP@]" ]
+    [ "${lines[1]}" = "5" ]
+}
+
+@test "a directory moved down takes its whole subtree with it" {
+    run stage "$(tree)"'
+        tui_cur=0; tui_move_node down; names; echo "$tui_cur"'
+    # The three children stay behind Rel.One-GRP, which is now second.
+    [ "${lines[0]}" = "[Rel.Two-GRP@ Rel.One-GRP@ CD1/ movie.mkv movie.nfo notes.nfo]" ]
+    [ "${lines[1]}" = "1" ]
+}
+
+@test "alt-k puts it back where it was" {
+    run stage "$(tree)"'
+        tui_cur=0; tui_move_node down; tui_move_node up; names; echo "$tui_cur"'
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo Rel.Two-GRP@ notes.nfo]" ]
+    [ "${lines[1]}" = "0" ]
+}
+
+@test "an entry never leaves its sibling group" {
+    # CD1 is the first child, movie.nfo the last: neither may step out of the
+    # directory they are in.
+    run stage "$(tree)"'
+        tui_cur=1; tui_move_node up; echo "$tui_msg"; names
+        tui_cur=3; tui_msg=""; tui_move_node down; echo "$tui_msg"; names'
+    [ "${lines[0]}" = "CD1/ is already first here" ]
+    [ "${lines[1]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo Rel.Two-GRP@ notes.nfo]" ]
+    [ "${lines[2]}" = "movie.nfo is already last here" ]
+    [ "${lines[3]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo Rel.Two-GRP@ notes.nfo]" ]
+}
+
+@test "children reorder among themselves without disturbing the top level" {
+    run stage "$(tree)"'
+        tui_cur=2; tui_move_node up; names; echo "$tui_cur"'
+    [ "${lines[0]}" = "[Rel.One-GRP@ movie.mkv CD1/ movie.nfo Rel.Two-GRP@ notes.nfo]" ]
+    [ "${lines[1]}" = "1" ]
+}
+
+@test "reordering keeps the selection counters and the marks right" {
+    run stage "$(tree)"'
+        tui_cur=0; tui_toggle; tui_move_node down; marks; echo "$tui_nsel"'
+    [ "${lines[0]}" = "[ ++++ ]" ]
+    [ "${lines[1]}" = "1" ]
+}
+
+@test "alt-j and the alt-arrows reach tui_move_node from the loop" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(G $(printf "\ek") q e); tui_loop; names; echo "$tui_cur"'
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo notes.nfo Rel.Two-GRP@]" ]
+    [ "${lines[1]}" = "4" ]
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=($(printf "\e[1;3B") q e); tui_loop; names'
+    [ "${lines[0]}" = "[Rel.Two-GRP@ Rel.One-GRP@ CD1/ movie.mkv movie.nfo notes.nfo]" ]
+}
+
+@test "x asks before it marks, and only Y confirms" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(x Y); tui_loop; marks; echo "$tui_ndel"'
+    [ "${lines[0]}" = "[x     ]" ]
+    [ "${lines[1]}" = "1" ]
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(x n); tui_loop; marks; echo "$tui_ndel $tui_msg"'
+    [ "${lines[0]}" = "[      ]" ]
+    [ "${lines[1]}" = "0 Rel.One-GRP@ left alone" ]
+}
+
+@test "x on an entry already marked x clears it without asking" {
+    # Only two keys: if the second x had asked, tui_read_key would have run out
+    # and the loop would have exited before the mark came off.
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(x Y x q e); tui_loop; marks; echo "$tui_ndel $tui_result"'
+    [ "${lines[0]}" = "[      ]" ]
+    [ "${lines[1]}" = "0 exit" ]
+}
+
+@test "Delete marks the same way x does" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(j j $(printf "\e[3~") Y q s); tui_loop; marks; echo "$tui_ndel"'
+    [ "${lines[0]}" = "[  x   ]" ]
+    [ "${lines[1]}" = "1" ]
+}
+
+@test "a and A leave a delete mark alone, R clears everything" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(x Y j j j j d a); tui_loop; marks; echo "$tui_nsel/$tui_nrm/$tui_ndel"
+        KI=0; KEYS=(A); tui_loop; marks
+        KI=0; KEYS=(R); tui_loop; marks; echo "$tui_nsel/$tui_nrm/$tui_ndel"'
+    [ "${lines[0]}" = "[x   -+]" ]
+    [ "${lines[1]}" = "1/1/1" ]
+    [ "${lines[2]}" = "[x   - ]" ]
+    [ "${lines[3]}" = "[      ]" ]
+    [ "${lines[4]}" = "0/0/0" ]
+}
+
+@test "r clears the mark under the cursor, subtree and all" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(" " r); tui_loop; marks; echo "$tui_nsel"
+        KI=0; KEYS=(j j " " k k r); tui_loop; marks; echo "$tui_nsel"'
+    [ "${lines[0]}" = "[      ]" ]
+    [ "${lines[1]}" = "0" ]
+    # The "*" on the directory is its child's selection; r on the child's
+    # parent takes the whole thing back.
+    [ "${lines[2]}" = "[      ]" ]
+    [ "${lines[3]}" = "0" ]
+}
+
+@test "tui_save writes the x mark for TYPE to read back" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(x Y q s); tui_loop; tui_save; head -n 1 "$listfile"'
+    [ "$output" = "xRel.One-GRP@           4.1G  2026-08-23 17:10" ]
+}
+
+@test "TYPE reads an x line into LINESX and leaves it out of the download" {
+    listfile=$(mktemp); listfile2=$(mktemp)
+    printf '%s\n' 'xRel.One-GRP@          4.1G  2026-08-23 17:10' \
+                  '+notes.nfo             2.1K  2026-08-22 09:03' > "$listfile"
+    printf '%s\n' 'Rel.One-GRP/' 'notes.nfo' > "$listfile2"
+    run stage 'listfile="'"$listfile"'"; listfile2="'"$listfile2"'"; TYPE
+               echo "D=[$LINESD] F=[$LINESF] X=[$LINESX]"'
+    rm -f "$listfile" "$listfile2"
+    [ "$output" = "D=[] F=[notes.nfo] X=[Rel.One-GRP]" ]
+}
+
+@test "DLDEL removes the data and then the symlink, and neither under --dry-run" {
+    run stage 'LINESX="Rel.Two-GRP"; data_dir=/srv/data/; dirname=TV
+               remote_dl_dir=/srv/complete/TV; DLDEL'
+    # No parsed ls -l target, so the data path is the one the layout implies.
+    [ "${lines[0]}" = 'rm -r -f "/srv/data/TV/Rel.Two-GRP"; !echo DELETED: "/srv/data/TV/Rel.Two-GRP"' ]
+    [ "${lines[1]}" = 'rm -f "Rel.Two-GRP"; !echo UNLINKED: "Rel.Two-GRP"' ]
+    run stage 'LINESX="Rel.Two-GRP"; data_dir=/srv/data/; dirname=TV
+               remote_dl_dir=/srv/complete/TV; dry_run=True; DLDEL'
+    [ "${lines[0]}" = '!echo DRY-RUN: rm -r "/srv/data/TV/Rel.Two-GRP"' ]
+    [ "${lines[1]}" = '!echo DRY-RUN: rm "Rel.Two-GRP"' ]
+}
+
+@test "DLDEL follows the parsed symlink target and leaves a nested entry its symlink" {
+    run stage 'LINESX="Rel.One-GRP"; data_dir=/srv/data/; dirname=TV
+               remote_dl_dir=/srv/complete/TV
+               LINK_TARGET[Rel.One-GRP]="../../data/OTHER/Rel.One-GRP"; DLDEL'
+    [ "${lines[0]}" = 'rm -r -f "/srv/data/OTHER/Rel.One-GRP"; !echo DELETED: "/srv/data/OTHER/Rel.One-GRP"' ]
+    [ "${lines[1]}" = 'rm -f "Rel.One-GRP"; !echo UNLINKED: "Rel.One-GRP"' ]
+    # Nested: the data hangs off whatever the top-level link resolved to, and
+    # there is no symlink of its own to drop.
+    run stage 'LINESX="Rel.One-GRP/movie.mkv"; data_dir=/srv/data/; dirname=TV
+               remote_dl_dir=/srv/complete/TV
+               LINK_TARGET[Rel.One-GRP]="../../data/OTHER/Rel.One-GRP"; DLDEL'
+    [ "${lines[0]}" = 'rm -r -f "/srv/data/OTHER/Rel.One-GRP/movie.mkv"; !echo DELETED: "/srv/data/OTHER/Rel.One-GRP/movie.mkv"' ]
+    [ "${#lines[@]}" -eq 1 ]
+}
+
+@test "LINESO carries the list order, and DLXFER emits the transfers in it" {
+    listfile=$(mktemp); listfile2=$(mktemp)
+    # A file above a directory: without LINESO the directory would go first.
+    printf '%s\n' '+notes.nfo             2.1K  2026-08-22 09:03' \
+                  '+Rel.One-GRP@          4.1G  2026-08-23 17:10' > "$listfile"
+    printf '%s\n' 'Rel.One-GRP/' 'notes.nfo' > "$listfile2"
+    run stage 'listfile="'"$listfile"'"; listfile2="'"$listfile2"'"; TYPE
+               echo "O=[$(printf "%s" "$LINESO" | tr "\t\n" ":,")]"
+               local_dl_dir=/dl; logfile=/dl/log; DLXFER'
+    rm -f "$listfile" "$listfile2"
+    [ "${lines[0]}" = "O=[file:notes.nfo,dir:Rel.One-GRP]" ]
+    [[ "${lines[1]}" == 'pget -c -n 5 "notes.nfo"'* ]]
+    [[ "${lines[3]}" == 'mirror -c -P5'*'"Rel.One-GRP"'* ]]
+}
+
+@test "DLXFER with no LINESO falls back to the grouped order" {
+    run stage 'LINESD="Rel.One-GRP"; LINESF="notes.nfo"
+               local_dl_dir=/dl; logfile=/dl/log; DLXFER'
+    [[ "${lines[0]}" == 'mirror -c -P5'* ]]
+    [[ "${lines[2]}" == 'pget -c -n 5'* ]]
 }
 
 @test "FORMAT_LIST puts the name first and lines the columns up" {
