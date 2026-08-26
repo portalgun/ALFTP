@@ -591,3 +591,42 @@ SNIP
     # group rather than at the end of the list.
     [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv release.nfo late.bin notes.nfo@]" ]
 }
+
+@test "the glyph turns and the keys still work while a check is in flight" {
+    # A check against file:// is over before it has been drawn once, so the
+    # login is made to take a moment: the point of the exercise is what the UI
+    # does while it is waiting, not how long the waiting is.
+    mkdir -p "$SRV/bin"
+    printf '#!/bin/sh\nsleep 1\nexec %s "$@"\n' "$(command -v lftp)" > "$SRV/bin/lftp"
+    chmod +x "$SRV/bin/lftp"
+    run srv_stage '
+        oldfile=$(mktemp)
+        { CREATE_LIST; FORMAT_LIST; LOAD_LINKS; VALIDATE_LINKS; } > /dev/null 2>&1
+        exec {TUI_OUT}>"$SRV/frames"
+        tui_load
+        TUI_LINES=12; TUI_COLS=60; TUI_ROWS=9
+        PATH="$SRV/bin:$PATH"
+        KI=0
+        tui_read_key () {
+            if (( KI == 0 )); then KI=1; TUI_KEY=u; return 0; fi
+            # While the check runs, every other read is a real keystroke: the
+            # UI has to go on moving the cursor with a login in the background.
+            if [[ -n $tui_upd_pid ]]; then
+                KI=$(( KI + 1 ))
+                if (( KI % 2 == 0 )); then TUI_KEY=j; return 0; fi
+                sleep 0.2; TUI_KEYRC=2; return 1
+            fi
+            if [[ $TUI_KEY == q ]]; then TUI_KEY=e; else TUI_KEY=q; fi
+            return 0
+        }
+        tui_loop
+        echo "$tui_cur"'
+    [ "$status" -eq 0 ]
+    # The cursor moved while the check was running ...
+    [ "$output" -gt 0 ]
+    # ... and more than one frame of the glyph was painted.
+    grep -q -- '\[-\]' "$SRV/frames"
+    [ "$(grep -c -o -e '\[-\]' -e '\[\\\]' -e '\[|\]' -e '\[/\]' "$SRV/frames")" -gt 1 ]
+    # The check still landed: the footer says what it found.
+    grep -q 'checked:' "$SRV/frames"
+}
