@@ -523,6 +523,11 @@ picker_check () {
     # in tui_close, which a test driving tui_loop by hand never reaches.
     export TMPDIR="$SRV"
     oldfile=$(mktemp)
+    # These are about the check and nothing else. The recursive walk is a
+    # second background login that lands in the same tree, and whether it beat
+    # the check's own reaping would decide what the tree looked like -- so it
+    # is off here, and tested on its own further down.
+    recursive_listing=False
     # The listing session's own chatter is not what these tests are reading.
     { CREATE_LIST; FORMAT_LIST; LOAD_LINKS; VALIDATE_LINKS; } > /dev/null 2>&1
     exec {TUI_OUT}>/dev/null

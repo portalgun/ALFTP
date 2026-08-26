@@ -220,11 +220,36 @@ rather than guessing:
   data directory the links point into — and uses that. It is what the `SIZE` column shows for a
   file, too, so the picker no longer reports the length of a symlink as the size of a release.
 - **A directory** is complete when every entry in it is. `tab` on one is what makes that knowable,
-  since only then is there a list of entries to check. For a directory you have not opened, the
-  recursive total `--dir-sizes` asks the server for is the one thing that says anything — and it is
-  a coarse comparison, so it errs towards `i` and opening the directory replaces it with an exact
-  answer. Without `--dir-sizes` an unopened directory has no status at all: the size a listing gives
-  a directory is the size of the directory entry, which says nothing about its contents.
+  since only then is there a list of entries to check — and with `recursive_listing` on, which it is
+  by default, that list arrives for the whole tree at once and every directory has a real total (see
+  below). Without it, the recursive total `--dir-sizes` asks the server for is the one thing that
+  says anything about a directory you have not opened, and it is a coarse comparison, so it errs
+  towards `i`. With neither, an unopened directory has no status at all: the size a listing gives a
+  directory is the size of the directory entry, which says nothing about its contents.
+
+### Listing the whole tree at once
+The completed directory is symlinks, and behind them is the data directory — a real tree. Once the
+picker has drawn its first frame it asks the server to list that tree, in one go, in the background.
+Two things come of it:
+
+- **`tab` costs nothing.** Opening a directory used to be a fresh login of its own, because the
+  session that opened the picker is sitting in its `!` waiting for you. Anything the walk reached is
+  already there.
+- **A directory has a real size.** Not the size of its directory entry, which is what a listing
+  gives one and says nothing at all, but the total of everything under it — which is also what lets
+  the `STATUS` column judge a directory you have not opened.
+
+`recursive_listing` in the config turns it off (`True` by default). The command is `ls -R`; a server
+that ignores `-R` answers with one flat block, which alftp notices and retries as `find` plus
+`du -a -h`. That fallback's sizes are block-rounded, so they fill in directory totals and nothing
+else — a rounded file size compared against what is on disk would report every small file as
+incomplete for ever.
+
+The walk runs in the background and the picker stays usable throughout: the title bar carries the
+same turning `[-]` `[\]` `[|]` `[/]` a remote check does, and anything the walk has not reached yet
+still opens the old way, with a login. In srcs mode there is a data directory per source directory,
+and walking all of them up front could be the whole server, so each is walked when you first open
+it.
 
 ### Downloading from the picker
 `enter` starts downloading. Everything marked `+` at that moment is queued, top of the list first —
@@ -386,6 +411,12 @@ one listing request per subdirectory — before the editor opens. On a directory
 releases that is a moment; on a deep tree it is not. Where a server does report a directory size of
 its own, the `du` total wins, since the server's figure is the size of the directory entry rather
 than of its contents.
+
+`--dir-sizes` is largely superseded by `recursive_listing`, which is on by default: that walk
+happens in the background *after* the picker has drawn rather than blocking it, covers the whole
+tree rather than one level, and (over `ls -R`) gets exact totals rather than block-rounded ones.
+`--dir-sizes` remains for the editor picker, which never runs the walk, and for a server the walk
+cannot get an answer out of.
 
 ## CREDENTIALS
 The password can stay out of the config file. In order of preference:

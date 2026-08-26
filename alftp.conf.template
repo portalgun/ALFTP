@@ -55,6 +55,15 @@
 #                     open. 0 is never; "u" checks whatever this says. The check
 #                     is a background login of its own, so the UI stays usable
 #                     while it runs
+#    recursive_listing
+#                   - (True|False, default True) list the whole data directory
+#                     once, in the background, when the terminal UI opens.
+#                     "tab" then opens a directory with no login of its own,
+#                     and a directory has a real size instead of the size of
+#                     its directory entry. "ls -R" is the command, with an
+#                     automatic fallback to find plus "du -a -h" for a server
+#                     that ignores -R. In srcs mode each source directory is
+#                     walked when it is first opened, not all of them up front
 #    concurrent_downloads
 #                   - (count, default 2) how many transfers started from the
 #                     terminal UI with "enter" run at once. Each one is a
