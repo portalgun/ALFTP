@@ -55,7 +55,7 @@ srv_globals () {
     local_dl_dir="$DL"; dirname="TV"
     remote_dl_dir="$SRV/complete/TV"
     listfile="$SRV/list"; listfile2="$SRV/list2"; listfile3=""
-    listfile4="$SRV/list4"
+    listfile4="$SRV/list4"; listfile5="$SRV/list5"
     logfile="$SRV/xfer.log"
 SNIP
 }

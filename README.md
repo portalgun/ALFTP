@@ -94,6 +94,40 @@ as `dl_dir_tv_shows`.
 override where a profile is fetched *from*, use `remote_dl_dir_<profile>`, which takes precedence
 over the usual fallback of using the profile name as the remote directory.
 
+### Picking from every source at once
+`srcs` lists the source directories that live under `complete_dir`, separated by `;`:
+
+``` bash
+srcs=TV; music; other; prn; books; docs; home; laptop; movies
+```
+
+(That line is the one thing in a profile block that is not bash — the `;` would end the assignment —
+so alftp reads it as text rather than evaluating it.)
+
+Run `-i` with no profile name after it and alftp lists `complete_dir` itself, with those srcs as the
+top level of the picker:
+
+``` bash
+$ alftp -i
+```
+
+Each src behaves like any other directory: `tab` opens it, and the entries inside are picked with
+`space` exactly as usual. What you pick lands wherever that src's own `dl_dir` scheme resolves to —
+`dl_dir_<src>` if there is one, otherwise `dl_dir` with `@profile` standing for the src — and the
+src's own name is consumed by that resolution rather than repeated under it:
+
+``` bash
+dl_dir='~/Downloads/@profile'
+dl_dir_films='/mnt/media/films'
+# picking films/Film.One-GRP    ->  /mnt/media/films/Film.One-GRP
+# picking TV/Rel.One-GRP        ->  ~/Downloads/TV/Rel.One-GRP
+```
+
+Only the srcs that are actually on the server are listed, so a src that has been retired stays in
+the config without showing up. A src directory itself is a real directory rather than a symlink, so
+`d` and `x` refuse it — and a finished transfer never removes it the way it removes the symlink of a
+completed top-level entry.
+
 ## PICKING FILES
 With `-i` or `-a`, alftp shows you what the remote directory holds and you pick what to fetch. That
 happens in the terminal UI by default, and in `$editor` where the terminal cannot drive a UI.
@@ -132,6 +166,7 @@ The far-left column is what will happen to each entry:
 | `d` | mark the source symlink for removal (top-level entries only) |
 | `x`, `Delete` | mark for deletion — symlink and data both; asks first |
 | `r` / `R` | clear the mark on this entry / on every entry |
+| `t` | show or hide the entries that are already downloaded |
 | `PgDn` / `PgUp` | move a screen at a time |
 | `0` / `Home`, `G` / `End` | jump to the top / bottom |
 | `a` / `A` | select all / select none — the `-` and `x` marks are left alone |
@@ -154,10 +189,45 @@ selection back. `space` on a directory that has nothing picked inside it takes t
 (its contents then show `+` without being listed separately), and taking any one entry back out of
 it turns it into a `*` with everything else still picked.
 
+### What is already downloaded
+Where alftp can work it out, the list carries a `STATUS` column saying whether an entry is already
+in the directory it would land in:
+
+| status | |
+| --- | --- |
+| `c` | it is there, complete |
+| `i` | it is there, but smaller than the server's copy |
+| blank | it is not there, or there is no way to tell |
+
+`t` hides every `c` entry so that only what is left to fetch is on screen, and the title bar says
+which way round it is — `completed=T` while they are shown, `completed=F` while they are hidden.
+It is a view filter and nothing else: your marks, the order and the open directories are all still
+there when you show them again. The column disappears entirely when nothing is known, so a fresh
+directory looks exactly as it always did.
+
+Working out what "complete" means takes some care, and where alftp cannot be sure it says nothing
+rather than guessing:
+
+- **A file** is complete when what is on disk is the size the server gives it. Those sizes are
+  human-readable (`4.1G`, `753`) because that is the only form lftp will print, so the comparison
+  allows for the rounding rather than testing for equality.
+- **The size that matters is the data's**, not the symlink's. In a completed directory of symlinks
+  the size column is the length of the link itself, so alftp takes a second size listing — of the
+  data directory the links point into — and uses that. It is what the `SIZE` column shows for a
+  file, too, so the picker no longer reports the length of a symlink as the size of a release.
+- **A directory** is complete when every entry in it is. `tab` on one is what makes that knowable,
+  since only then is there a list of entries to check. For a directory you have not opened, the
+  recursive total `--dir-sizes` asks the server for is the one thing that says anything — and it is
+  a coarse comparison, so it errs towards `i` and opening the directory replaces it with an exact
+  answer. Without `--dir-sizes` an unopened directory has no status at all: the size a listing gives
+  a directory is the size of the directory entry, which says nothing about its contents.
+
 ### Where it lands, and picking up where it left off
 A whole entry mirrors to `<local_dl_dir>/<name>`, as it always has. Anything picked from inside a
 directory keeps the structure it has on the server: `Some.Release-GRP/CD2` lands in
-`<local_dl_dir>/Some.Release-GRP/CD2`, not loose in the download directory.
+`<local_dl_dir>/Some.Release-GRP/CD2`, not loose in the download directory. (In srcs mode the
+download directory is the one that src resolves to, rather than a single one for the whole run —
+see *Picking from every source at once*.)
 
 Transfers resume. Directories go through `mirror -c`, which continues a part-transferred file and
 skips what already matches the server, and single files through `pget -c`, so re-running after an

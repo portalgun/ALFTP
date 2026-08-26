@@ -76,8 +76,11 @@ Options:
 -P  <port>       (Port) ftp port
 -l  <file>       (list) file to write/read the remote listing to
 
--i
--a
+-i  [profile]    (individual) pick entries out of the listing. With no profile
+                name after it, and a srcs list in the profile block, picks
+                from the completed directory itself with those source
+                directories as the top of the tree
+-a  <profile>    (all) the same, starting from the whole directory
 
 -d    (data) checkout data dir instead of complete dir, doesn't delete anything
 -do   (download only) download, but don't remove symlink
@@ -252,13 +255,13 @@ declare -A TUI_SUBDIR=()
 # knowable) and TUI_STATUS the short string drawn for it, which later work also
 # writes transfer progress into. TUI_ACC/TUI_HASKID are how a directory's
 # verdict is folded up out of its children in one pass.
-tui_show_done=1; tui_statusw=0; tui_datew=0; tui_dusize=0
+tui_show_done=1; tui_statusw=0; tui_datew=0
 tui_stat=""; tui_lpath=""; tui_bytes=0; tui_tol=0; tui_lbytes=0
 tui_unit=0; tui_num=""; tui_frac=""; tui_dulist=(); tui_srcs_keep=""
 tui_srcs_out=""
 TUI_STATUS=(); TUI_LSTAT=(); TUI_ACC=(); TUI_HASKID=()
 TUI_LPATH=(); TUI_LHAVE=()
-declare -A TUI_RSIZE=(); declare -A TUI_LSIZE=()
+declare -A TUI_RSIZE=(); declare -A TUI_LSIZE=(); declare -A TUI_DUSIZE=()
 tui_chain=(); tui_kids=(); tui_kidsnew=()
 TUI_NAME=(); TUI_PATH=(); TUI_SIZE=(); TUI_DATE=(); TUI_DEPTH=(); TUI_PARENT=()
 TUI_ISDIR=(); TUI_OPEN=(); TUI_LOADED=(); TUI_STATE=(); TUI_SELCNT=(); TUI_POS=()
@@ -1588,10 +1591,13 @@ tui_load () {
         fi
         # The size the completed directory gives a top-level entry is the
         # length of the symlink, which is not a fact about the file at all, so
-        # the data directory's own figure replaces it wherever there is one.
-        # Not for a directory, though: there the figure is the size of the
-        # directory entry, and du (--dir-sizes) has already had its say.
-        if (( tui_isdir == 0 )) && [[ -n ${TUI_RSIZE[$tui_stripped]:-} ]]; then
+        # a real figure replaces it wherever there is one: du's recursive total
+        # for a directory, and the data listing's own size for a file. The data
+        # listing is no use for a directory -- there it gives the size of the
+        # directory entry, which says nothing about what is in it.
+        if [[ -n ${TUI_DUSIZE[$tui_stripped]:-} ]]; then
+            tui_sz=${TUI_DUSIZE[$tui_stripped]}
+        elif (( tui_isdir == 0 )) && [[ -n ${TUI_RSIZE[$tui_stripped]:-} ]]; then
             tui_sz=${TUI_RSIZE[$tui_stripped]}
         fi
         tui_add_node "$tui_nm" "$tui_sz" "$tui_dt" -1 "$tui_isdir"
@@ -1967,12 +1973,25 @@ tui_clear_all () {
 
 # name -> size, from the data directory's own listing ("size name", one entry
 # per line). This is the real size of what is behind each top-level symlink.
+# TUI_DUSIZE is the other half of the same question, for the entries that are
+# directories: --dir-sizes asks the server for a recursive total, and where it
+# came back that total is the only figure that says anything about how much of
+# the directory there is. It is kept per name rather than as a "-ds was given"
+# flag because it frequently comes back for nothing at all: lftp's du does not
+# follow symlinks, so in a completed directory of them it reports only ".".
 tui_load_sizes () {
     unset TUI_RSIZE
     declare -gA TUI_RSIZE=()
-    tui_dusize=0
+    unset TUI_DUSIZE
+    declare -gA TUI_DUSIZE=()
     if [[ -n $listfile3 ]] && [[ -s $listfile3 ]]; then
-        tui_dusize=1
+        while IFS=$'\t' read -r tui_sz tui_nm; do
+            tui_nm=${tui_nm#./}
+            tui_nm=${tui_nm%/}
+            if [[ -n $tui_nm ]] && [[ $tui_nm != "." ]] && [[ -n $tui_sz ]]; then
+                TUI_DUSIZE[$tui_nm]=$tui_sz
+            fi
+        done < "$listfile3"
     fi
     if [[ -z $listfile5 ]] || [[ ! -s $listfile5 ]]; then
         return 0
@@ -2039,6 +2058,27 @@ tui_local_sizes () {
     done < <(printf '%s\0' "${tui_dulist[@]}" | du -sb --files0-from=- 2> /dev/null)
 }
 
+# Whether a directory has a recursive total to be judged against. Only the top
+# level can: --dir-sizes walks one level down from $remote_dl_dir, and a
+# listing fetched by tab carries directory-entry sizes, which mean nothing.
+# The comparison it enables is deliberately biased: the server totals up sizes
+# rounded to a block per file, and du -sb here does not, so the remote figure
+# is the larger of the two by up to a block per file and a directory whose
+# content is small enough for that to show reads as incomplete when it is not.
+# That is the harmless direction -- the entry stays visible and gets fetched
+# again, which mirror -c settles in seconds -- and opening the directory
+# replaces the guess with an exact answer from its children.
+tui_has_du () {
+    if (( TUI_DEPTH[$1] != 0 )); then
+        return 1
+    fi
+    tui_strip_class "${TUI_NAME[$1]}"
+    if [[ -z ${TUI_DUSIZE[$tui_stripped]:-} ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # Complete, incomplete or unknowable, from the remote size and what is on disk.
 tui_compare_size () {
     tui_stat=u
@@ -2082,7 +2122,7 @@ tui_status_node () {
         elif (( TUI_LOADED[$1] == 1 )); then
             # Listed and empty: there is nothing left to fetch.
             tui_stat=c
-        elif (( TUI_DEPTH[$1] == 0 )) && (( tui_dusize == 1 )); then
+        elif tui_has_du "$1"; then
             tui_compare_size "$1"
         fi
     else
@@ -2127,7 +2167,7 @@ tui_status_scan () {
         # A directory judged by its children needs no size of its own, and a
         # du of it would be a walk of the whole subtree for nothing.
         if (( TUI_ISDIR[tui_id] == 1 )) \
-           && ( (( TUI_LOADED[tui_id] == 1 )) || (( TUI_DEPTH[tui_id] != 0 )) || (( tui_dusize != 1 )) ); then
+           && { (( TUI_LOADED[tui_id] == 1 )) || ! tui_has_du "$tui_id"; }; then
             continue
         fi
         tui_dulist+=("$target")
@@ -3151,7 +3191,9 @@ local_dir_for () {
     if [[ -z $local_src ]]; then
         return 0
     fi
-    local_var="local_dl_dir_$(profile_var_name "$local_src")"
+    # profile_var_name's mapping, inline: this runs once per entry per redraw
+    # of the status column, and a fork each time would be felt.
+    local_var="local_dl_dir_${local_src//[^A-Za-z0-9_]/_}"
     if [[ -n ${!local_var:-} ]]; then
         local_dir="${!local_var}"
     fi

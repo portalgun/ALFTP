@@ -352,6 +352,119 @@ PICK
     [ -L "$SRV/complete/TV/notes.nfo" ]
 }
 
+# ------------------------------------------------- srcs mode, local status --
+
+@test "the listing session fetches the data directory's real sizes" {
+    run srv_stage 'CREATE_LIST; echo "--"; cat "$listfile"; echo "--"; cat "$listfile5"'
+    [ "$status" -eq 0 ]
+    # The completed directory gives the length of the symlink string ...
+    [[ "$output" == *"../../data/TV/notes.nfo"* ]] || true
+    # ... while the data directory gives the size of the file itself.
+    [[ "$output" == *"11 notes.nfo"* ]]
+}
+
+@test "the picker shows the size of the data, not the length of the symlink" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys 'q e' --delay 0.5 -- "$ALFTP" -i TV -t -nu -do
+    # "some notes\n" is 11 bytes; the symlink to it is 23 characters long, and
+    # 23 is what the completed directory's own listing reports.
+    [[ "$output" == *"notes.nfo@"*"11"* ]]
+    [[ "$output" != *"notes.nfo@"*"23"* ]]
+}
+
+@test "an entry already downloaded is marked c, and t hides it" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    cp "$SRV/data/TV/notes.nfo" "$DL/notes.nfo"
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys 't q e' --delay 0.5 -- "$ALFTP" -i TV -t -nu -do
+    [[ "$output" == *"STATUS"* ]]
+    [[ "$output" == *"completed=T"* ]]
+    # After t the entry is gone from the list and the title says so.
+    [[ "$output" == *"completed=F"* ]]
+    # Nothing after that frame lists it again.
+    ! printf '%s\n' "$output" | sed -n '/completed=F/,$p' | grep -q 'notes.nfo'
+}
+
+@test "-i with no profile picks from the completed directory, srcs at the top" {
+    home=$(srv_home)
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" EDITOR="$(srv_picker)" "$ALFTP" -i -nu -do
+    [ "$status" -eq 0 ]
+    seen=$(cat "$home/.cache/alftp/alftp.list.seen")
+    # Both configured srcs, and nothing below them.
+    [[ "$seen" == *"TV/"* ]]
+    [[ "$seen" == *"films/"* ]]
+    [[ "$seen" != *"Rel.One-GRP"* ]]
+}
+
+@test "a src that is not on the server is left out of the listing" {
+    home=$(srv_home)
+    sed -i 's/^srcs=.*/srcs=TV; films; music/' "$home/.config/alftp/alftp.src.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" EDITOR="$(srv_picker)" "$ALFTP" -i -nu -do
+    [ "$status" -eq 0 ]
+    seen=$(cat "$home/.cache/alftp/alftp.list.seen")
+    [[ "$seen" == *"TV/"* ]]
+    [[ "$seen" != *"music"* ]]
+}
+
+@test "a whole src lands where its own dl_dir says, and keeps its directory" {
+    home=$(srv_home)
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    # An $editor that takes the films src whole. With -i the list arrives
+    # commented out, so picking is uncommenting.
+    cat > "$SRV/pick" <<'PICK'
+#!/usr/bin/env bash
+sed -i 's|^#films|films|' "$1"
+PICK
+    chmod +x "$SRV/pick"
+    run env HOME="$home" EDITOR="$SRV/pick" "$ALFTP" -i -nu
+    [ "$status" -eq 0 ]
+    # dl_dir_films is $DL/films, and the src component is consumed resolving
+    # it: the release lands directly under it rather than under films/films.
+    [ -f "$DL/films/Film.One-GRP/film.mkv" ]
+    [ ! -e "$DL/films/films" ]
+    # The src is a real directory, not a symlink, so a finished mirror leaves
+    # it exactly where it was.
+    [ -d "$SRV/complete/films" ]
+    [ -L "$SRV/complete/films/Film.One-GRP" ]
+}
+
+@test "an entry inside a src is a directory, and lands under the src's dl_dir" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    # tab into TV, down onto the release, space, save.
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\t j \x20 q s' --delay 0.6 -- "$ALFTP" -i -t -nu -do
+    [[ "$output" == *"1 selection(s)"* ]]
+    # cls -F calls a symlinked release "@" whether or not it is a directory, so
+    # this only works because the data behind TV is listed as well: as a file
+    # it would have been pgot, and pget refuses a directory.
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+    [ -f "$DL/Rel.One-GRP/CD1/part1.bin" ]
+    [[ "$output" != *"Is a directory"* ]]
+    # TV has no dl_dir of its own, so it fell back to the general one.
+    [ ! -e "$DL/TV" ]
+}
+
 @test "x asks under a real terminal, and Y deletes both ends of the symlink" {
     if ! command -v python3 > /dev/null 2>&1; then
         skip "python3 is needed to drive a pty"

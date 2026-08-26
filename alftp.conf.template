@@ -7,7 +7,12 @@
 #    editor         - the editor you prefer to use
 #    picker         - (tui|editor|[unset]) how to choose files: the terminal UI, $editor,
 #                     or unset for the UI wherever the terminal supports it
-#    listfile       - where to download list of available files to
+#    listfile       - where to download list of available files to. Four more
+#                     files are derived from it for one session's use: the data
+#                     listing, the directory sizes, the long listing that says
+#                     where each symlink points, and the data directory's own
+#                     sizes, which is what the picker's STATUS column compares
+#                     a local copy against
 #    logfile        - where lftp mirror writes its transfer log
 #    lockfile       - one run at a time; this file holds the running pid
 #                     (default /tmp/alftp.lock)
@@ -55,6 +60,15 @@
 #    remote_dl_dir_<profile> - remote directory for that profile only
 # The <profile> suffix is part of a variable name, so characters outside
 # A-Za-z0-9_ become '_' (profile "tv-shows" -> dl_dir_tv_shows). See README.md.
+#
+# A block may also name the source directories that live under complete_dir:
+#    srcs=TV; music; books
+# "alftp -i" with no profile name after it picks from complete_dir itself, with
+# those srcs as the top of the tree; each one lands in whatever its own
+# dl_dir_<src> -- or dl_dir with @profile standing for the src -- resolves to.
+# It is the one key in the file that is not bash (the ";" would end the
+# assignment), so it is read as text rather than eval'd, and cannot be set in
+# this file.
 #
 # NOTE: alftp.src.conf is not a key=value file. Each profile block is eval'd as
 # bash, which is what lets a block contain conditionals -- and also means the

@@ -374,6 +374,224 @@ SNIP
     [ "${lines[0]}" = '!echo DRY-RUN: rm "Rel.Two-GRP"' ]
 }
 
+# ------------------------------------------------------------- srcs mode ----
+#
+# "srcs" is the one key in a profile block that is not valid bash, so it is
+# read textually rather than eval'd; "-i" with no profile after it is what
+# turns the list into the top level of the picker.
+
+@test "parse_srcs reads the ;-separated list the eval cannot" {
+    run stage 'configsrc="$fixture"; eval_remote_config
+               echo "${#SRCS[@]} [${SRCS[0]}] [${SRCS[1]}] [${SRCS[2]}]"'
+    # Split on ";" and trimmed, and the trailing space on the last one is gone.
+    [ "$output" = "3 [TV] [music] [other]" ]
+}
+
+@test "srcs never reaches the eval of either config pass" {
+    run stage 'configsrc="$fixture"; eval_remote_config; echo "[${srcs:-unset}]"'
+    [ "$output" = "[unset]" ]
+    run stage 'hostname() { echo testhost; }; configsrc="$fixture"
+               eval_local_config; echo "[${srcs:-unset}]"'
+    [ "$output" = "[unset]" ]
+}
+
+@test "-i with no profile after it enters srcs mode, with one it does not" {
+    run stage 'configsrc="$fixture"; eval_remote_config; ARGSB -i
+               echo "[$srcs_mode] [$profile]"'
+    [ "$output" = "[True] []" ]
+    run stage 'configsrc="$fixture"; eval_remote_config; ARGSB -i TV
+               echo "[$srcs_mode] [$profile]"'
+    [ "$output" = "[] [TV]" ]
+    # Another flag after -i is no profile name either.
+    run stage 'configsrc="$fixture"; eval_remote_config; ARGSB -i -q
+               echo "[$srcs_mode]"'
+    [ "$output" = "[True]" ]
+}
+
+@test "srcs mode needs no -ld/-rd, and lists the completed directory itself" {
+    run stage 'srcs_mode=True; complete_dir=/complete/
+               ARGSC -i; echo "[$remote_dl_dir] [$dirname]"'
+    [ "$status" -eq 0 ]
+    [ "$output" = "[/complete/] []" ]
+    # Without srcs mode the same argv is still the old error.
+    run stage 'complete_dir=/complete/; ARGSC -i'
+    [[ "$output" == *"Please specify desitnation"* ]]
+}
+
+@test "local_dir_for sends each src to its own dl_dir, and the rest to one" {
+    run stage 'local_dl_dir=/dl
+               local_dir_for "Rel.One-GRP"; echo "[$local_dir] [$local_rel]"
+               local_dir_for "Rel.One-GRP/CD1"; echo "[$local_dir] [$local_rel]"'
+    # An ordinary run has one answer: everything under $local_dl_dir, whole.
+    [ "${lines[0]}" = "[/dl] [Rel.One-GRP]" ]
+    [ "${lines[1]}" = "[/dl] [Rel.One-GRP/CD1]" ]
+
+    run stage 'srcs_mode=True; local_dl_dir=/dl/@profile; local_dl_dir_films=/mnt/films
+               local_dir_for "films/Film-GRP"; echo "[$local_dir] [$local_rel]"
+               local_dir_for "TV/Rel.One-GRP/CD1"; echo "[$local_dir] [$local_rel]"
+               local_dir_for "TV/"; echo "[$local_dir] [$local_rel]"'
+    # The src is consumed by resolving it: its own dl_dir wins, and the general
+    # one has @profile substituted with the src the way a profile name would.
+    [ "${lines[0]}" = "[/mnt/films] [Film-GRP]" ]
+    [ "${lines[1]}" = "[/dl/TV] [Rel.One-GRP/CD1]" ]
+    # A whole src is the root itself, with nothing below it.
+    [ "${lines[2]}" = "[/dl/TV] []" ]
+}
+
+@test "a whole src mirrors into its own directory, not into a copy of itself" {
+    run stage 'srcs_mode=True; local_dl_dir=/dl; local_dl_dir_films=/mnt/films
+               LINESD="films"; DLDR'
+    # No trailing slash and no empty name behind it: "…/films/\"\"" would make
+    # mirror take the source basename and nest it a second time.
+    [ "${lines[0]}" = 'mirror -c -P5 --log="" "films" "/mnt/films"; !echo COMPLETE: "films"' ]
+}
+
+@test "srcs mode never unlinks the source directory it just mirrored" {
+    run stage 'srcs_mode=True; local_dl_dir=/dl; LINESD="TV"; DLDR'
+    # The "&& rm -f" that a completed top-level entry gets is a symlink's; a
+    # src is a real directory and removing it would take the lot.
+    [[ "$output" != *"rm -f"* ]]
+    run stage 'srcs_mode=True; local_dl_dir=/dl; LINESF="TV/notes.nfo"; DLFL'
+    [[ "$output" != *"rm -f"* ]]
+    # TV has no dl_dir of its own, so it falls back to $local_dl_dir and the
+    # file lands there directly -- no directory to make, exactly as a
+    # top-level entry outside srcs mode.
+    [ "${lines[0]}" = 'pget -c -n 5 "TV/notes.nfo" -o /dl/"notes.nfo"; !echo COMPLETE: "TV/notes.nfo"' ]
+
+    run stage 'srcs_mode=True; local_dl_dir=/dl; local_dl_dir_films=/mnt/films
+               LINESF="films/Film-GRP/film.mkv"; DLFL'
+    # A src with a directory of its own does need one made: pget will not.
+    [ "${lines[0]}" = "!mkdir -p '/mnt/films/Film-GRP'" ]
+    [ "${lines[1]}" = 'pget -c -n 5 "films/Film-GRP/film.mkv" -o /mnt/films/"Film-GRP/film.mkv"; !echo COMPLETE: "films/Film-GRP/film.mkv"' ]
+}
+
+@test "a src is neither unlinked nor deleted" {
+    run stage "$(tree)"'
+        srcs_mode=True; tui_cur=0
+        tui_mark_remove; echo "1 [$tui_msg] ${TUI_STATE[0]}"
+        tui_mark_delete; echo "2 [$tui_msg] ${TUI_STATE[0]}"'
+    [ "${lines[0]}" = "1 [Rel.One-GRP@ is a source directory, not an entry] 0" ]
+    [ "${lines[1]}" = "2 [Rel.One-GRP@ is a source directory, not an entry] 0" ]
+}
+
+# ---------------------------------------------------------- local status ----
+
+@test "tui_size_bytes parses a rounded size and says how rounded it is" {
+    run stage 'for z in 753 4.1G 2.9M 1.5K 4G ""; do
+                   tui_size_bytes "$z"; echo "$z $tui_bytes $tui_tol"
+               done'
+    # A plain byte count is exact; a suffix is a tenth of its unit out, and a
+    # suffix with no decimal at all is half of it.
+    [ "${lines[0]}" = "753 753 0" ]
+    [ "${lines[1]}" = "4.1G 4402341478 107374182" ]
+    [ "${lines[2]}" = "2.9M 3040870 104857" ]
+    [ "${lines[3]}" = "1.5K 1536 102" ]
+    [ "${lines[4]}" = "4G 4294967296 536870912" ]
+    # Nothing recognisable is -1, which is what leaves the status empty.
+    [ "${lines[5]}" = " -1 0" ]
+}
+
+@test "a file is complete when it is there at its size, and short when it is not" {
+    dir=$(mktemp -d)
+    printf '%s' 0123456789 > "$dir/whole"
+    printf '%s' 012 > "$dir/part"
+    run stage "$(tree)"'
+        local_dl_dir="'"$dir"'"
+        TUI_SIZE[2]=10; TUI_NAME[2]=whole; TUI_PATH[2]=whole
+        TUI_SIZE[4]=10; TUI_NAME[4]=part;  TUI_PATH[4]=part; TUI_PARENT[4]=-1
+        TUI_SIZE[5]=10; TUI_NAME[5]=gone;  TUI_PATH[5]=gone; TUI_PARENT[5]=-1
+        tui_status_scan
+        echo "[${TUI_STATUS[2]}][${TUI_STATUS[4]}][${TUI_STATUS[5]}] w=$tui_statusw"'
+    rm -rf "$dir"
+    # There at its size, there and short, not there at all.
+    [ "$output" = "[c][i][] w=1" ]
+}
+
+@test "a rounded size still matches the file it was rounded from" {
+    dir=$(mktemp -d)
+    head -c 3000000 /dev/zero > "$dir/big"
+    run stage "$(tree)"'
+        local_dl_dir="'"$dir"'"
+        TUI_SIZE[2]=2.9M; TUI_NAME[2]=big; TUI_PATH[2]=big
+        tui_status_scan; echo "[${TUI_STATUS[2]}]"'
+    rm -rf "$dir"
+    # 2.9M is 3040870 bytes read back literally; the file is 3000000, and only
+    # the rounding tolerance closes the gap.
+    [ "$output" = "[c]" ]
+}
+
+@test "a directory is judged by its children, and stays empty where they are not loaded" {
+    dir=$(mktemp -d)
+    mkdir -p "$dir/Rel.One-GRP"
+    printf '%s' 0123456789 > "$dir/Rel.One-GRP/movie.mkv"
+    printf '%s' 0123456789 > "$dir/Rel.One-GRP/movie.nfo"
+    mkdir -p "$dir/Rel.One-GRP/CD1"
+    run stage "$(tree)"'
+        local_dl_dir="'"$dir"'"
+        TUI_SIZE[4]=10; TUI_SIZE[5]=10
+        tui_status_scan
+        echo "one=[${TUI_STATUS[0]}] cd1=[${TUI_STATUS[3]}] two=[${TUI_STATUS[1]}]"
+        # take one of the files away and the directory follows it
+        rm -f "'"$dir"'/Rel.One-GRP/movie.nfo"
+        tui_status_scan; echo "one=[${TUI_STATUS[0]}]"'
+    rm -rf "$dir"
+    # CD1 is there but never listed, so nothing can be said about it -- and
+    # that only blocks "complete", it never claims it. Rel.Two-GRP was never
+    # downloaded at all.
+    [ "${lines[0]}" = "one=[] cd1=[] two=[]" ]
+    [ "${lines[1]}" = "one=[i]" ]
+}
+
+@test "t hides what is complete, and shows it again" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        TUI_STATUS[1]=c; TUI_STATUS[2]=c; tui_status_width
+        KEYS=(t q e); tui_loop
+        names; echo "show=$tui_show_done"'
+    # The two completed top-level entries drop out of view; the tree, the
+    # marks and the order are untouched, so pressing it again puts them back.
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo]" ]
+    [ "${lines[1]}" = "show=0" ]
+    run stage "$(tree)"$'\n'"$(keys)"'
+        TUI_STATUS[1]=c; TUI_STATUS[2]=c; tui_status_width
+        KEYS=(t t q e); tui_loop; names'
+    [ "$output" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo Rel.Two-GRP@ notes.nfo]" ]
+}
+
+@test "t is the key that does it" {
+    run stage 'tui_key_action t; echo "$tui_action"'
+    [ "$output" = "showdone" ]
+}
+
+@test "hiding a completed directory hides its subtree with it" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        TUI_STATUS[0]=c; tui_status_width
+        KEYS=(t q e); tui_loop; names'
+    [ "$output" = "[Rel.Two-GRP@ notes.nfo]" ]
+}
+
+@test "t with nothing to hide, and t that would hide everything, both refuse" {
+    run stage "$(tree)"'
+        tui_toggle_done; echo "[$tui_msg] $TUI_N show=$tui_show_done"'
+    [ "$output" = "[nothing here is known to be downloaded already] 6 show=1" ]
+    run stage "$(tree)"'
+        for i in 0 1 2; do TUI_STATUS[i]=c; done; tui_status_width
+        tui_toggle_done; echo "[$tui_msg] $TUI_N show=$tui_show_done"'
+    [ "$output" = "[everything here is already downloaded] 6 show=1" ]
+}
+
+@test "the STATUS column appears only when there is a status to show" {
+    run stage "$(tree)"'
+        TUI_OUT=1; tui_widths; tui_draw; echo'
+    [[ "$output" == *"NAME"*"SIZE"*"DATE"* ]]
+    [[ "$output" != *"STATUS"* ]]
+    [[ "$output" != *"completed="* ]]
+    run stage "$(tree)"'
+        TUI_STATUS[5]=c; tui_widths
+        TUI_OUT=1; tui_draw; echo'
+    [[ "$output" == *"SIZE"*"DATE"*"STATUS"* ]]
+    [[ "$output" == *"completed=T"* ]]
+}
+
 # The event loop, driven by a scripted key source instead of a terminal.
 keys () {
     cat <<'SNIP'
