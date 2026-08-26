@@ -2521,6 +2521,359 @@ EOF
     return 0
 }
 
+# ------------------------------------------------------------------ UPDATE --
+# A listing goes stale while it is being picked over: a release finishes
+# uploading, another one is removed. "u" asks the server again now, and
+# update_interval asks it every so many seconds without being told to.
+#
+# The check cannot be done where tui_fetch does its work, because tui_fetch
+# blocks: a login against a slow server would freeze the picker for as long as
+# it took. So the check is one background lftp, and the loop stops waiting for
+# a keystroke for ever -- tui_read_key gained a timeout, and every time it
+# expires tui_tick runs. That is the general shape, not an update-specific one:
+# anything that has to happen while the user is doing nothing hangs off
+# tui_tick.
+#
+# What comes back is merged into the tree rather than replacing it. Everything
+# the user has done -- the marks, which directories are open, and above all the
+# order, which is the download priority -- has to survive a check, so a
+# surviving entry keeps its node and its place in TUI_ORDER, an entry that
+# appeared is added at the end of its sibling group (which keeps a subtree one
+# contiguous run), and an entry that vanished is dropped only when nothing
+# would be lost with it.
+
+# The tick. It runs on every expiry of tui_read_key's timeout -- about five
+# times a second, from tui_loop and from the prompts that read a key of their
+# own -- and never while a keystroke is waiting, so it is the picker's idle
+# time and nothing else.
+#
+# What it may assume: the tree is whole and consistent (no key is half-handled
+# around it), the screen has been drawn, and it is the only thing running.
+# What it must not do: block, read a key, or draw. Redrawing is the loop's job
+# and it does it when $tui_dirty says something changed, which is what keeps an
+# idle picker from repainting five times a second for nothing. Work that takes
+# any time at all belongs in a background job that a later tick reaps, which is
+# what the update does.
+tui_tick () {
+    if [[ -n $tui_upd_pid ]]; then
+        tui_spin=$(( (tui_spin + 1) % ${#tui_spin_frames} ))
+        tui_dirty=1
+        if ! kill -0 "$tui_upd_pid" 2> /dev/null; then
+            tui_upd_reap
+        fi
+        return 0
+    fi
+    if (( update_interval > 0 )) && (( SECONDS - tui_upd_last >= update_interval )); then
+        tui_upd_start
+    fi
+}
+
+# One of the check's listing files, made once and then reused. The check runs
+# again every update_interval seconds, and a fresh mktemp per listing per check
+# would leave a pile of them for the run to clean up at the end.
+tui_upd_tmp () {
+    if [[ -n $1 ]]; then
+        tui_upd_name=$1
+        : > "$tui_upd_name"
+        return 0
+    fi
+    new_tmp "${TMPDIR:-/tmp}/alftp.upd.XXXXXX" || return 1
+    tui_upd_name=$tmpfile_new
+}
+
+# Ask the server again, in the background. The listings are exactly the ones
+# the run's own session fetched -- the completed directory, its long form, the
+# data directory and its sizes -- plus the listing tui_fetch would fetch for
+# every directory the user has already opened, so that the whole of the tree
+# that is on screen is checked and not only its top level. du is deliberately
+# left out: it walks the entire tree below the directory, and no size in the
+# column is worth that every update_interval seconds.
+tui_upd_start () {
+    if [[ -n $tui_upd_pid ]]; then
+        return 1
+    fi
+    tui_upd_last=$SECONDS
+    tui_upd_ids=()
+    tui_upd_tmp "$tui_upd_top";     tui_upd_top=$tui_upd_name
+    tui_upd_tmp "$tui_upd_topdata"; tui_upd_topdata=$tui_upd_name
+    tui_upd_tmp "$tui_upd_topsize"; tui_upd_topsize=$tui_upd_name
+    tui_upd_tmp "$tui_upd_toplong"; tui_upd_toplong=$tui_upd_name
+    tui_upd_tmp "$tui_upd_log";     tui_upd_log=$tui_upd_name
+    tui_upd_tmp "$tui_upd_script";  tui_upd_script=$tui_upd_name
+    #DO NOT INDENT CONTENTS
+    cat > "$tui_upd_script" << EOF
+$(open_cmd)
+$(set_opts)
+cd "$remote_dl_dir"
+cls -1 -F -h --size --date --time-style="%Y-%m-%d %H:%M" > $(lftp_quote "$tui_upd_top")
+ls -l > $(lftp_quote "$tui_upd_toplong")
+cd "$data_dir""$dirname"
+cls -1 > $(lftp_quote "$tui_upd_topdata")
+cls -1 -F -h --size > $(lftp_quote "$tui_upd_topsize")
+EOF
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( TUI_LOADED[tui_id] == 0 )); then
+            continue
+        fi
+        tui_strip_class "${TUI_PATH[tui_id]}"
+        tui_upd_path=$tui_stripped
+        link_entry_path "$tui_upd_path"
+        tui_upd_tmp "${TUI_UPD_RAW[tui_id]:-}";  TUI_UPD_RAW[tui_id]=$tui_upd_name
+        tui_upd_tmp "${TUI_UPD_DATA[tui_id]:-}"; TUI_UPD_DATA[tui_id]=$tui_upd_name
+        tui_upd_ids+=("$tui_id")
+        {
+            printf 'cd "%s"\n' "$remote_dl_dir"
+            printf 'cd %s\n' "$(lftp_quote "$tui_upd_path")"
+            printf 'cls -1 -F -h --size --date --time-style="%%Y-%%m-%%d %%H:%%M" > %s\n' \
+                "$(lftp_quote "${TUI_UPD_RAW[tui_id]}")"
+            printf 'cls -1 %s > %s\n' "$(lftp_quote "$link_path/")" \
+                "$(lftp_quote "${TUI_UPD_DATA[tui_id]}")"
+        } >> "$tui_upd_script"
+    done
+    printf 'quit\n' >> "$tui_upd_script"
+    # Nothing of this may reach the screen: the picker owns it, and lftp's
+    # chatter would be painted over the list. stdin is closed off for the same
+    # reason -- a prompt it decided to ask would eat the user's keystrokes.
+    lftp -f "$tui_upd_script" < /dev/null > "$tui_upd_log" 2>&1 &
+    tui_upd_pid=$!
+    tui_spin=0
+    tui_dirty=1
+    return 0
+}
+
+# Stop a check that is still running: quitting, or being interrupted, should
+# not leave a login behind.
+tui_upd_stop () {
+    if [[ -z $tui_upd_pid ]]; then
+        return 0
+    fi
+    kill -TERM "$tui_upd_pid" 2> /dev/null
+    wait "$tui_upd_pid" 2> /dev/null
+    tui_upd_pid=""
+}
+
+# The check finished. Its own listing is the only thing that says whether it
+# worked -- the same rule tui_fetch goes by -- and a failure changes nothing at
+# all, because a tree merged against half a listing would lose entries that are
+# still on the server.
+tui_upd_reap () {
+    tui_upd_rc=0
+    wait "$tui_upd_pid" 2> /dev/null || tui_upd_rc=$?
+    tui_upd_pid=""
+    tui_dirty=1
+    if (( tui_upd_rc != 0 )) && [[ ! -s $tui_upd_top ]]; then
+        tui_upd_name=$(head -n 1 "$tui_upd_log" 2> /dev/null) || tui_upd_name=""
+        tui_msg="could not check the remote${tui_upd_name:+: $tui_upd_name}"
+        return 0
+    fi
+    tui_upd_merge
+}
+
+# In srcs mode the top level is the source directories the profile named, not
+# everything $complete_dir happens to hold, so a fresh listing is cut down the
+# way SRCS_FILTER cuts down the run's own.
+tui_upd_srcs_ok () {
+    if [[ $srcs_mode != True ]]; then
+        return 0
+    fi
+    for tui_upd_s in ${SRCS[@]+"${SRCS[@]}"}; do
+        if [[ $tui_upd_s == "$1" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Drop a node and everything under it. Both halves matter: the states go
+# through tui_set_state so that the selection counters of every ancestor stay
+# right, and the splice takes the whole subtree, which is one contiguous run of
+# TUI_ORDER and leaves the runs around it contiguous too.
+tui_upd_drop () {
+    tui_subtree "${TUI_POS[$1]}"
+    tui_upd_i0=$(( tui_r0 - 1 ))
+    tui_upd_i1=$tui_r1
+    for (( tui_i = tui_upd_i0; tui_i < tui_upd_i1; tui_i++ )); do
+        tui_set_state "${TUI_ORDER[tui_i]}" 0
+        TUI_DEAD[${TUI_ORDER[tui_i]}]=1
+    done
+    TUI_ORDER=("${TUI_ORDER[@]:0:tui_upd_i0}" "${TUI_ORDER[@]:tui_upd_i1}")
+    tui_reindex
+}
+
+# Merge one fresh listing into one sibling group: $1 is the parent (-1 for the
+# top level), $2 the listing and $3 the data listing beside it, which is what
+# says which entries are directories (cls -F marks every symlink "@" whatever
+# it points at).
+#
+# An entry that is still there keeps its node -- and with it its mark, its
+# status, whether it is open, and where in the order the user put it -- and
+# takes only the fresh size and date. It keeps the kind it was listed with as
+# well: a name that changed from a file to a directory is a different entry,
+# and its path, its children and its local status were all built on the old
+# answer. An entry that is gone is dropped, unless it carries a mark or has one
+# below it, in which case removing it would throw away a decision the user
+# made; those stay, and the footer says how many. Anything new goes at the end
+# of the group, which is where an entry nobody has looked at yet belongs and,
+# in a subtree, the only place that keeps the run contiguous.
+tui_upd_group () {
+    if [[ ! -s $2 ]]; then
+        return 0
+    fi
+    unset TUI_UPD_SUB
+    declare -gA TUI_UPD_SUB=()
+    unset TUI_UPD_IDX
+    declare -gA TUI_UPD_IDX=()
+    unset TUI_UPD_HAVE
+    declare -gA TUI_UPD_HAVE=()
+    if [[ -s $3 ]]; then
+        while IFS= read -r tui_scratch || [[ -n $tui_scratch ]]; do
+            if [[ $tui_scratch == */ ]]; then
+                tui_scratch=${tui_scratch%/}
+                TUI_UPD_SUB[${tui_scratch##*/}]=1
+            fi
+        done < "$3"
+    fi
+    tui_upd_nm=(); tui_upd_sz=(); tui_upd_dt=(); tui_upd_kind=()
+    while IFS=$'\t' read -r tui_nm tui_sz tui_dt; do
+        tui_strip_class "$tui_nm"
+        if (( $1 < 0 )) && ! tui_upd_srcs_ok "$tui_stripped"; then
+            continue
+        fi
+        tui_isdir=0
+        if [[ $tui_nm == */ ]] || [[ -n ${TUI_UPD_SUB[$tui_stripped]:-} ]]; then
+            tui_isdir=1
+        fi
+        if (( $1 < 0 )); then
+            tui_real_size "$tui_stripped" "$tui_isdir"
+        fi
+        TUI_UPD_IDX[$tui_stripped]=${#tui_upd_nm[@]}
+        tui_upd_nm+=("$tui_nm"); tui_upd_sz+=("$tui_sz")
+        tui_upd_dt+=("$tui_dt"); tui_upd_kind+=("$tui_isdir")
+    done < <(format_columns "$2" "" | tui_parse_listing /dev/stdin)
+
+    # The group as it stands. Collected first and worked through backwards, so
+    # that dropping one entry cannot move an index that is still to be looked
+    # at -- and held by id rather than by position, which tui_upd_drop rewrites.
+    tui_upd_old=()
+    if (( $1 < 0 )); then
+        for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+            if (( TUI_DEPTH[tui_id] == 0 )); then
+                tui_upd_old+=("$tui_id")
+            fi
+        done
+    else
+        tui_children "$1"
+        tui_upd_old=(${tui_kids[@]+"${tui_kids[@]}"})
+    fi
+    for (( tui_i = ${#tui_upd_old[@]} - 1; tui_i >= 0; tui_i-- )); do
+        tui_id=${tui_upd_old[tui_i]}
+        tui_strip_class "${TUI_NAME[tui_id]}"
+        if [[ -n ${TUI_UPD_IDX[$tui_stripped]:-} ]]; then
+            TUI_UPD_HAVE[$tui_stripped]=1
+            tui_upd_j=${TUI_UPD_IDX[$tui_stripped]}
+            TUI_SIZE[tui_id]=${tui_upd_sz[tui_upd_j]}
+            TUI_DATE[tui_id]=${tui_upd_dt[tui_upd_j]}
+            continue
+        fi
+        if (( TUI_STATE[tui_id] != 0 )) || (( TUI_SELCNT[tui_id] > 0 )); then
+            tui_upd_kept=$(( tui_upd_kept + 1 ))
+            continue
+        fi
+        tui_upd_drop "$tui_id"
+        tui_upd_gone=$(( tui_upd_gone + 1 ))
+    done
+
+    tui_upd_add=()
+    for (( tui_i = 0; tui_i < ${#tui_upd_nm[@]}; tui_i++ )); do
+        tui_strip_class "${tui_upd_nm[tui_i]}"
+        if [[ -n ${TUI_UPD_HAVE[$tui_stripped]:-} ]]; then
+            continue
+        fi
+        tui_add_node "${tui_upd_nm[tui_i]}" "${tui_upd_sz[tui_i]}" \
+            "${tui_upd_dt[tui_i]}" "$1" "${tui_upd_kind[tui_i]}"
+        tui_upd_add+=("$tui_new_id")
+    done
+    if (( ${#tui_upd_add[@]} == 0 )); then
+        return 0
+    fi
+    if (( $1 < 0 )); then
+        tui_upd_i1=${#TUI_ORDER[@]}
+    else
+        tui_subtree "${TUI_POS[$1]}"
+        tui_upd_i1=$tui_r1
+    fi
+    TUI_ORDER=("${TUI_ORDER[@]:0:tui_upd_i1}" "${tui_upd_add[@]}" \
+               "${TUI_ORDER[@]:tui_upd_i1}")
+    tui_upd_new=$(( tui_upd_new + ${#tui_upd_add[@]} ))
+    tui_reindex
+}
+
+# Fold the whole check into the tree. The run's own listing files are replaced
+# first, because everything that reads them later -- LOAD_LINKS, the size
+# lookup, and TYPE once the picker is done -- should be answering from what is
+# on the server now rather than from what was there when the session opened.
+# $listfile itself is not touched: tui_save writes it from the tree.
+tui_upd_merge () {
+    tui_upd_new=0; tui_upd_gone=0; tui_upd_kept=0
+    unset TUI_DEAD
+    declare -gA TUI_DEAD=()
+    if [[ -n $listfile2 ]] && [[ -s $tui_upd_topdata ]]; then
+        cp -f "$tui_upd_topdata" "$listfile2"
+    fi
+    if [[ -n $listfile5 ]] && [[ -s $tui_upd_topsize ]]; then
+        cp -f "$tui_upd_topsize" "$listfile5"
+    fi
+    if [[ -n $listfile4 ]] && [[ -s $tui_upd_toplong ]]; then
+        cp -f "$tui_upd_toplong" "$listfile4"
+        LOAD_LINKS
+    fi
+    tui_load_sizes
+    # The node under the cursor is the one piece of state the tree does not
+    # hold, so it is remembered across a merge that may move rows about under
+    # it. A cursor on an entry that has just been dropped has nothing to go
+    # back to, and tui_rebuild_vis puts it somewhere sane.
+    tui_upd_cur=-1
+    if (( TUI_N > 0 )) && (( tui_cur < TUI_N )); then
+        tui_upd_cur=${TUI_VIS[tui_cur]}
+    fi
+    tui_upd_group -1 "$tui_upd_top" "$tui_upd_topdata"
+    for tui_upd_id in ${tui_upd_ids[@]+"${tui_upd_ids[@]}"}; do
+        if [[ -n ${TUI_DEAD[$tui_upd_id]:-} ]]; then
+            continue
+        fi
+        tui_upd_group "$tui_upd_id" "${TUI_UPD_RAW[$tui_upd_id]}" \
+            "${TUI_UPD_DATA[$tui_upd_id]}"
+    done
+    tui_status_scan
+    tui_widths
+    tui_rebuild_vis
+    if (( tui_upd_cur >= 0 )) && [[ -z ${TUI_DEAD[$tui_upd_cur]:-} ]]; then
+        tui_vis_pos "$tui_upd_cur"
+        if (( tui_vidx >= 0 )); then
+            tui_cur=$tui_vidx
+            tui_scroll
+        fi
+    fi
+    if (( tui_upd_new == 0 )) && (( tui_upd_gone == 0 )) && (( tui_upd_kept == 0 )); then
+        tui_msg="checked: nothing has changed"
+        return 0
+    fi
+    tui_msg="checked: $tui_upd_new new, $tui_upd_gone gone"
+    if (( tui_upd_kept > 0 )); then
+        tui_msg="$tui_msg, $tui_upd_kept marked but no longer on the server"
+    fi
+}
+
+# "u": check now, whatever the timer is doing.
+tui_update_now () {
+    if [[ -n $tui_upd_pid ]]; then
+        tui_msg="a check is already running"
+        return 0
+    fi
+    tui_upd_start
+    tui_msg="checking the remote ..."
+}
+
 tui_toggle_open () {
     tui_node=${TUI_VIS[tui_cur]}
     if (( TUI_ISDIR[tui_node] == 0 )); then
