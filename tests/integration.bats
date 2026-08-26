@@ -375,8 +375,14 @@ PICK
         --keys 'q e' --delay 0.5 -- "$ALFTP" -i TV -t -nu -do
     # "some notes\n" is 11 bytes; the symlink to it is 23 characters long, and
     # 23 is what the completed directory's own listing reports.
-    [[ "$output" == *"notes.nfo@"*"11"* ]]
-    [[ "$output" != *"notes.nfo@"*"23"* ]]
+    #
+    # Read the SIZE column out of the row rather than looking for the number
+    # anywhere on the line: the row ends in a timestamp, so a bare "23" test
+    # also matches every run that happens at 23 minutes past.
+    row=$(printf '%s\n' "$output" | grep -m1 'notes\.nfo@')
+    [ -n "$row" ]
+    read -r _name _size _rest <<< "$row"
+    [ "$_size" = "11" ]
 }
 
 @test "an entry already downloaded is marked c, and t hides it" {
