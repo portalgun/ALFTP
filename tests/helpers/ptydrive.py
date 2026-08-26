@@ -28,7 +28,7 @@ ESC = re.compile(rb'\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Z0-9]|\x1b[=>]|\x1b\][^\x0
 def decode_keys(spec):
     out = []
     for chunk in spec.split():
-        chunk = chunk.replace('\\s', ' ')
+        chunk = chunk.replace('\\s', ' ').replace('\\e', '\\x1b')
         out.append(chunk.encode().decode('unicode_escape').encode('latin-1'))
     return out
 

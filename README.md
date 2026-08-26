@@ -100,15 +100,16 @@ happens in the terminal UI by default, and in `$editor` where the terminal canno
 
 ### The terminal UI
 ```
- alftp  /remote/dir                                 2 selected, 1 to unlink
+ alftp  /remote/dir                   2 selected, 1 to unlink, 1 to delete
   NAME                       SIZE  DATE
 * Some.Release.2026-GRP/     4.1G  2026-08-23 17:10
     CD1/                     2.0G  2026-08-23 17:10
 +   CD2/                     2.0G  2026-08-23 17:10
 +   release.nfo              2.1K  2026-08-23 17:10
 - Another.Release-GRP/       2.7G  2026-08-23 14:42
+x Old.Release-GRP/           1.4G  2026-08-20 08:11
   notes.nfo                  2.1K  2026-08-22 09:03
- j/k move  space toggle  tab open dir  d unlink  a all  A none  q quit
+ j/k move  M-j/k order  space pick  tab open  d/x mark  r/R clear  q quit
 ```
 The far-left column is what will happen to each entry:
 
@@ -116,6 +117,7 @@ The far-left column is what will happen to each entry:
 | --- | --- |
 | `+` | download it |
 | `-` | leave it, but remove the source symlink from the remote directory |
+| `x` | delete it: the source symlink *and* the data behind it |
 | `*` | a directory you have picked *part* of — the parts are the `+` lines under it |
 | blank | leave it alone |
 
@@ -126,10 +128,13 @@ The far-left column is what will happen to each entry:
 | `j` / `k`, `↓` / `↑` | move down / up |
 | `space`, `enter` | toggle the entry under the cursor |
 | `tab` | open a directory, or close it again |
+| `Alt`+`j` / `Alt`+`k`, `Alt`+`↓` / `Alt`+`↑` | move the entry itself down / up — the order is the download order |
 | `d` | mark the source symlink for removal (top-level entries only) |
+| `x`, `Delete` | mark for deletion — symlink and data both; asks first |
+| `r` / `R` | clear the mark on this entry / on every entry |
 | `PgDn` / `PgUp` | move a screen at a time |
 | `0` / `Home`, `G` / `End` | jump to the top / bottom |
-| `a` / `A` | select all / select none — the `-` marks are left alone |
+| `a` / `A` | select all / select none — the `-` and `x` marks are left alone |
 | `q` / `Esc` | quit, which asks first |
 
 `q` asks `(c)ancel`, `(s)ave and download`, or `(e)xit without downloading`. Cancel puts you back in
@@ -142,9 +147,9 @@ directory is listed once, over a short lftp login of its own — the session tha
 sitting inside its `!` waiting for you, so it cannot do the listing itself. If the server refuses
 that second connection the footer says so and the directory stays closed; nothing else is affected.
 
-Inside an open directory you can pick individual entries with `space`. Those are the only two states
-there — `d` is refused below the top level, because the symlink it removes is the top-level entry
-itself. Picking part of a directory turns it into a `*`, and `space` on a `*` takes the whole
+Inside an open directory you can pick individual entries with `space`. `d` is refused below the top
+level, because the symlink it removes is the top-level entry itself; `x` is not, because the data it
+removes is right there. Picking part of a directory turns it into a `*`, and `space` on a `*` takes the whole
 selection back. `space` on a directory that has nothing picked inside it takes the directory whole
 (its contents then show `+` without being listed separately), and taking any one entry back out of
 it turns it into a `*` with everything else still picked.
@@ -162,6 +167,25 @@ here.
 
 A `-` entry is never downloaded: its symlink is removed from the remote directory and that is all.
 (`-cl` still does that to everything in one go; `d` is the per-entry version of it.)
+
+### Ordering the downloads
+The list order *is* the download order: alftp transfers the entries top first, in the order they are
+on screen, whether they are directories or single files. `Alt`+`j` and `Alt`+`k` (or `Alt`+`↓` and
+`Alt`+`↑`) move the entry under the cursor down or up so you can put the one you want first at the
+top. The cursor goes with it, a directory takes everything under it along, and an entry never leaves
+the directory it is in — the top and the bottom of its own group stop it.
+
+### Deleting an entry
+`x` (or `Delete`) marks an entry for deletion. That is not the same as `d`: `d` removes the symlink
+and leaves the data where it is, while `x` removes the symlink **and** the file or directory it
+points at. Nothing here or anywhere else undoes it, so `x` asks first — a footer line naming the
+entry, where only `Y` confirms and any other key cancels. Pressing `x` again on an entry already
+marked `x` takes the mark off, no question asked; `r` does the same for any mark.
+
+Where the data actually lives comes from the long listing alftp already takes (see *Broken
+symlinks*), so a symlink pointing outside the usual data directory is followed rather than guessed
+at. An entry picked from *inside* an open directory has no symlink of its own, so `x` on one of
+those removes only the data. `--dry-run` prints what it would remove and removes nothing.
 
 ### Broken symlinks
 A completed directory is symlinks into the data directory, and it collects broken ones: the data
@@ -192,8 +216,14 @@ it fell back if it could not run.
 
 Editing the list file directly, the convention is the reverse of the UI's: a line that is commented
 out is not downloaded, and the file arrives fully commented under `-i` for you to uncomment what you
-want. A line the UI wrote carries its mark in the first column instead — `+`, `-`, `*` or `#` — and
-those mean in the file exactly what they mean on screen, so a saved list can be re-edited by hand.
+want. A line the UI wrote carries its mark in the first column instead — `+`, `-`, `x`, `*` or `#` —
+and those mean in the file exactly what they mean on screen, so a saved list can be re-edited by
+hand. The order of the lines is the download order, so moving a line up moves that transfer up the
+queue, exactly as `Alt`+`j`/`Alt`+`k` do in the UI.
+
+The first character being the mark cuts both ways: an *unmarked* line whose name happens to begin
+with `-` or `x` reads as an unlink or a deletion rather than a download. The UI always writes a
+mark, so this only ever bites a list edited by hand — put a `+` in front of such a line.
 
 Each line is three columns — name, size, modification date:
 ```
