@@ -263,10 +263,33 @@ TUI_STATUS=(); TUI_LSTAT=(); TUI_ACC=(); TUI_HASKID=()
 TUI_LPATH=(); TUI_LHAVE=()
 declare -A TUI_RSIZE=(); declare -A TUI_LSIZE=(); declare -A TUI_DUSIZE=()
 tui_chain=(); tui_kids=(); tui_kidsnew=()
+
+# The check for remote changes. It is a background lftp writing fresh listings
+# to files of its own, so what is here is the pid of that login, the files it
+# writes (kept and reused, one per directory checked, rather than mktemp'd
+# again every time the timer comes round) and the counters the merge reports
+# in the footer. update_interval is how many seconds apart the checks are, 0
+# for never; tui_read_timeout is what stops tui_read_key waiting for ever, and
+# tui_tick_interval how long that wait is -- short enough for the spinner to
+# turn, long enough that an idle picker costs nothing. tui_dirty is how a tick
+# asks for the redraw it is not allowed to do itself.
+update_interval=0
+tui_tick_interval=0.2; tui_read_timeout=""; tui_dirty=0; tui_keyrc=0
+tui_spin=0; tui_spin_frames='-\|/'
+tui_upd_pid=""; tui_upd_last=0; tui_upd_rc=0; tui_upd_name=""
+tui_upd_top=""; tui_upd_topdata=""; tui_upd_topsize=""; tui_upd_toplong=""
+tui_upd_log=""; tui_upd_script=""; tui_upd_path=""; tui_upd_s=""
+tui_upd_new=0; tui_upd_gone=0; tui_upd_kept=0; tui_upd_cur=-1; tui_upd_id=0
+tui_upd_i0=0; tui_upd_i1=0; tui_upd_j=0
+tui_upd_ids=(); tui_upd_old=(); tui_upd_add=()
+tui_upd_nm=(); tui_upd_sz=(); tui_upd_dt=(); tui_upd_kind=()
+TUI_UPD_RAW=(); TUI_UPD_DATA=()
+declare -A TUI_UPD_SUB=(); declare -A TUI_UPD_IDX=(); declare -A TUI_UPD_HAVE=()
+declare -A TUI_DEAD=()
 TUI_NAME=(); TUI_PATH=(); TUI_SIZE=(); TUI_DATE=(); TUI_DEPTH=(); TUI_PARENT=()
 TUI_ISDIR=(); TUI_OPEN=(); TUI_LOADED=(); TUI_STATE=(); TUI_SELCNT=(); TUI_POS=()
 TUI_ORDER=(); TUI_VIS=(); declare -A TUI_DIRMAP=()
-TUI_N=0; TUI_KEY=""
+TUI_N=0; TUI_KEY=""; TUI_KEYRC=0
 TUI_IN=0; TUI_OUT=1; tui_owns_fd=0; tui_dev_tty=0
 TUI_LINES=0; TUI_COLS=0; TUI_ROWS=0
 t_smcup=""; t_rmcup=""; t_civis=""; t_cnorm=""; t_clear=""; t_home=""
@@ -1568,6 +1591,21 @@ tui_parse_listing () {
     ' "$1"
 }
 
+# The size the completed directory gives a top-level entry is the length of the
+# symlink, which is not a fact about the file at all, so a real figure replaces
+# it in $tui_sz wherever there is one: du's recursive total for a directory,
+# and the data listing's own size for a file. The data listing is no use for a
+# directory -- there it gives the size of the directory entry, which says
+# nothing about what is in it. The check for remote changes re-lists the same
+# two directories, so it wants the same substitution.
+tui_real_size () {
+    if [[ -n ${TUI_DUSIZE[$1]:-} ]]; then
+        tui_sz=${TUI_DUSIZE[$1]}
+    elif (( $2 == 0 )) && [[ -n ${TUI_RSIZE[$1]:-} ]]; then
+        tui_sz=${TUI_RSIZE[$1]}
+    fi
+}
+
 # The top level of the tree. Which of those entries are directories is the same
 # question TYPE asks, and it has the same answer: $listfile2, the listing of
 # the real directory behind the symlinks.
@@ -1589,17 +1627,7 @@ tui_load () {
         if [[ $tui_nm == */ ]] || [[ -n ${TUI_DIRMAP[$tui_stripped]:-} ]]; then
             tui_isdir=1
         fi
-        # The size the completed directory gives a top-level entry is the
-        # length of the symlink, which is not a fact about the file at all, so
-        # a real figure replaces it wherever there is one: du's recursive total
-        # for a directory, and the data listing's own size for a file. The data
-        # listing is no use for a directory -- there it gives the size of the
-        # directory entry, which says nothing about what is in it.
-        if [[ -n ${TUI_DUSIZE[$tui_stripped]:-} ]]; then
-            tui_sz=${TUI_DUSIZE[$tui_stripped]}
-        elif (( tui_isdir == 0 )) && [[ -n ${TUI_RSIZE[$tui_stripped]:-} ]]; then
-            tui_sz=${TUI_RSIZE[$tui_stripped]}
-        fi
+        tui_real_size "$tui_stripped" "$tui_isdir"
         tui_add_node "$tui_nm" "$tui_sz" "$tui_dt" -1 "$tui_isdir"
         TUI_ORDER+=("$tui_new_id")
     done < <(tui_parse_listing "$listfile")
@@ -1882,10 +1910,21 @@ tui_mark_remove () {
 tui_delete_prompt () {
     tui_prompt="delete ${TUI_NAME[$1]} and the data behind it? (Y confirms, any other key cancels)"
     tui_answer=no
-    tui_draw
-    if tui_read_key && [[ $TUI_KEY == Y ]]; then
-        tui_answer=yes
-    fi
+    while true; do
+        tui_draw
+        TUI_KEYRC=1
+        if tui_read_key; then
+            if [[ $TUI_KEY == Y ]]; then
+                tui_answer=yes
+            fi
+            break
+        fi
+        # A timeout is not an answer: tick, redraw and go on waiting for one.
+        if (( TUI_KEYRC != 2 )); then
+            break
+        fi
+        tui_tick
+    done
     tui_prompt=""
 }
 
@@ -2273,6 +2312,11 @@ tui_fit () {
 # padded and cleared to the right edge, so what was there before is covered.
 tui_draw () {
     tui_left="alftp  ${remote_dl_dir}"
+    # A check is a background login the user cannot otherwise see; the glyph
+    # turning is all there is to say that the listing is being asked about.
+    if [[ -n $tui_upd_pid ]]; then
+        tui_left="$tui_left  [${tui_spin_frames:tui_spin:1}]"
+    fi
     tui_right="${tui_nsel} selected"
     if (( tui_nrm > 0 )); then
         tui_right="$tui_right, $tui_nrm to unlink"
@@ -2346,11 +2390,11 @@ tui_draw () {
         if [[ -n $tui_msg ]]; then
             tui_line=$tui_msg
         elif (( TUI_COLS >= 100 )); then
-            tui_line="j/k move  M-j/k reorder  space pick  tab open  d unlink  x delete  r/R clear  t done  a/A  q quit"
+            tui_line="j/k move  M-j/k reorder  space pick  tab open  d unlink  x delete  r/R clear  t done  u check  a/A  q quit"
         elif (( TUI_COLS >= 74 )); then
-            tui_line="j/k move  M-j/k order  space pick  tab open  d/x mark  r/R clear  t  q quit"
+            tui_line="j/k move  M-j/k order  space pick  tab open  d/x mark  r/R clear  t  u  q quit"
         else
-            tui_line="j/k  M-j/k  space  tab  d  x  r/R  t  q"
+            tui_line="j/k  M-j/k  space  tab  d  x  r/R  t  u  q"
         fi
         if (( TUI_N > TUI_ROWS )); then
             printf -v tui_line '%s   %s-%s/%s' "$tui_line" \
@@ -2365,9 +2409,33 @@ tui_draw () {
 # One keystroke, or one escape sequence: after ESC the rest of the sequence is
 # already in the buffer, so a short timeout tells a real arrow key from a bare
 # ESC without making the UI feel sluggish.
+#
+# The wait for the first character is not open-ended any more: with
+# $tui_read_timeout set (which tui_open does, and only there -- a caller
+# driving this without a terminal still blocks) it gives up after that long so
+# that the caller can tick. Which of the two things happened is in $TUI_KEYRC,
+# because the return code cannot say: read answers 1 at end of input and
+# something over 128 on a timeout, and telling those apart is the difference
+# between "the terminal went away, stop" and "nothing was typed, carry on".
+# Callers set TUI_KEYRC=1 before calling, so that a stub which only returns a
+# code still reads as end of input.
 tui_read_key () {
     TUI_KEY=""
-    IFS= read -rN1 -u "$TUI_IN" TUI_KEY || return 1
+    TUI_KEYRC=0
+    if [[ -n $tui_read_timeout ]]; then
+        tui_keyrc=0
+        IFS= read -rN1 -t "$tui_read_timeout" -u "$TUI_IN" TUI_KEY || tui_keyrc=$?
+        if (( tui_keyrc > 128 )); then
+            TUI_KEYRC=2
+            return 1
+        fi
+        if (( tui_keyrc != 0 )); then
+            TUI_KEYRC=1
+            return 1
+        fi
+    else
+        IFS= read -rN1 -u "$TUI_IN" TUI_KEY || { TUI_KEYRC=1; return 1; }
+    fi
     if [[ $TUI_KEY == $'\e' ]]; then
         while IFS= read -rN1 -t 0.05 -u "$TUI_IN" tui_scratch; do
             TUI_KEY+=$tui_scratch
@@ -2398,6 +2466,7 @@ tui_key_action () {
         x|$'\e[3~')                             tui_action=delete ;;
         r)                                     tui_action=clear ;;
         t)                                     tui_action=showdone ;;
+        u)                                     tui_action=update ;;
         R)                                     tui_action=clearall ;;
         a)                                     tui_action=all ;;
         A)                                     tui_action=none ;;
@@ -2901,7 +2970,12 @@ tui_quit_prompt () {
     tui_answer=""
     while [[ -z $tui_answer ]]; do
         tui_draw
+        TUI_KEYRC=1
         if ! tui_read_key; then
+            if (( TUI_KEYRC == 2 )); then
+                tui_tick
+                continue
+            fi
             tui_answer="exit"
             break
         fi
@@ -2926,10 +3000,23 @@ tui_loop () {
             printf '%s' "$t_clear" >&"$TUI_OUT"
         fi
         tui_draw
-        if ! tui_read_key; then
-            tui_result="exit"
-            return 0
-        fi
+        # Wait for a key, but not for ever: every expiry of the read's timeout
+        # is one tick, which is where the background check is started, animated
+        # and reaped. Only a redraw the tick asked for is done here -- an idle
+        # picker with nothing running repaints nothing at all.
+        TUI_KEYRC=1
+        while ! tui_read_key; do
+            if (( TUI_KEYRC != 2 )); then
+                tui_result="exit"
+                return 0
+            fi
+            tui_tick
+            if (( tui_dirty == 1 )); then
+                tui_dirty=0
+                tui_draw
+            fi
+            TUI_KEYRC=1
+        done
         tui_msg=""
         tui_key_action "$TUI_KEY"
         case $tui_action in
@@ -2959,6 +3046,9 @@ tui_loop () {
                 ;;
             showdone)
                 tui_toggle_done
+                ;;
+            update)
+                tui_update_now
                 ;;
             clearall)
                 tui_clear_all
@@ -3011,6 +3101,9 @@ tui_open () {
     tui_saved_winch=$(trap -p WINCH)
     trap 'tui_abort' INT TERM
     trap 'tui_resized=1' WINCH
+    # Only a real terminal ticks: everything else that drives tui_loop (a test,
+    # for one) has no background work and wants the read to block.
+    tui_read_timeout=$tui_tick_interval
     printf '%s%s%s' "$t_smcup" "$t_civis" "$t_clear" >&"$TUI_OUT"
     return 0
 }
@@ -3020,6 +3113,10 @@ tui_close () {
         return 0
     fi
     tui_open_flag=0
+    tui_read_timeout=""
+    # A check still in flight has nothing left to report to, and its login is
+    # this run's to close.
+    tui_upd_stop
     printf '%s%s%s' "$t_sgr0" "$t_cnorm" "$t_rmcup" >&"$TUI_OUT"
     if [[ -n $tui_saved_stty ]]; then
         stty "$tui_saved_stty" <&"$TUI_IN" 2> /dev/null
@@ -3108,6 +3205,12 @@ tui_apply_marks () {
 tui_select () {
     tui_cur=0
     tui_top=0
+    # A timer that is not a whole number of seconds is not a timer; anything
+    # else in the config leaves the check to "u" rather than failing the run.
+    if [[ ! $update_interval =~ ^[0-9]+$ ]]; then
+        update_interval=0
+    fi
+    tui_upd_last=$SECONDS
     tui_prompt=""
     tui_msg=""
     tui_resized=0
