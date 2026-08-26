@@ -1243,3 +1243,130 @@ SNIP
     [ "${lines[0]}" = 'ls -l > "/tmp/x y/list4"' ]
     [ "${lines[1]}" = "off:[]" ]
 }
+
+# A fresh listing as lftp writes one -- "size date time name", before
+# format_columns has been anywhere near it -- plus the data listing beside it
+# that says which of the entries are directories. $raw and $rawdata are the two
+# files; the arguments are the lines of each, separated by "--".
+listing () {
+    cat <<'SNIP'
+    raw=$(mktemp); rawdata=$(mktemp)
+    printf '%s\n' '4.1G  2026-08-23 17:10 Rel.One-GRP@' \
+                  '2.1K  2026-08-22 09:03 notes.nfo' \
+                  '9.9G  2026-08-25 11:00 Rel.Three-GRP@' > "$raw"
+    printf '%s\n' 'Rel.One-GRP/' 'notes.nfo' 'Rel.Three-GRP/' > "$rawdata"
+    order () { n=""; for v in "${TUI_ORDER[@]}"; do n="$n ${TUI_NAME[v]}"; done; echo "[${n# }]"; }
+    depths () { d=""; for v in "${TUI_ORDER[@]}"; do d="$d${TUI_DEPTH[v]}"; done; echo "$d"; }
+    merge () { tui_upd_new=0; tui_upd_gone=0; tui_upd_kept=0
+               tui_upd_group "$1" "$raw" "$rawdata"
+               tui_status_scan; tui_widths; tui_rebuild_vis; }
+SNIP
+}
+
+@test "u asks for a check of the remote" {
+    run stage 'tui_key_action u; echo "$tui_action"'
+    [ "$output" = "update" ]
+}
+
+@test "the loop ticks while nothing is typed and still ends at end of input" {
+    run stage "$(tree)"'
+        TICKS=0; KI=0
+        tui_tick () { TICKS=$(( TICKS + 1 )); tui_dirty=1; }
+        tui_read_key () {
+            if (( KI < 3 )); then KI=$(( KI + 1 )); TUI_KEYRC=2; return 1; fi
+            return 1
+        }
+        tui_loop; echo "$TICKS $tui_result"'
+    # Three timeouts are three ticks and no exit; the fourth read is the
+    # terminal going away, which is what ends the loop.
+    [ "$output" = "3 exit" ]
+}
+
+@test "a check leaves surviving entries where the user put them" {
+    run stage "$(tree)"$'\n'"$(listing)"'
+        tui_cur=4; tui_move_node up          # Rel.Two-GRP above the open release
+        echo "$(order)"; merge -1; echo "$(order)"; echo "$tui_upd_new"'
+    # Rel.Two-GRP is not in the fresh listing and carries no mark, so it goes;
+    # everything else keeps the order the reorder gave it, children and all,
+    # and the entry that appeared is added at the end.
+    [ "${lines[0]}" = "[Rel.Two-GRP@ Rel.One-GRP@ CD1/ movie.mkv movie.nfo notes.nfo]" ]
+    [ "${lines[1]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo notes.nfo Rel.Three-GRP@]" ]
+    [ "${lines[2]}" = "1" ]
+}
+
+@test "an entry that is gone but marked stays, and the count says so" {
+    run stage "$(tree)"$'\n'"$(listing)"'
+        tui_cur=4; tui_toggle                # mark Rel.Two-GRP for download
+        merge -1
+        echo "$(order)"; echo "$tui_upd_new $tui_upd_gone $tui_upd_kept"
+        echo "$tui_nsel ${TUI_STATE[1]}"'
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo Rel.Two-GRP@ notes.nfo Rel.Three-GRP@]" ]
+    [ "${lines[1]}" = "1 0 1" ]
+    # The mark it was kept for is still on it and still counted.
+    [ "${lines[2]}" = "1 1" ]
+}
+
+@test "a directory holding a selection is not dropped from under it" {
+    run stage "$(tree)"$'\n'"$(listing)"'
+        tui_cur=2; tui_toggle                # movie.mkv, inside Rel.One-GRP
+        merge -1
+        echo "$(order)"; echo "$tui_nsel $tui_upd_kept"'
+    # Rel.One-GRP is still listed, so nothing here turns on it; what matters is
+    # that the selection below it survived the merge intact.
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo notes.nfo Rel.Three-GRP@]" ]
+    [ "${lines[1]}" = "1 0" ]
+}
+
+@test "dropping an entry takes its whole subtree and leaves the rest contiguous" {
+    run stage "$(tree)"$'\n'"$(listing)"'
+        printf %s "$(depths)"; echo " -> "
+        merge -1
+        echo "$(depths)"
+        tui_subtree "${TUI_POS[0]}"; echo "$tui_r0 $tui_r1"'
+    [ "${lines[0]}" = "011100 -> " ]
+    # Rel.Two-GRP went; the three children of Rel.One-GRP are still the run
+    # directly behind it, and the new entry is at depth 0 at the end.
+    [ "${lines[1]}" = "011100" ]
+    [ "${lines[2]}" = "1 4" ]
+}
+
+@test "a merge into an open directory adds to that sibling group only" {
+    run stage "$(tree)"$'\n'"$(listing)"'
+        printf "%s\n" "13K  2026-08-25 11:00 extra.sub" > "$raw"
+        : > "$rawdata"
+        merge 0
+        echo "$(order)"; echo "$(depths)"; echo "$tui_upd_new $tui_upd_gone"'
+    # Everything that was in the directory has gone from the listing, but the
+    # new entry still lands inside it, directly behind its siblings.
+    [ "${lines[0]}" = "[Rel.One-GRP@ extra.sub Rel.Two-GRP@ notes.nfo]" ]
+    [ "${lines[1]}" = "0100" ]
+    [ "${lines[2]}" = "1 3" ]
+}
+
+@test "a check with nothing to say still leaves the tree alone" {
+    run stage "$(tree)"$'\n'"$(listing)"'
+        : > "$raw"
+        merge -1; echo "$(order)"; echo "$tui_upd_new $tui_upd_gone $tui_upd_kept"'
+    # An empty listing is a check that did not work, not a directory that
+    # emptied itself: nothing is dropped on the strength of it.
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo Rel.Two-GRP@ notes.nfo]" ]
+    [ "${lines[1]}" = "0 0 0" ]
+}
+
+@test "srcs mode keeps a check to the source directories the profile named" {
+    run stage "$(tree)"$'\n'"$(listing)"'
+        srcs_mode=True; SRCS=(Rel.One-GRP notes.nfo)
+        merge -1; echo "$(order)"; echo "$tui_upd_new"'
+    # Rel.Three-GRP is on the server but is not one of the srcs, so it is no
+    # more part of the top level after the check than it was before it.
+    [ "${lines[0]}" = "[Rel.One-GRP@ CD1/ movie.mkv movie.nfo notes.nfo]" ]
+    [ "${lines[1]}" = "0" ]
+}
+
+@test "the title bar carries a turning glyph while a check is running" {
+    run stage "$(tree)"'
+        TUI_OUT=1; tui_upd_pid=999; tui_draw; echo
+        tui_spin=2; tui_draw; echo'
+    [[ "$output" == *"[-]"* ]]
+    [[ "$output" == *"[|]"* ]]
+}

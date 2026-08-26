@@ -280,7 +280,7 @@ tui_upd_pid=""; tui_upd_last=0; tui_upd_rc=0; tui_upd_name=""
 tui_upd_top=""; tui_upd_topdata=""; tui_upd_topsize=""; tui_upd_toplong=""
 tui_upd_log=""; tui_upd_script=""; tui_upd_path=""; tui_upd_s=""
 tui_upd_new=0; tui_upd_gone=0; tui_upd_kept=0; tui_upd_cur=-1; tui_upd_id=0
-tui_upd_i0=0; tui_upd_i1=0; tui_upd_j=0
+tui_upd_i0=0; tui_upd_i1=0; tui_upd_j=0; tui_upd_k=0; tui_upd_m=0
 tui_upd_ids=(); tui_upd_old=(); tui_upd_add=()
 tui_upd_nm=(); tui_upd_sz=(); tui_upd_dt=(); tui_upd_kind=()
 TUI_UPD_RAW=(); TUI_UPD_DATA=()
@@ -2761,9 +2761,11 @@ tui_upd_drop () {
     tui_subtree "${TUI_POS[$1]}"
     tui_upd_i0=$(( tui_r0 - 1 ))
     tui_upd_i1=$tui_r1
-    for (( tui_i = tui_upd_i0; tui_i < tui_upd_i1; tui_i++ )); do
-        tui_set_state "${TUI_ORDER[tui_i]}" 0
-        TUI_DEAD[${TUI_ORDER[tui_i]}]=1
+    # tui_upd_m rather than tui_i: tui_reindex below runs on tui_i, and this is
+    # called from the middle of a loop of tui_upd_group's own.
+    for (( tui_upd_m = tui_upd_i0; tui_upd_m < tui_upd_i1; tui_upd_m++ )); do
+        tui_set_state "${TUI_ORDER[tui_upd_m]}" 0
+        TUI_DEAD[${TUI_ORDER[tui_upd_m]}]=1
     done
     TUI_ORDER=("${TUI_ORDER[@]:0:tui_upd_i0}" "${TUI_ORDER[@]:tui_upd_i1}")
     tui_reindex
@@ -2834,8 +2836,8 @@ tui_upd_group () {
         tui_children "$1"
         tui_upd_old=(${tui_kids[@]+"${tui_kids[@]}"})
     fi
-    for (( tui_i = ${#tui_upd_old[@]} - 1; tui_i >= 0; tui_i-- )); do
-        tui_id=${tui_upd_old[tui_i]}
+    for (( tui_upd_k = ${#tui_upd_old[@]} - 1; tui_upd_k >= 0; tui_upd_k-- )); do
+        tui_id=${tui_upd_old[tui_upd_k]}
         tui_strip_class "${TUI_NAME[tui_id]}"
         if [[ -n ${TUI_UPD_IDX[$tui_stripped]:-} ]]; then
             TUI_UPD_HAVE[$tui_stripped]=1
@@ -2853,13 +2855,13 @@ tui_upd_group () {
     done
 
     tui_upd_add=()
-    for (( tui_i = 0; tui_i < ${#tui_upd_nm[@]}; tui_i++ )); do
-        tui_strip_class "${tui_upd_nm[tui_i]}"
+    for (( tui_upd_k = 0; tui_upd_k < ${#tui_upd_nm[@]}; tui_upd_k++ )); do
+        tui_strip_class "${tui_upd_nm[tui_upd_k]}"
         if [[ -n ${TUI_UPD_HAVE[$tui_stripped]:-} ]]; then
             continue
         fi
-        tui_add_node "${tui_upd_nm[tui_i]}" "${tui_upd_sz[tui_i]}" \
-            "${tui_upd_dt[tui_i]}" "$1" "${tui_upd_kind[tui_i]}"
+        tui_add_node "${tui_upd_nm[tui_upd_k]}" "${tui_upd_sz[tui_upd_k]}" \
+            "${tui_upd_dt[tui_upd_k]}" "$1" "${tui_upd_kind[tui_upd_k]}"
         tui_upd_add+=("$tui_new_id")
     done
     if (( ${#tui_upd_add[@]} == 0 )); then
