@@ -41,6 +41,10 @@
 #    perms_files    - three-digit mode for downloaded files (default 644)
 #    chown          - (True|False) give what was downloaded to $owner. Default False
 #    owner          - user, or user:group, for chown=True
+#    prune_broken   - (True|False, default True) leave broken symlinks out of the listing and
+#                     remove them from the remote. A link is broken when the data it points at is
+#                     gone; one whose target cannot be checked is always kept. --dry-run only says
+#                     what it would remove, and -do leaves the remote alone.
 #    norm           - (True|[unset]) do not remove symlinks when completed
 #    rm_remote      - (True|[unset]) remove files, not just symlinks, once completed
 #    rm_list        - (True|[unset]) remove list file once download is complete

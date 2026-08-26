@@ -221,3 +221,82 @@ perms_files=640' -a TV -q -nu
     [ "$(stat -c '%a' "$DL/Rel.One-GRP/movie.mkv")" = "640" ]
     [ "$(stat -c '%a' "$DL/Rel.One-GRP/CD1")" = "755" ]
 }
+
+# A stand-in for $editor that keeps a copy of what it was shown and then picks
+# nothing, so a run costs one listing and no transfers: what is being tested is
+# the list the picker was handed and what the session did to the remote.
+srv_picker() {
+    cat > "$SRV/pick" <<'PICK'
+#!/usr/bin/env bash
+cp "$1" "$1.seen"
+sed -i 's/^/#/' "$1"
+PICK
+    chmod +x "$SRV/pick"
+    printf '%s' "$SRV/pick"
+}
+
+@test "CREATE_LIST captures the symlink targets alongside the listings" {
+    run srv_stage 'CREATE_LIST; link_targets "$listfile4"'
+    [ "$status" -eq 0 ]
+    # Real lftp "ls -l" output, parsed back into name -> target.
+    [[ "$output" == *"broken.link	../../data/TV/gone.mkv"* ]]
+    [[ "$output" == *"Rel.One-GRP	../../data/TV/Rel.One-GRP"* ]]
+    [[ "$output" == *"notes.nfo	../../data/TV/notes.nfo"* ]]
+}
+
+@test "a broken symlink never reaches the picker and is removed from the remote" {
+    home=$(srv_home)
+    run env HOME="$home" EDITOR="$(srv_picker)" ALFTP_LIB= "$ALFTP" -a TV -nu
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"pruning 1 broken symlink(s)"* ]]
+    seen=$(cat "$home/.cache/alftp/alftp.list.seen")
+    [[ "$seen" != *"broken.link"* ]]
+    # The links whose data is still there are shown, and left alone.
+    [[ "$seen" == *"Rel.One-GRP"* ]]
+    [[ "$seen" == *"notes.nfo"* ]]
+    [ ! -L "$SRV/complete/TV/broken.link" ]
+    [ -L "$SRV/complete/TV/Rel.One-GRP" ]
+    [ -L "$SRV/complete/TV/notes.nfo" ]
+    [ -f "$SRV/data/TV/notes.nfo" ]
+}
+
+@test "--dry-run says what it would prune and leaves the broken symlink alone" {
+    home=$(srv_home)
+    run env HOME="$home" EDITOR="$(srv_picker)" ALFTP_LIB= "$ALFTP" -a TV -nu --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"dry run, none removed"* ]]
+    [[ "$output" == *"DRY-RUN: rm broken broken.link"* ]]
+    [ -L "$SRV/complete/TV/broken.link" ]
+}
+
+@test "-do leaves the broken symlink on the remote" {
+    home=$(srv_home)
+    run env HOME="$home" EDITOR="$(srv_picker)" ALFTP_LIB= "$ALFTP" -a TV -nu -do
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"left on the remote (-do)"* ]]
+    [ -L "$SRV/complete/TV/broken.link" ]
+    # Still out of the list, though: it cannot be downloaded either way.
+    seen=$(cat "$home/.cache/alftp/alftp.list.seen")
+    [[ "$seen" != *"broken.link"* ]]
+}
+
+@test "prune_broken=False lists the broken symlink and leaves it in place" {
+    home=$(srv_home)
+    echo 'prune_broken=False' >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" EDITOR="$(srv_picker)" ALFTP_LIB= "$ALFTP" -a TV -nu
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"broken symlink"* ]]
+    seen=$(cat "$home/.cache/alftp/alftp.list.seen")
+    [[ "$seen" == *"broken.link"* ]]
+    [ -L "$SRV/complete/TV/broken.link" ]
+}
+
+@test "--two-session prunes in the download login" {
+    home=$(srv_home)
+    run env HOME="$home" EDITOR="$(srv_picker)" ALFTP_LIB= "$ALFTP" -a TV -nu --two-session
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"pruning 1 broken symlink(s)"* ]]
+    # Nothing was picked, so the second login exists only to do the pruning.
+    [ ! -L "$SRV/complete/TV/broken.link" ]
+    [ -L "$SRV/complete/TV/notes.nfo" ]
+}

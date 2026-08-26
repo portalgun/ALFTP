@@ -138,7 +138,8 @@ stage() {
     # one login for the whole run: a single open, then listing, helper, download
     [ "$(grep -c "^open " <<< "$output")" -eq 1 ]
     [[ "$output" == *"set net:idle never"* ]]          # survive the editor pause
-    [[ "$output" == *'cls -1 > "/tmp/alftp-test-list"'* ]]
+    [[ "$output" == *'--size --date'*'> "/tmp/alftp-test-list"'* ]]
+    [[ "$output" == *'cls -1 > "/tmp/alftp-test-list2"'* ]]
     [[ "$output" == *"!env ALFTP_EMIT_DL="*"ALFTP_ARGV="*"bash '/usr/local/bin/alftp'"* ]]
     [[ "$output" == *'source "'* ]]
 }
@@ -189,15 +190,20 @@ stage() {
 @test "pick_list falls back to the editor, commenting the list out for -i" {
     listfile=$(mktemp)
     log=$(mktemp)
+    stub=$(mktemp)
     printf '%s\n' 'file1  4.0K  2026-08-23 17:10' 'file2   753  2026-08-23 14:42' > "$listfile"
+    # A stub $editor that records the file it was handed and prints nothing:
+    # anything it wrote to stdout would land in $output ahead of the list.
+    printf '#!/bin/sh\nprintf %%s "$1" > %s\n' "$log" > "$stub"
+    chmod +x "$stub"
     run stage 'listfile="'"$listfile"'"; ind_files=True; picker=editor
-               editor="printf %s\n >> '"$log"' --"
+               editor="'"$stub"'"
                pick_list; cat "$listfile"'
-    rm -f "$log"
+    [ "$(cat "$log")" = "$listfile" ]
     # -i hands the editor a fully commented list for the user to uncomment.
     [ "${lines[0]}" = "#file1  4.0K  2026-08-23 17:10" ]
     [ "${lines[1]}" = "#file2   753  2026-08-23 14:42" ]
-    rm -f "$listfile"
+    rm -f "$listfile" "$log" "$stub"
 }
 
 # A small tree, built the way tui_fetch would: three top-level entries, the
@@ -286,9 +292,9 @@ SNIP
         tui_cur=4; tui_mark_remove
                         tui_set_all 1; marks; echo "$tui_nsel/$tui_nrm"
                         tui_set_all 0; marks; echo "$tui_nsel/$tui_nrm"'
-    [ "${lines[0]}" = "[++++ +]" ]
+    [ "${lines[0]}" = "[++++-+]" ]
     [ "${lines[1]}" = "2/1" ]
-    [ "${lines[2]}" = "[     -]" ]
+    [ "${lines[2]}" = "[    - ]" ]
     [ "${lines[3]}" = "0/1" ]
 }
 
@@ -314,9 +320,12 @@ SNIP
 
 @test "TYPE splits the picked list into mirrors, pgets and unlinks" {
     listfile=$(mktemp); listfile2=$(mktemp)
+    # Two spaces before the size column, which is what FORMAT_LIST and
+    # tui_save always write: strip_columns needs them to tell the columns from
+    # a name that has spaces in it.
     printf '%s\n' '*Rel.One-GRP@          4.1G  2026-08-23 17:10' \
                   '+Rel.One-GRP/CD1/            2026-08-23 17:10' \
-                  '+Rel.One-GRP/movie.mkv 4.0G  2026-08-23 17:10' \
+                  '+Rel.One-GRP/movie.mkv  4.0G  2026-08-23 17:10' \
                   '-Rel.Two-GRP@          2.7G  2026-08-23 14:42' \
                   '#notes.nfo             2.1K  2026-08-22 09:03' > "$listfile"
     printf '%s\n' 'Rel.One-GRP/' 'Rel.Two-GRP/' 'notes.nfo' > "$listfile2"
@@ -380,7 +389,7 @@ SNIP
         printf -v NL "\n"
         KEYS=(" " j "$NL" q s); tui_loop
         marks; echo "$tui_nsel $tui_result"'
-    [ "${lines[0]}" = "[+ +   ]" ]
+    [ "${lines[0]}" = "[* ++  ]" ]
     [ "${lines[1]}" = "2 save" ]
 }
 
@@ -710,4 +719,132 @@ missing.nfo"; POST_PROCESS'
                LINESD="Rel.One-GRP"; POST_PROCESS'
     [ "$output" = "" ]
     rm -rf "$dl"
+}
+
+# ---------------------------------------------------------------- SYMLINKS --
+# The "ls -l" parser and the validity rules built on it. tests/fixtures/ls-l.txt
+# is a listing of the shape a server produces, complete with the awkward cases:
+# a name with a space, a target with spaces, an old entry whose date is a year
+# rather than a time, an ISO date, and one line no parser could make sense of.
+
+@test "link_targets reads name and target out of an ls -l listing" {
+    run stage 'link_targets "'"${BATS_TEST_DIRNAME}"'/fixtures/ls-l.txt"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "Rel.One-GRP	../../data/TV/Rel.One-GRP" ]
+    [ "${lines[1]}" = "notes.nfo	../../data/TV/notes.nfo" ]
+    [ "${lines[2]}" = "broken.link	../../data/TV/gone.mkv" ]
+    # A name and a target may both contain spaces; only " -> " separates them.
+    [ "${lines[3]}" = "spaced link	../../data/TV/with space name.mkv" ]
+    # "Mon DD  YYYY" and the ISO form are both dates, and the name is whatever
+    # follows either of them.
+    [ "${lines[4]}" = "elsewhere.mkv	/srv/archive/elsewhere.mkv" ]
+    [ "${lines[5]}" = "deep.mkv	../../data/TV/Rel.One-GRP/movie.mkv" ]
+    # The unparsable line and the two non-symlinks contribute nothing.
+    [ "${#lines[@]}" -eq 6 ]
+}
+
+@test "a line with no date it recognises yields no record at all" {
+    run stage 'printf "%s\n" "lrwxrwxrwx 1 u g 12 who knows -> anywhere" | link_targets /dev/stdin'
+    [ "$output" = "" ]
+}
+
+@test "link_normalize folds . and .. out of a remote path" {
+    run stage 'link_normalize "/srv/complete/TV/../../data/TV/gone.mkv"; echo "$link_norm"
+               link_normalize "rel/./path/../x"; echo "$link_norm"
+               link_normalize "/a/b/"; echo "$link_norm"'
+    [ "${lines[0]}" = "/srv/data/TV/gone.mkv" ]
+    [ "${lines[1]}" = "rel/x" ]
+    [ "${lines[2]}" = "/a/b" ]
+}
+
+@test "link_data_path resolves the parsed target and falls back to the layout" {
+    run stage 'listfile4="'"${BATS_TEST_DIRNAME}"'/fixtures/ls-l.txt"
+               remote_dl_dir=/srv/complete/TV; data_dir=/srv/data/; dirname=TV
+               LOAD_LINKS
+               link_data_path "notes.nfo@"; echo "$link_path"
+               link_data_path "elsewhere.mkv"; echo "$link_path"
+               link_data_path "who.knows.mkv"; echo "$link_path"'
+    # A relative target hangs off the completed directory, an absolute one
+    # stands on its own, and an entry with no parsed target falls back to the
+    # path the data_dir/dirname layout implies.
+    [ "${lines[0]}" = "/srv/data/TV/notes.nfo" ]
+    [ "${lines[1]}" = "/srv/archive/elsewhere.mkv" ]
+    [ "${lines[2]}" = "/srv/data/TV/who.knows.mkv" ]
+}
+
+# The listing and the data behind it, as VALIDATE_LINKS expects to find them:
+# of everything the long listing names, only gone.mkv is missing from the data
+# directory.
+links () {
+    cat <<'SNIP'
+    listfile4="$FIXTURES/ls-l.txt"
+    remote_dl_dir=/srv/complete/TV; data_dir=/srv/data/; dirname=TV
+    listfile=$(mktemp); listfile2=$(mktemp)
+    printf '%s\n' 'Rel.One-GRP/' 'notes.nfo' 'with space name.mkv' > "$listfile2"
+    printf '%s\n' 'Rel.One-GRP@   4.1G  2026-08-23 17:10' \
+                  'broken.link@     22  2026-08-22 09:03' \
+                  'notes.nfo@       23  2026-08-23 17:10' \
+                  'spaced link@     33  2019-01-02 00:00' \
+                  'elsewhere.mkv@   30  2026-08-23 17:10' \
+                  'deep.mkv@        41  2026-08-23 17:10' \
+                  'who knows@       12  2026-08-23 17:10' > "$listfile"
+    LOAD_LINKS
+SNIP
+}
+
+@test "VALIDATE_LINKS drops the links whose data is gone and keeps the rest" {
+    run stage 'FIXTURES="'"${BATS_TEST_DIRNAME}"'/fixtures"'$'\n'"$(links)"'
+        VALIDATE_LINKS
+        echo "B=[$LINESB]"
+        cat "$listfile"
+        rm -f "$listfile" "$listfile2"'
+    [ "${lines[0]}" = "alftp: pruning 1 broken symlink(s) from /srv/complete/TV" ]
+    [ "${lines[1]}" = "B=[broken.link]" ]
+    # Everything else survives: the two live links, the one pointing outside the
+    # data directory entirely (elsewhere.mkv), the one pointing deeper into it
+    # than the data listing goes (deep.mkv), and the entry whose ls -l line
+    # could not be parsed at all (who knows). None of those could be checked,
+    # and unchecked means kept.
+    [ "${lines[2]}" = "Rel.One-GRP@   4.1G  2026-08-23 17:10" ]
+    [ "${lines[3]}" = "notes.nfo@       23  2026-08-23 17:10" ]
+    [ "${lines[4]}" = "spaced link@     33  2019-01-02 00:00" ]
+    [ "${lines[5]}" = "elsewhere.mkv@   30  2026-08-23 17:10" ]
+    [ "${lines[6]}" = "deep.mkv@        41  2026-08-23 17:10" ]
+    [ "${lines[7]}" = "who knows@       12  2026-08-23 17:10" ]
+    [ "${#lines[@]}" -eq 8 ]
+}
+
+@test "prune_broken=False leaves the listing alone" {
+    run stage 'FIXTURES="'"${BATS_TEST_DIRNAME}"'/fixtures"'$'\n'"$(links)"'
+        prune_broken=False; VALIDATE_LINKS
+        echo "B=[$LINESB] count=$link_count"
+        grep -c broken.link "$listfile"
+        rm -f "$listfile" "$listfile2"'
+    [ "${lines[0]}" = "B=[] count=0" ]
+    [ "${lines[1]}" = "1" ]
+}
+
+@test "a listing with no long form to check it against prunes nothing" {
+    run stage 'FIXTURES="'"${BATS_TEST_DIRNAME}"'/fixtures"'$'\n'"$(links)"'
+        listfile4=""; LOAD_LINKS; VALIDATE_LINKS
+        echo "B=[$LINESB] targets=${#LINK_TARGET[@]}"
+        grep -c broken.link "$listfile"
+        rm -f "$listfile" "$listfile2"'
+    [ "${lines[0]}" = "B=[] targets=0" ]
+    [ "${lines[1]}" = "1" ]
+}
+
+@test "DLPRUNE removes a broken link, prints it under --dry-run and skips it under -do" {
+    run stage 'LINESB="broken.link"; DLPRUNE'
+    [ "${lines[0]}" = 'rm -f "broken.link"; !echo PRUNED: "broken.link"' ]
+    run stage 'LINESB="broken.link"; dry_run=True; DLPRUNE'
+    [ "${lines[0]}" = '!echo DRY-RUN: rm broken "broken.link"' ]
+    run stage 'LINESB="broken.link"; norm=True; echo "[$(DLPRUNE)]"'
+    [ "$output" = "[]" ]
+}
+
+@test "the listing session captures the long listing, and only where it has somewhere to go" {
+    run stage 'listfile4="/tmp/x y/list4"; ls_l_cmd; listfile4=""; echo "off:[$(ls_l_cmd)]"'
+    [ "${lines[0]}" = 'ls -l > "/tmp/x y/list4"' ]
+    [ "${lines[1]}" = "off:[]" ]
 }
