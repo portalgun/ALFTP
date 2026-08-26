@@ -194,6 +194,19 @@ rawline=""; unlink_ok=""
 # LINESF still hold the same paths split by kind, for POST_PROCESS).
 LINESX=""; LINESO=""; del_path=""; xfer_kind=""; xfer_path=""
 two_session=""; self=""; ARGV=(); dir_sizes=""; listfile3=""; listfile4=""
+# $listfile5 is a size listing of the data directory. The completed directory's
+# own size column is the *symlink's* length rather than the size of the data
+# behind it, so it is the only thing that can say whether a local copy is
+# finished (see the STATUS column in the picker).
+listfile5=""
+
+# srcs mode: "-i" with no profile name after it picks from $complete_dir
+# itself, with the source directories named by the profile's "srcs" key as the
+# top level of the tree. Each of them resolves its own local directory, which
+# is what local_dir_for is for.
+srcs_mode=""; SRCS=(); srcs_line=""; remote_block=""; srcs_item=""
+local_dir=""; local_rel=""; local_src=""; local_var=""; local_parent=""
+line_rel=""; local_out=""
 
 # A completed directory is symlinks into the data directory, and they go stale
 # when the data behind one is removed. LINK_TARGET is what the listing session's
@@ -231,7 +244,21 @@ tui_nodes=0; tui_new_id=0; tui_stripped=""; tui_mark=""; tui_anc=-1
 tui_old=0; tui_delta=0; tui_p=0; tui_d=0; tui_r0=0; tui_r1=0; tui_skipd=-1
 tui_walk=0; tui_step=0; tui_kid=0; tui_isdir=0; tui_nm=""; tui_sz=""; tui_dt=""
 tui_blk0=0; tui_blk1=0; tui_sib=0; tui_sib1=0; tui_vidx=-1
-tui_raw=""; tui_log=""; tui_script=""
+tui_raw=""; tui_rawdata=""; tui_log=""; tui_script=""
+declare -A TUI_SUBDIR=()
+# The STATUS column: what is true about an entry, as against TUI_STATE, which
+# is what the run will do to it. TUI_LSTAT holds the verdict the local
+# directory gives ("c" complete, "i" incomplete, "m" not there at all, "u" not
+# knowable) and TUI_STATUS the short string drawn for it, which later work also
+# writes transfer progress into. TUI_ACC/TUI_HASKID are how a directory's
+# verdict is folded up out of its children in one pass.
+tui_show_done=1; tui_statusw=0; tui_datew=0; tui_dusize=0
+tui_stat=""; tui_lpath=""; tui_bytes=0; tui_tol=0; tui_lbytes=0
+tui_unit=0; tui_num=""; tui_frac=""; tui_dulist=(); tui_srcs_keep=""
+tui_srcs_out=""
+TUI_STATUS=(); TUI_LSTAT=(); TUI_ACC=(); TUI_HASKID=()
+TUI_LPATH=(); TUI_LHAVE=()
+declare -A TUI_RSIZE=(); declare -A TUI_LSIZE=()
 tui_chain=(); tui_kids=(); tui_kidsnew=()
 TUI_NAME=(); TUI_PATH=(); TUI_SIZE=(); TUI_DATE=(); TUI_DEPTH=(); TUI_PARENT=()
 TUI_ISDIR=(); TUI_OPEN=(); TUI_LOADED=(); TUI_STATE=(); TUI_SELCNT=(); TUI_POS=()
@@ -388,15 +415,40 @@ eval_remote_config () {
     if [[ -n $default_server ]]; then
         I='\\|'"$(ere_escape "$default_server")"'\\]'
     fi
-    #remote_config=$(awk -v awkvar="$I" 'BEGIN { RS="\n\n\\[" ; FS="\n"; OFS="\n"} $0 ~ awkvar {print $0}' "$configsrc" | \
-    remote_config=$(awk -v awkvar="$I" 'BEGIN { RS="\n\n\\[" ; FS="\n"; OFS="\n"} $0 ~ awkvar {print $0}' "$configsrc" | \
+    remote_block=$(awk -v awkvar="$I" 'BEGIN { RS="\n\n\\[" ; FS="\n"; OFS="\n"} $0 ~ awkvar {print $0}' "$configsrc")
+    remote_config=$(printf '%s\n' "$remote_block" | \
 	grep -vE "^srcs" | \
 	sed 's/^dl_dir=/remote_dl_dir=/' | \
 	sed '1 s/|\(.*\)]/name=\1/'
     )
     #echo "$remote_config"
     eval "$remote_config"
+    parse_srcs
+}
 
+# "srcs" is the list of source directories under $complete_dir, and it is the
+# one key in a profile block that is not valid bash: the ";" separating the
+# entries would end the assignment, which is why both config passes grep it out
+# before eval'ing the rest. So it is read textually instead, out of the same
+# block the remote settings came from.
+parse_srcs () {
+    SRCS=()
+    srcs_line=$(printf '%s\n' "$remote_block" | grep -E '^[[:space:]]*srcs[[:space:]]*=' | tail -n 1)
+    if [[ -z $srcs_line ]]; then
+        return 0
+    fi
+    srcs_line=${srcs_line#*=}
+    # A quoted value is worth accepting even though the ";" outside the quotes
+    # is what makes the line un-eval-able in the first place.
+    srcs_line=${srcs_line#[\"\']}
+    srcs_line=${srcs_line%[\"\']}
+    while IFS= read -r srcs_item; do
+        srcs_item=${srcs_item#"${srcs_item%%[![:space:]]*}"}
+        srcs_item=${srcs_item%"${srcs_item##*[![:space:]]}"}
+        if [[ -n $srcs_item ]]; then
+            SRCS+=("$srcs_item")
+        fi
+    done < <(printf '%s\n' "$srcs_line" | tr ';' '\n')
 }
 
 # A gpg-encrypted file of settings, so credentials need not sit in plaintext in
@@ -481,6 +533,15 @@ ARGSB () {
                 ;;
         esac
     done
+    # "-i" with nothing after it (end of argv, or another flag next, which the
+    # loop above turns back into an empty nextParam) names no profile, so
+    # there is nothing to build a remote directory out of. With a "srcs" list
+    # to go on that is the request to pick from $complete_dir itself, one
+    # level up, with those source directories as the top of the tree; without
+    # one it is the usual missing-argument error, left to ARGSC to report.
+    if [[ $ind_files == True ]] && [[ -z $profile ]] && [[ ${#SRCS[@]} -gt 0 ]]; then
+        srcs_mode=True
+    fi
 }
 
 ARGSC () {
@@ -607,11 +668,15 @@ ARGSC () {
                 ;;
         esac
     done
-    if [[ -z $destflag ]]; then
+    # In srcs mode neither end is a single directory: the source is
+    # $complete_dir itself (remote_dl_dir stays empty, so the join below leaves
+    # it at that) and each entry picks its own destination through
+    # local_dir_for. Anything given explicitly still wins.
+    if [[ -z $destflag ]] && [[ $srcs_mode != True ]]; then
         echo "Please specify desitnation."
         exit 0
     fi
-    if [[ -z $sourceflag ]]; then
+    if [[ -z $sourceflag ]] && [[ $srcs_mode != True ]]; then
         echo "Please specify source."
         exit 0
     fi
@@ -791,6 +856,7 @@ fi
 listfile2="$listfile"2
 listfile3="$listfile"3
 listfile4="$listfile"4
+listfile5="$listfile"5
 oldfile="$listfile"_old
 }
 
@@ -862,6 +928,18 @@ ls_l_cmd () {
     fi
 }
 
+# The data directory listed with its sizes, which is the only place a real one
+# is to be had: in the completed directory the size column is the length of the
+# *symlink*, not of what it points at. --size on its own reports 1 for
+# everything, so -h is not cosmetic here -- it is what makes lftp print a
+# figure at all, at the cost of it being rounded ("4.1G"). Prints nothing when
+# there is nowhere to put it, the way du_cmd does.
+size_cmd () {
+    if [[ -n $listfile5 ]]; then
+        printf 'cls -1 -F -h --size > %s\n' "$(lftp_quote "$listfile5")"
+    fi
+}
+
 CREATE_LIST () {
     # Last run's list, marks and all, is what -c carries into this one; the
     # listing below is about to overwrite it.
@@ -878,6 +956,7 @@ $(ls_l_cmd)
 $(du_cmd)
 cd "$data_dir""$dirname"
 cls -1 > "$listfile2"
+$(size_cmd)
 quit
 EOF
     run_lftp_script "$scriptfile"
@@ -910,6 +989,7 @@ $(ls_l_cmd)
 $(du_cmd)
 cd "$data_dir""$dirname"
 cls -1 > "$listfile2"
+$(size_cmd)
 cd "$remote_dl_dir"
 !env $(child_env) bash $(sh_quote "$self")
 source "$emitfile"
@@ -990,7 +1070,7 @@ NEW_SESSION () {
                 POST_PROCESS
             fi
         fi
-        rm -f "$listfile2" "$listfile3" "$listfile4"
+        rm -f "$listfile2" "$listfile3" "$listfile4" "$listfile5"
     fi
 }
 
@@ -1076,6 +1156,32 @@ FORMAT_LIST () {
     fi
     format_columns "$listfile" "$dufile" > "$tmpfile" && mv "$tmpfile" "$listfile"
     rm -f "$tmpfile"
+}
+
+# srcs mode lists $complete_dir itself, which holds more than the source
+# directories the profile named -- and the profile may name directories that
+# are not there. The listing is cut down to the intersection before anything
+# looks at it, so the tree, $editor and TYPE all agree on what the top level
+# is. The name is recovered exactly the way PRUNE_LIST recovers it.
+SRCS_FILTER () {
+    if [[ $srcs_mode != True ]] || [[ ${#SRCS[@]} -eq 0 ]] || [[ ! -s $listfile ]]; then
+        return 0
+    fi
+    new_tmp "${TMPDIR:-/tmp}/alftp.srcs.XXXXXX"; tui_srcs_keep="$tmpfile_new"
+    printf '%s\n' "${SRCS[@]}" > "$tui_srcs_keep"
+    new_tmp "${TMPDIR:-/tmp}/alftp.srcs.XXXXXX"; tui_srcs_out="$tmpfile_new"
+    awk -v names="$tui_srcs_keep" '
+        BEGIN { while ((getline nm < names) > 0) { keep[nm] = 1 } }
+        {
+            nm = $0
+            sub(/^[-+*#]/, "", nm)
+            sub(/[ \t][ \t]+([^ \t]+[ \t]+)?[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9][ \t]*$/, "", nm)
+            sub(/[ \t]+$/, "", nm)
+            sub(/[\/@*]$/, "", nm)
+            if (nm in keep) { print }
+        }
+    ' "$listfile" > "$tui_srcs_out" && mv "$tui_srcs_out" "$listfile"
+    rm -f "$tui_srcs_keep" "$tui_srcs_out"
 }
 
 # ----------------------------------------------------------------- SYMLINKS --
@@ -1381,7 +1487,10 @@ tui_reset () {
     TUI_NAME=(); TUI_PATH=(); TUI_SIZE=(); TUI_DATE=()
     TUI_DEPTH=(); TUI_PARENT=(); TUI_ISDIR=(); TUI_OPEN=(); TUI_LOADED=()
     TUI_STATE=(); TUI_SELCNT=(); TUI_POS=()
+    TUI_STATUS=(); TUI_LSTAT=(); TUI_ACC=(); TUI_HASKID=()
+    TUI_LPATH=(); TUI_LHAVE=()
     TUI_ORDER=(); TUI_VIS=()
+    tui_statusw=0
     tui_nodes=0; TUI_N=0; tui_nsel=0; tui_nrm=0; tui_ndel=0
 }
 
@@ -1400,6 +1509,12 @@ tui_add_node () {
     TUI_PARENT[tui_new_id]=$4
     TUI_ISDIR[tui_new_id]=$5
     TUI_STATE[tui_new_id]=0
+    TUI_STATUS[tui_new_id]=""
+    TUI_LSTAT[tui_new_id]=""
+    TUI_ACC[tui_new_id]=""
+    TUI_HASKID[tui_new_id]=0
+    TUI_LPATH[tui_new_id]=""
+    TUI_LHAVE[tui_new_id]=0
     TUI_SELCNT[tui_new_id]=0
     TUI_OPEN[tui_new_id]=0
     TUI_LOADED[tui_new_id]=0
@@ -1464,16 +1579,26 @@ tui_load () {
             fi
         done < "$listfile2"
     fi
+    tui_load_sizes
     while IFS=$'\t' read -r tui_nm tui_sz tui_dt; do
         tui_isdir=0
         tui_strip_class "$tui_nm"
         if [[ $tui_nm == */ ]] || [[ -n ${TUI_DIRMAP[$tui_stripped]:-} ]]; then
             tui_isdir=1
         fi
+        # The size the completed directory gives a top-level entry is the
+        # length of the symlink, which is not a fact about the file at all, so
+        # the data directory's own figure replaces it wherever there is one.
+        # Not for a directory, though: there the figure is the size of the
+        # directory entry, and du (--dir-sizes) has already had its say.
+        if (( tui_isdir == 0 )) && [[ -n ${TUI_RSIZE[$tui_stripped]:-} ]]; then
+            tui_sz=${TUI_RSIZE[$tui_stripped]}
+        fi
         tui_add_node "$tui_nm" "$tui_sz" "$tui_dt" -1 "$tui_isdir"
         TUI_ORDER+=("$tui_new_id")
     done < <(tui_parse_listing "$listfile")
     tui_reindex
+    tui_status_scan
     tui_rebuild_vis
     tui_widths
 }
@@ -1494,6 +1619,17 @@ tui_rebuild_vis () {
             continue
         fi
         tui_skipd=-1
+        # "t" hides what is already downloaded. It is a view filter and
+        # nothing more: the tree, the marks and the order are untouched, so
+        # showing them again puts everything back exactly where it was. A
+        # hidden directory takes its subtree with it -- everything under a
+        # complete directory is complete by definition.
+        if (( tui_show_done == 0 )) && [[ ${TUI_STATUS[tui_id]} == c ]]; then
+            if (( TUI_ISDIR[tui_id] == 1 )); then
+                tui_skipd=${TUI_DEPTH[tui_id]}
+            fi
+            continue
+        fi
         TUI_VIS+=("$tui_id")
         if (( TUI_ISDIR[tui_id] == 1 )) && (( TUI_OPEN[tui_id] == 0 )); then
             tui_skipd=${TUI_DEPTH[tui_id]}
@@ -1715,6 +1851,12 @@ tui_toggle () {
 # of: everything below is a real file or directory inside the target.
 tui_mark_remove () {
     tui_node=${TUI_VIS[tui_cur]}
+    # In srcs mode the top level is the source directories themselves, which
+    # are not symlinks and are not this run's to remove.
+    if (( TUI_DEPTH[tui_node] == 0 )) && [[ $srcs_mode == True ]]; then
+        tui_msg="${TUI_NAME[tui_node]} is a source directory, not an entry"
+        return 0
+    fi
     if (( TUI_DEPTH[tui_node] > 0 )); then
         tui_msg="only a top-level entry has a symlink to remove"
         return 0
@@ -1743,6 +1885,10 @@ tui_delete_prompt () {
 
 tui_mark_delete () {
     tui_node=${TUI_VIS[tui_cur]}
+    if (( TUI_DEPTH[tui_node] == 0 )) && [[ $srcs_mode == True ]]; then
+        tui_msg="${TUI_NAME[tui_node]} is a source directory, not an entry"
+        return 0
+    fi
     # Taking the mark off again destroys nothing, so it does not ask.
     if (( TUI_STATE[tui_node] == 3 )); then
         tui_set_state "$tui_node" 0
@@ -1804,11 +1950,236 @@ tui_clear_all () {
     done
 }
 
+# ------------------------------------------------------------------ STATUS --
+# What is already on disk. This is the second of the picker's two state axes:
+# TUI_STATE says what the run will *do* to an entry, TUI_STATUS what is true
+# about it whatever the marks say, and the STATUS column draws the latter.
+#
+# Getting the expected size right is most of the work, because the completed
+# directory does not have it: its size column is the length of the *symlink*
+# ("../../data/TV/notes.nfo" lists as 23 for an 11 byte file), and a server
+# that stats through the link instead reports something else again. So the
+# figures come from $listfile5, a size listing of the data directory, and even
+# there they are rounded -- lftp prints nothing useful for --size unless -h is
+# given too, which buys a figure at the price of it being "4.1G". Every
+# comparison therefore carries the tolerance that rounding forces on it, and
+# anything that cannot be established comes out empty rather than guessed.
+
+# name -> size, from the data directory's own listing ("size name", one entry
+# per line). This is the real size of what is behind each top-level symlink.
+tui_load_sizes () {
+    unset TUI_RSIZE
+    declare -gA TUI_RSIZE=()
+    tui_dusize=0
+    if [[ -n $listfile3 ]] && [[ -s $listfile3 ]]; then
+        tui_dusize=1
+    fi
+    if [[ -z $listfile5 ]] || [[ ! -s $listfile5 ]]; then
+        return 0
+    fi
+    while IFS= read -r tui_scratch || [[ -n $tui_scratch ]]; do
+        tui_scratch=${tui_scratch#"${tui_scratch%%[![:space:]]*}"}
+        tui_sz=${tui_scratch%%[[:space:]]*}
+        tui_nm=${tui_scratch#*[[:space:]]}
+        tui_nm=${tui_nm#"${tui_nm%%[![:space:]]*}"}
+        tui_strip_class "$tui_nm"
+        if [[ -n $tui_stripped ]] && [[ -n $tui_sz ]] && [[ $tui_sz != "$tui_nm" ]]; then
+            TUI_RSIZE[$tui_stripped]=$tui_sz
+        fi
+    done < "$listfile5"
+}
+
+# A size as an lftp listing spells it, in bytes, plus the tolerance its own
+# rounding forces on any comparison: "4.1G" stands for everything from 4.05G to
+# 4.15G, so $tui_tol is a last digit's worth and a match means "within that",
+# never equality. A plain byte count is exact and gets no tolerance at all.
+# $tui_bytes comes back -1 for anything unrecognised, which is the answer that
+# leaves the status empty instead of inventing one.
+tui_size_bytes () {
+    tui_bytes=-1
+    tui_tol=0
+    if [[ ! $1 =~ ^([0-9]+)(\.([0-9]))?([KkMmGgTt]?)$ ]]; then
+        return 0
+    fi
+    tui_num=${BASH_REMATCH[1]}
+    tui_frac=${BASH_REMATCH[3]}
+    case ${BASH_REMATCH[4]} in
+        K|k) tui_unit=1024 ;;
+        M|m) tui_unit=1048576 ;;
+        G|g) tui_unit=1073741824 ;;
+        T|t) tui_unit=1099511627776 ;;
+        *)   tui_unit=1 ;;
+    esac
+    if [[ -z $tui_frac ]]; then
+        tui_bytes=$(( tui_num * tui_unit ))
+        # No decimal at all is a coarser rounding, not a finer one.
+        if (( tui_unit > 1 )); then
+            tui_tol=$(( tui_unit / 2 ))
+        fi
+    else
+        tui_bytes=$(( (tui_num * 10 + tui_frac) * tui_unit / 10 ))
+        tui_tol=$(( tui_unit / 10 ))
+    fi
+}
+
+# The local sizes of everything the check needs one for, in a single du: a fork
+# per entry would be felt on a listing of any size. du gives bytes for a file
+# and a recursive total for a directory, and says nothing at all about a path
+# that is not there.
+tui_local_sizes () {
+    unset TUI_LSIZE
+    declare -gA TUI_LSIZE=()
+    if [[ ${#tui_dulist[@]} -eq 0 ]]; then
+        return 0
+    fi
+    while IFS=$'\t' read -r tui_lbytes tui_lpath; do
+        if [[ -n $tui_lpath ]] && [[ -n $tui_lbytes ]]; then
+            TUI_LSIZE[$tui_lpath]=$tui_lbytes
+        fi
+    done < <(printf '%s\0' "${tui_dulist[@]}" | du -sb --files0-from=- 2> /dev/null)
+}
+
+# Complete, incomplete or unknowable, from the remote size and what is on disk.
+tui_compare_size () {
+    tui_stat=u
+    tui_size_bytes "${TUI_SIZE[$1]}"
+    if (( tui_bytes < 0 )); then
+        return 0
+    fi
+    tui_lbytes=${TUI_LSIZE[${TUI_LPATH[$1]}]:-}
+    if [[ -z $tui_lbytes ]]; then
+        return 0
+    fi
+    if (( tui_lbytes + tui_tol >= tui_bytes )); then
+        tui_stat=c
+    else
+        tui_stat=i
+    fi
+}
+
+# One entry's verdict, in $tui_stat: "c" complete, "i" there but short, "m" not
+# downloaded at all, "u" no way to tell. Only the first two are ever drawn --
+# "m" is an ordinary entry waiting to be fetched and "u" is a question this
+# cannot answer, and both of those are worth nothing in the column.
+#
+# A directory is judged by its children wherever they are loaded, which is the
+# only honest way: the size a listing gives a directory is the size of the
+# directory entry, not of what is in it. Where they are not loaded, --dir-sizes
+# is the one thing that supplies a real total, and without it the answer stays
+# empty. One missing or short child is proof that the directory is incomplete;
+# a child that could not be judged only blocks the verdict "complete".
+tui_status_node () {
+    tui_stat=u
+    if (( TUI_LHAVE[$1] == 0 )); then
+        tui_stat=m
+    elif (( TUI_ISDIR[$1] == 1 )); then
+        if (( TUI_HASKID[$1] == 1 )); then
+            case ${TUI_ACC[$1]} in
+                p) tui_stat=i ;;
+                c) tui_stat=c ;;
+                *) tui_stat=u ;;
+            esac
+        elif (( TUI_LOADED[$1] == 1 )); then
+            # Listed and empty: there is nothing left to fetch.
+            tui_stat=c
+        elif (( TUI_DEPTH[$1] == 0 )) && (( tui_dusize == 1 )); then
+            tui_compare_size "$1"
+        fi
+    else
+        tui_compare_size "$1"
+    fi
+    TUI_LSTAT[$1]=$tui_stat
+    case $tui_stat in
+        c|i) TUI_STATUS[$1]=$tui_stat ;;
+        *)   TUI_STATUS[$1]="" ;;
+    esac
+    tui_p=${TUI_PARENT[$1]}
+    if (( tui_p >= 0 )); then
+        TUI_HASKID[tui_p]=1
+        case $tui_stat in
+            m|i) TUI_ACC[tui_p]=p ;;
+            u)   if [[ ${TUI_ACC[tui_p]} != p ]]; then TUI_ACC[tui_p]=u; fi ;;
+            *)   if [[ -z ${TUI_ACC[tui_p]} ]]; then TUI_ACC[tui_p]=c; fi ;;
+        esac
+    fi
+}
+
+# Fill TUI_STATUS for the whole tree. Two passes: the first works out where
+# each entry would land locally and whether it is there at all, and collects
+# the paths worth a size; the second runs backwards through TUI_ORDER, which
+# puts every child before its parent (children sit directly behind the parent
+# they belong to), so a directory's verdict is folded up out of children that
+# have already been decided.
+tui_status_scan () {
+    tui_dulist=()
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        TUI_ACC[tui_id]=""
+        TUI_HASKID[tui_id]=0
+        tui_strip_class "${TUI_PATH[tui_id]}"
+        local_target_for "$tui_stripped"
+        TUI_LPATH[tui_id]=$target
+        if [[ -e $target ]]; then
+            TUI_LHAVE[tui_id]=1
+        else
+            TUI_LHAVE[tui_id]=0
+            continue
+        fi
+        # A directory judged by its children needs no size of its own, and a
+        # du of it would be a walk of the whole subtree for nothing.
+        if (( TUI_ISDIR[tui_id] == 1 )) \
+           && ( (( TUI_LOADED[tui_id] == 1 )) || (( TUI_DEPTH[tui_id] != 0 )) || (( tui_dusize != 1 )) ); then
+            continue
+        fi
+        tui_dulist+=("$target")
+    done
+    tui_local_sizes
+    for (( tui_i = ${#TUI_ORDER[@]} - 1; tui_i >= 0; tui_i-- )); do
+        tui_status_node "${TUI_ORDER[tui_i]}"
+    done
+    tui_status_width
+}
+
+# The width of the STATUS column, over every node rather than the visible ones
+# so it does not jump about as directories open. Zero means no status is known
+# at all, and the column is left out entirely -- a listing with nothing to say
+# looks exactly as it did before there was a column. Later work writes transfer
+# progress into TUI_STATUS as well, so this is called wherever it changes.
+tui_status_width () {
+    tui_statusw=0
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( ${#TUI_STATUS[tui_id]} > tui_statusw )); then
+            tui_statusw=${#TUI_STATUS[tui_id]}
+        fi
+    done
+}
+
+# "t": show or hide what is already downloaded.
+tui_toggle_done () {
+    if (( tui_statusw == 0 )); then
+        tui_msg="nothing here is known to be downloaded already"
+        return 0
+    fi
+    if (( tui_show_done == 1 )); then
+        tui_show_done=0
+    else
+        tui_show_done=1
+    fi
+    tui_rebuild_vis
+    # Hiding the lot would leave a screen with no cursor on it, which is worse
+    # than the answer the user was after.
+    if (( TUI_N == 0 )); then
+        tui_show_done=1
+        tui_rebuild_vis
+        tui_msg="everything here is already downloaded"
+    fi
+}
+
 # Column widths over every node loaded, indentation included, so the columns
 # stay put when a directory is opened or closed.
 tui_widths () {
     tui_namew=0
     tui_sizew=0
+    tui_datew=0
     for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
         tui_i=$(( TUI_DEPTH[tui_id] * 2 + ${#TUI_NAME[tui_id]} ))
         if (( tui_i > tui_namew )); then
@@ -1817,7 +2188,13 @@ tui_widths () {
         if (( ${#TUI_SIZE[tui_id]} > tui_sizew )); then
             tui_sizew=${#TUI_SIZE[tui_id]}
         fi
+        # DATE was the last column and needed no width of its own; with STATUS
+        # behind it, it does.
+        if (( ${#TUI_DATE[tui_id]} > tui_datew )); then
+            tui_datew=${#TUI_DATE[tui_id]}
+        fi
     done
+    tui_status_width
 }
 
 tui_marker () {
@@ -1863,6 +2240,15 @@ tui_draw () {
     if (( tui_ndel > 0 )); then
         tui_right="$tui_right, $tui_ndel to delete"
     fi
+    # Only worth saying where there is something to hide; a listing with no
+    # STATUS column has no "t" to press either.
+    if (( tui_statusw > 0 )); then
+        if (( tui_show_done == 1 )); then
+            tui_right="$tui_right  completed=T"
+        else
+            tui_right="$tui_right  completed=F"
+        fi
+    fi
     tui_pad=$(( TUI_COLS - ${#tui_left} - ${#tui_right} - 2 ))
     if (( tui_pad < 1 )); then
         tui_fit "$tui_left" $(( TUI_COLS - ${#tui_right} - 3 ))
@@ -1874,7 +2260,12 @@ tui_draw () {
     tui_out="${t_home}${t_rev}${tui_fitted}${t_sgr0}${t_el}"$'\n'
 
     # Column header, lined up with the two-column selection gutter.
-    printf -v tui_line '  %-*s  %*s  %s' "$tui_namew" "NAME" "$tui_sizew" "SIZE" "DATE"
+    if (( tui_statusw > 0 )); then
+        printf -v tui_line '  %-*s  %*s  %-*s  %*s' "$tui_namew" "NAME" \
+            "$tui_sizew" "SIZE" "$tui_datew" "DATE" "$tui_statusw" "STATUS"
+    else
+        printf -v tui_line '  %-*s  %*s  %s' "$tui_namew" "NAME" "$tui_sizew" "SIZE" "DATE"
+    fi
     tui_fit "$tui_line" "$TUI_COLS"
     tui_out+="${t_bold}${tui_fitted}${t_sgr0}${t_el}"$'\n'
 
@@ -1882,10 +2273,19 @@ tui_draw () {
         if (( tui_i < TUI_N )); then
             tui_id=${TUI_VIS[tui_i]}
             tui_marker "$tui_id"
-            printf -v tui_line '%s %*s%-*s  %*s  %s' "$tui_mark" \
-                "$(( TUI_DEPTH[tui_id] * 2 ))" "" \
-                "$(( tui_namew - TUI_DEPTH[tui_id] * 2 ))" "${TUI_NAME[tui_id]}" \
-                "$tui_sizew" "${TUI_SIZE[tui_id]}" "${TUI_DATE[tui_id]}"
+            if (( tui_statusw > 0 )); then
+                printf -v tui_line '%s %*s%-*s  %*s  %-*s  %*s' "$tui_mark" \
+                    "$(( TUI_DEPTH[tui_id] * 2 ))" "" \
+                    "$(( tui_namew - TUI_DEPTH[tui_id] * 2 ))" "${TUI_NAME[tui_id]}" \
+                    "$tui_sizew" "${TUI_SIZE[tui_id]}" \
+                    "$tui_datew" "${TUI_DATE[tui_id]}" \
+                    "$tui_statusw" "${TUI_STATUS[tui_id]}"
+            else
+                printf -v tui_line '%s %*s%-*s  %*s  %s' "$tui_mark" \
+                    "$(( TUI_DEPTH[tui_id] * 2 ))" "" \
+                    "$(( tui_namew - TUI_DEPTH[tui_id] * 2 ))" "${TUI_NAME[tui_id]}" \
+                    "$tui_sizew" "${TUI_SIZE[tui_id]}" "${TUI_DATE[tui_id]}"
+            fi
             tui_fit "$tui_line" "$TUI_COLS"
             if (( tui_i == tui_cur )); then
                 printf -v tui_line '%-*s' "$TUI_COLS" "$tui_fitted"
@@ -1906,11 +2306,11 @@ tui_draw () {
         if [[ -n $tui_msg ]]; then
             tui_line=$tui_msg
         elif (( TUI_COLS >= 100 )); then
-            tui_line="j/k move  M-j/k reorder  space pick  tab open  d unlink  x delete  r/R clear  a/A  q quit"
+            tui_line="j/k move  M-j/k reorder  space pick  tab open  d unlink  x delete  r/R clear  t done  a/A  q quit"
         elif (( TUI_COLS >= 74 )); then
-            tui_line="j/k move  M-j/k order  space pick  tab open  d/x mark  r/R clear  q quit"
+            tui_line="j/k move  M-j/k order  space pick  tab open  d/x mark  r/R clear  t  q quit"
         else
-            tui_line="j/k  M-j/k  space  tab  d  x  r/R  q"
+            tui_line="j/k  M-j/k  space  tab  d  x  r/R  t  q"
         fi
         if (( TUI_N > TUI_ROWS )); then
             printf -v tui_line '%s   %s-%s/%s' "$tui_line" \
@@ -1957,6 +2357,7 @@ tui_key_action () {
         d)                                     tui_action="unlink" ;;
         x|$'\e[3~')                             tui_action=delete ;;
         r)                                     tui_action=clear ;;
+        t)                                     tui_action=showdone ;;
         R)                                     tui_action=clearall ;;
         a)                                     tui_action=all ;;
         A)                                     tui_action=none ;;
@@ -2009,8 +2410,16 @@ tui_fetch () {
     tui_msg="listing ${TUI_NAME[$1]} ..."
     tui_draw
     new_tmp "${TMPDIR:-/tmp}/alftp.sub.XXXXXX"; tui_raw="$tmpfile_new"
+    new_tmp "${TMPDIR:-/tmp}/alftp.subdata.XXXXXX"; tui_rawdata="$tmpfile_new"
     new_tmp "${TMPDIR:-/tmp}/alftp.sublog.XXXXXX"; tui_log="$tmpfile_new"
     new_tmp "${TMPDIR:-/tmp}/alftp.subcmd.XXXXXX"; tui_script="$tmpfile_new"
+    # A directory of symlinks tells the same lie one level down as the top
+    # level does: cls -F marks a symlink "@" whether it points at a file or at
+    # a directory, so the data behind it is listed too and answers the
+    # question the way $listfile2 answers it for the top level. It is listed by
+    # path rather than by cd'ing to it, so a path that is not there costs an
+    # error line in the log and nothing else.
+    link_entry_path "$tui_stripped"
     #DO NOT INDENT CONTENTS
     cat > "$tui_script" << EOF
 $(open_cmd)
@@ -2018,22 +2427,39 @@ $(set_opts)
 cd "$remote_dl_dir"
 cd $(lftp_quote "$tui_stripped")
 cls -1 -F -h --size --date --time-style="%Y-%m-%d %H:%M" > $(lftp_quote "$tui_raw")
+cls -1 $(lftp_quote "$link_path/") > $(lftp_quote "$tui_rawdata")
 quit
 EOF
     tui_msg=""
-    if ! lftp -f "$tui_script" < /dev/null > "$tui_log" 2>&1; then
+    # Only the listing that was asked for decides whether this worked: the
+    # data listing beside it is an extra, and a server that will not give it
+    # leaves the types exactly as they were before.
+    if ! lftp -f "$tui_script" < /dev/null > "$tui_log" 2>&1 && [[ ! -s $tui_raw ]]; then
         tui_msg="could not list ${TUI_NAME[$1]}: $(head -n 1 "$tui_log")"
         if [[ -n ${ALFTP_DEBUG:-} ]]; then
             tui_msg="$tui_msg (script $tui_script)"
         else
-            rm -f "$tui_script" "$tui_raw" "$tui_log"
+            rm -f "$tui_script" "$tui_raw" "$tui_rawdata" "$tui_log"
         fi
         return 1
+    fi
+    unset TUI_SUBDIR
+    declare -gA TUI_SUBDIR=()
+    if [[ -s $tui_rawdata ]]; then
+        while IFS= read -r tui_scratch || [[ -n $tui_scratch ]]; do
+            # Listed by path rather than after a cd, cls answers in full paths,
+            # so only the last component is the name to key on.
+            if [[ $tui_scratch == */ ]]; then
+                tui_scratch=${tui_scratch%/}
+                TUI_SUBDIR[${tui_scratch##*/}]=1
+            fi
+        done < "$tui_rawdata"
     fi
     tui_kidsnew=()
     while IFS=$'\t' read -r tui_nm tui_sz tui_dt; do
         tui_isdir=0
-        if [[ $tui_nm == */ ]]; then
+        tui_strip_class "$tui_nm"
+        if [[ $tui_nm == */ ]] || [[ -n ${TUI_SUBDIR[$tui_stripped]:-} ]]; then
             tui_isdir=1
         fi
         tui_add_node "$tui_nm" "$tui_sz" "$tui_dt" "$1" "$tui_isdir"
@@ -2044,11 +2470,14 @@ EOF
                "${TUI_ORDER[@]:tui_i + 1}")
     TUI_LOADED[$1]=1
     tui_reindex
+    # What was just listed decides this directory's own status as well as its
+    # children's, so the whole tree is re-folded rather than patched.
+    tui_status_scan
     tui_widths
     if (( ${#tui_kidsnew[@]} == 0 )); then
         tui_msg="${TUI_NAME[$1]} is empty"
     fi
-    rm -f "$tui_script" "$tui_raw" "$tui_log"
+    rm -f "$tui_script" "$tui_raw" "$tui_rawdata" "$tui_log"
     return 0
 }
 
@@ -2134,6 +2563,9 @@ tui_loop () {
                 ;;
             clear)
                 tui_clear_mark
+                ;;
+            showdone)
+                tui_toggle_done
                 ;;
             clearall)
                 tui_clear_all
@@ -2349,6 +2781,7 @@ pick_list () {
 # see the same list, with the broken entries already gone.
 EDIT_LIST () {
     FORMAT_LIST
+    SRCS_FILTER
     LOAD_LINKS
     VALIDATE_LINKS
     # After the pruning, so what -c carries over is what is still really there.
@@ -2438,14 +2871,15 @@ POST_PROCESS () {
     if [[ $dry_run == True ]] || [[ $clean == True ]]; then
         return 0
     fi
-    # Downloaded content lands under $local_dl_dir, and the SsS sentinel
-    # stands in for a trailing space in the name.
+    # Where content landed is local_dir_for's question, not $local_dl_dir's:
+    # in srcs mode each source directory answers it differently. The SsS
+    # sentinel stands in for a trailing space in the name.
     while read -r line; do
         if [[ -z $line ]]; then
             continue
         fi
         line=$(echo "$line" | sed 's|SsS$| |')
-        target="$local_dl_dir/$line"
+        local_target_for "$line"
         record_result "$target" "$line"
         if [[ -e $target ]]; then
             apply_perms "$target"
@@ -2456,7 +2890,7 @@ POST_PROCESS () {
             continue
         fi
         line=$(echo "$line" | sed 's|SsS$| |')
-        target="$local_dl_dir/$line"
+        local_target_for "$line"
         record_result "$target" "$line"
         if [[ ! -e $target ]]; then
             continue
@@ -2690,6 +3124,68 @@ set_opts () {
 #set ftp:lang en_US
 #set sftp:charset UTF-8
 
+# Where one entry lands locally. Every ordinary run has a single answer --
+# $local_dl_dir, with the whole selection path under it -- but in srcs mode the
+# first component of the path is a source directory with a dl_dir scheme of its
+# own, and that component is consumed by resolving it: with dl_dir_TV=/mnt/tv,
+# "TV/Rel.One-GRP" lands in /mnt/tv/Rel.One-GRP, and with a general
+# dl_dir=/dl/@profile it lands in /dl/TV/Rel.One-GRP, because @profile is the
+# src here the way it is the profile name elsewhere.
+# Two answers come back: $local_dir, the directory the download is rooted at,
+# and $local_rel, the entry's path below it -- empty when the entry *is* that
+# root, which is what selecting a whole src means. The destination is
+# "$local_dir/$local_rel", or "$local_dir" when $local_rel is empty. The
+# classifier cls -F puts on a name is not part of either.
+local_dir_for () {
+    local_dir="$local_dl_dir"
+    local_rel=${1%[/@*]}
+    if [[ $srcs_mode != True ]]; then
+        return 0
+    fi
+    local_src=${local_rel%%/*}
+    if [[ $local_rel == */* ]]; then
+        local_rel=${local_rel#*/}
+    else
+        local_rel=""
+    fi
+    if [[ -z $local_src ]]; then
+        return 0
+    fi
+    local_var="local_dl_dir_$(profile_var_name "$local_src")"
+    if [[ -n ${!local_var:-} ]]; then
+        local_dir="${!local_var}"
+    fi
+    local_dir=${local_dir//@profile/$local_src}
+}
+
+# The destination of one entry and the directory it has to exist in, in
+# $target and $local_parent, from the two halves local_dir_for hands back.
+local_target_for () {
+    local_dir_for "$1"
+    if [[ -n $local_rel ]]; then
+        target="$local_dir/$local_rel"
+    else
+        target="$local_dir"
+    fi
+    local_parent=${target%/*}
+}
+
+# The same destination as lftp has to be handed it, in $local_out: the
+# directory unquoted and the entry quoted after it, which is how the name
+# (spaces, brackets and all) survives lftp's own parser. A whole src has no
+# name below the directory, and then the directory itself is what is quoted --
+# writing it with an empty name after the slash makes mirror take the source's
+# basename and nest it a second time.
+local_lftp_target () {
+    local_target_for "$1"
+    if [[ -n $local_rel ]]; then
+        line_rel=$(echo "$local_rel" | sed 's/\[/"\["/g')
+        printf -v local_out '%s/"%s"' "$local_dir" "$line_rel"
+    else
+        printf -v local_out '"%s"' "$local_dir"
+    fi
+}
+
 #DOWNLOAD DIRECTORIES
 # mirror -c is what makes a run resumable: it picks a partial transfer up where
 # it stopped, and skips what already matches the remote, so re-running after an
@@ -2712,20 +3208,24 @@ dldr_line () {
         line=$(echo "$rawline" | sed 's/\[/"\["/g')  # and brackets, for lftp's glob
         # A path with a directory in it came from inside an opened directory:
         # it lands under the same structure locally, and its symlink is not
-        # this run's to remove -- only whole top-level entries have one.
-        if [[ $rawline == */* ]]; then
+        # this run's to remove -- only whole top-level entries have one. In
+        # srcs mode nothing at the top level is a symlink either: those are the
+        # source directories themselves, and removing one would take the whole
+        # src with it.
+        if [[ $rawline == */* ]] || [[ $srcs_mode == True ]]; then
             unlink_ok=""
         else
             unlink_ok=1
         fi
+        local_lftp_target "$rawline"
         if [[ $clean == True ]]; then
             echo "rm -f \"$line\"; !echo REMOVED: \"$line\""
         elif [[ $dry_run == True ]]; then
-            echo "mirror -c -P5 --dry-run \"$line\" "$local_dl_dir"/"\"$line\""; !echo DRY-RUN: \"$line\""
+            echo "mirror -c -P5 --dry-run \"$line\" $local_out; !echo DRY-RUN: \"$line\""
         elif [[ $norm == True ]] || [[ -z $unlink_ok ]]; then
-            echo "mirror -c -P5 --log="\"$logfile\"" \"$line\" "$local_dl_dir"/"\"$line\""; !echo COMPLETE: \"$line\""
+            echo "mirror -c -P5 --log="\"$logfile\"" \"$line\" $local_out; !echo COMPLETE: \"$line\""
         else
-            echo "mirror -c -P5 --log="\"$logfile\"" \"$line\" "$local_dl_dir"/"\"$line\"" && rm -f \"$line\""
+            echo "mirror -c -P5 --log="\"$logfile\"" \"$line\" $local_out && rm -f \"$line\""
 	    echo "echo "COMPLETE: \"$line\"""
         fi
 }
@@ -2744,24 +3244,28 @@ dlfl_line () {
             return 0
         fi
         line=$(echo "$rawline" | sed 's/\[/"\["/g')  # and brackets, for lftp's glob
-        if [[ $rawline == */* ]]; then
+        if [[ $rawline == */* ]] || [[ $srcs_mode == True ]]; then
             unlink_ok=""
         else
             unlink_ok=1
         fi
+        local_lftp_target "$rawline"
         if [[ $clean == True ]]; then
             echo "rm -f \"$line\"; !echo REMOVED: \"$line\""
         elif [[ $dry_run == True ]]; then
-            echo "!echo DRY-RUN: pget \"$line\" -o "$local_dl_dir"/\"$line\""
+            echo "!echo DRY-RUN: pget \"$line\" -o $local_out"
         else
-            # pget will not make the directory a nested file has to go in.
-            if [[ $rawline == */* ]]; then
-                echo "!mkdir -p $(sh_quote "$local_dl_dir/${rawline%/*}")"
+            # pget will not make the directory the file has to go in, and that
+            # is any directory but the one the run was pointed at: a nested
+            # path brings its own structure, and in srcs mode the src decides
+            # where the download is rooted in the first place.
+            if [[ $local_parent != "$local_dl_dir" ]]; then
+                echo "!mkdir -p $(sh_quote "$local_parent")"
             fi
             if [[ $norm == True ]] || [[ -z $unlink_ok ]]; then
-                echo "pget -c -n 5 \"$line\" -o "$local_dl_dir"/\"$line\"; !echo COMPLETE: \"$line\""
+                echo "pget -c -n 5 \"$line\" -o $local_out; !echo COMPLETE: \"$line\""
             else
-                echo "pget -c -n 5 \"$line\" -o "$local_dl_dir"/\"$line\" && rm -f \"$line\""
+                echo "pget -c -n 5 \"$line\" -o $local_out && rm -f \"$line\""
                 echo "echo "COMPLETE: \"$line\"""
             fi
         fi

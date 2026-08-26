@@ -14,12 +14,20 @@
 #   $SRV/data/TV/notes.nfo
 #   $SRV/complete/TV/{Rel.One-GRP@,notes.nfo@,broken.link@}
 #   $DL                                    <- local download directory
+#
+# There is a second source directory beside TV, because srcs mode picks from
+# $complete_dir itself and one src would not tell a filtered listing from an
+# unfiltered one. Nothing that names TV explicitly sees it.
+#
+#   $SRV/data/films/Film.One-GRP/film.mkv
+#   $SRV/complete/films/Film.One-GRP@
 
 # Create the fake remote. Sets $SRV (its root) and $DL (the local side).
 srv_setup () {
     SRV=$(mktemp -d "${TMPDIR:-/tmp}/alftp-srv.XXXXXX")
     DL="$SRV/local"
     mkdir -p "$SRV/data/TV/Rel.One-GRP/CD1" "$SRV/complete/TV" "$DL"
+    mkdir -p "$SRV/data/films/Film.One-GRP" "$SRV/complete/films"
     printf 'movie contents\n' > "$SRV/data/TV/Rel.One-GRP/movie.mkv"
     printf 'release info\n'   > "$SRV/data/TV/Rel.One-GRP/release.nfo"
     printf 'part one\n'       > "$SRV/data/TV/Rel.One-GRP/CD1/part1.bin"
@@ -27,6 +35,8 @@ srv_setup () {
     ln -s ../../data/TV/Rel.One-GRP "$SRV/complete/TV/Rel.One-GRP"
     ln -s ../../data/TV/notes.nfo   "$SRV/complete/TV/notes.nfo"
     ln -s ../../data/TV/gone.mkv    "$SRV/complete/TV/broken.link"
+    printf 'film contents\n' > "$SRV/data/films/Film.One-GRP/film.mkv"
+    ln -s ../../data/films/Film.One-GRP "$SRV/complete/films/Film.One-GRP"
 }
 
 srv_teardown () {
@@ -68,6 +78,7 @@ default_server=testsrv
 
 [$(hostname)|localhostname]
 dl_dir='$DL'
+dl_dir_films='$DL/films'
 
 [|testsrv]
 server='file:///'
