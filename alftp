@@ -296,7 +296,8 @@ TUI_DLJOB=(); declare -A TUI_DLSIZE=()
 tui_dl_n=0; tui_dl_order=(); tui_dl_targets=(); tui_dl_j=0; tui_dl_k=0
 tui_dl_slot=0; tui_dl_pos=0; tui_dl_id=0; tui_dl_rc=0; tui_dl_have=0
 tui_dl_exp=-1; tui_dl_bytes=0; tui_dl_pct=0; tui_dl_sz=""; tui_dl_line=""
-tui_dl_poll_last=-1; tui_dl_running=0; tui_dl_queued=0
+tui_dl_poll_last=-1; tui_dl_running=0; tui_dl_queued=0; tui_dl_moved=0
+tui_dl_cur=-1; tui_dl_ask=0
 declare -A TUI_UPD_SUB=(); declare -A TUI_UPD_IDX=(); declare -A TUI_UPD_HAVE=()
 declare -A TUI_DEAD=()
 TUI_NAME=(); TUI_PATH=(); TUI_SIZE=(); TUI_DATE=(); TUI_DEPTH=(); TUI_PARENT=()
@@ -3256,7 +3257,11 @@ tui_dl_prio () {
 # should not, which is one rule covering three things: a queued job starting,
 # a paused job resuming, and a running job that something has been moved above
 # being stopped again to hand its slot over.
+# It runs on every tick, so it costs nothing when nothing has changed: the
+# STATUS column is only re-measured when a job actually started or stopped,
+# which on a listing of any size is the expensive half.
 tui_dl_sched () {
+    tui_dl_moved=0
     tui_dl_prio
     for (( tui_dl_slot = 0; tui_dl_slot < ${#tui_dl_order[@]}; tui_dl_slot++ )); do
         tui_dl_j=${tui_dl_order[tui_dl_slot]}
@@ -3267,16 +3272,19 @@ tui_dl_sched () {
                     TUI_STATUS[${TUI_DLID[tui_dl_j]}]=failed
                     tui_msg="could not start ${TUI_NAME[${TUI_DLID[tui_dl_j]}]}"
                 fi
-                tui_dirty=1
+                tui_dl_moved=1
             fi
         elif [[ ${TUI_DLSTATE[tui_dl_j]} == running ]]; then
             tui_dl_kill "$tui_dl_j"
             TUI_DLSTATE[tui_dl_j]=paused
             TUI_STATUS[${TUI_DLID[tui_dl_j]}]=paused
-            tui_dirty=1
+            tui_dl_moved=1
         fi
     done
-    tui_status_width
+    if (( tui_dl_moved == 1 )); then
+        tui_status_width
+        tui_dirty=1
+    fi
 }
 
 # What has arrived. One du for every running transfer at once rather than a
@@ -3367,8 +3375,10 @@ tui_dl_tick () {
     if (( tui_dl_have == 1 )); then
         tui_status_width
         tui_dirty=1
-        tui_dl_sched
     fi
+    # Every tick, not only after something finished: reordering the list is a
+    # re-prioritisation of the queue, and this is where that takes effect.
+    tui_dl_sched
     if (( SECONDS != tui_dl_poll_last )); then
         tui_dl_poll_last=$SECONDS
         tui_dl_progress
@@ -3405,33 +3415,37 @@ tui_confirm () {
 # put there itself -- whether the destination existed beforehand was recorded
 # when the job was queued, precisely so that a cancellation can never take away
 # something that was already downloaded.
+# $tui_dl_cur rather than the $tui_dl_j every other function here loops on:
+# tui_confirm draws, drawing counts the queue, and counting the queue walks it
+# -- so the job number would not survive the question being asked.
 tui_dl_cancel () {
     tui_node=${TUI_VIS[tui_cur]}
-    tui_dl_j=$(( ${TUI_DLJOB[tui_node]:-0} - 1 ))
-    if (( tui_dl_j < 0 )); then
+    tui_dl_cur=$(( ${TUI_DLJOB[tui_node]:-0} - 1 ))
+    if (( tui_dl_cur < 0 )); then
         tui_msg="${TUI_NAME[tui_node]} is not queued"
         return 0
     fi
-    if ! tui_dl_live "$tui_dl_j"; then
-        tui_msg="${TUI_NAME[tui_node]} is already ${TUI_DLSTATE[tui_dl_j]}"
+    if ! tui_dl_live "$tui_dl_cur"; then
+        tui_msg="${TUI_NAME[tui_node]} is already ${TUI_DLSTATE[tui_dl_cur]}"
         return 0
     fi
     # A job that never got a slot cannot have put anything on disk, so there is
     # nothing to ask about.
-    tui_dl_have=0
-    if [[ ${TUI_DLSTATE[tui_dl_j]} != queued ]]; then
-        tui_dl_have=1
+    tui_dl_ask=0
+    if [[ ${TUI_DLSTATE[tui_dl_cur]} != queued ]] \
+       && (( TUI_DLPRE[tui_dl_cur] == 0 )) \
+       && [[ -e ${TUI_DLTARGET[tui_dl_cur]} ]]; then
+        tui_dl_ask=1
     fi
-    tui_dl_kill "$tui_dl_j"
-    TUI_DLSTATE[tui_dl_j]=cancelled
+    tui_dl_kill "$tui_dl_cur"
+    TUI_DLSTATE[tui_dl_cur]=cancelled
     TUI_STATUS[tui_node]=cancelled
     tui_status_width
     tui_msg="${TUI_NAME[tui_node]} cancelled"
-    if (( tui_dl_have == 1 )) && (( TUI_DLPRE[tui_dl_j] == 0 )) \
-       && [[ -e ${TUI_DLTARGET[tui_dl_j]} ]]; then
+    if (( tui_dl_ask == 1 )); then
         tui_confirm "delete the part of ${TUI_NAME[tui_node]} already downloaded?"
         if [[ $tui_answer == yes ]]; then
-            rm -rf -- "${TUI_DLTARGET[tui_dl_j]}"
+            rm -rf -- "${TUI_DLTARGET[tui_dl_cur]}"
             tui_msg="${TUI_NAME[tui_node]} cancelled and removed"
         else
             tui_msg="${TUI_NAME[tui_node]} cancelled, what arrived is still there"

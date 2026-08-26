@@ -646,6 +646,135 @@ SNIP
     [ "${lines[1]}" = "1 1 running 0%" ]
 }
 
+# Three top-level entries marked by hand: movie.mkv is inside the open
+# directory and comes first in the order, then Rel.Two-GRP, then notes.nfo.
+picked () {
+    cat <<'SNIP'
+    tui_set_state 4 1; tui_set_state 1 1; tui_set_state 2 1
+SNIP
+}
+
+@test "enter queues in list order and starts concurrent_downloads of them" {
+    run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        tui_dl_enqueue
+        states; echo "${TUI_DLPATH[0]} ${TUI_DLPATH[1]} ${TUI_DLPATH[2]}"
+        echo "${TUI_STATUS[4]} ${TUI_STATUS[1]} ${TUI_STATUS[2]}"'
+    [ "${lines[0]}" = "[running running queued]" ]
+    [ "${lines[1]}" = "Rel.One-GRP/movie.mkv Rel.Two-GRP notes.nfo" ]
+    # The one still waiting says so; the two with a login of their own start
+    # at nothing transferred.
+    [ "${lines[2]}" = "0% 0% queued" ]
+}
+
+@test "moving a queued entry above a running one pauses the running one" {
+    run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        tui_dl_enqueue; states
+        tui_cur=5; tui_move_node up; tui_dl_sched
+        states; echo "${TUI_STATUS[1]}"
+        # ... and putting it back gives the slot straight back.
+        tui_cur=4; tui_move_node down; tui_dl_sched; states'
+    [ "${lines[0]}" = "[running running queued]" ]
+    [ "${lines[1]}" = "[running paused running]" ]
+    [ "${lines[2]}" = "paused" ]
+    [ "${lines[3]}" = "[running running paused]" ]
+}
+
+@test "a second enter queues only what was marked since the first" {
+    run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        tui_dl_enqueue; echo "$tui_dl_n"
+        tui_dl_enqueue; echo "$tui_dl_n $tui_msg"
+        tui_set_state 5 1; tui_dl_enqueue; echo "$tui_dl_n ${TUI_DLPATH[3]}"'
+    [ "${lines[0]}" = "3" ]
+    [ "${lines[1]}" = "3 everything marked is already queued" ]
+    [ "${lines[2]}" = "4 Rel.One-GRP/movie.nfo" ]
+}
+
+@test "c takes a queued entry out of the queue and asks nothing" {
+    run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        tui_dl_enqueue
+        tui_cur=5; tui_dl_cancel
+        states; echo "${TUI_STATUS[2]} | $tui_msg | $tui_prompt"'
+    [ "${lines[0]}" = "[running running cancelled]" ]
+    [ "${lines[1]}" = "cancelled | notes.nfo cancelled | " ]
+}
+
+@test "c on an entry that was never queued says so" {
+    run stage "$(tree)"$'\n'"$(fakerun)"'
+        tui_cur=5; tui_dl_cancel; echo "$tui_msg"'
+    [ "$output" = "notes.nfo is not queued" ]
+}
+
+# Cancelling a running transfer may leave part of a release behind. Only what
+# this session put there is ever offered up, and only "Y" takes it.
+@test "cancelling a running transfer offers to delete what it created" {
+    run stage "$(tree)"$'\n'"$(keys)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        local_dl_dir=$(mktemp -d)
+        tui_dl_enqueue
+        mkdir -p "$local_dl_dir/Rel.Two-GRP"; : > "$local_dl_dir/Rel.Two-GRP/part"
+        tui_cur=4; KEYS=(n); tui_dl_cancel
+        echo "kept: $([ -e "$local_dl_dir/Rel.Two-GRP" ] && echo yes || echo no) $tui_msg"
+        TUI_DLSTATE[1]=running; TUI_DLPID[1]=""
+        tui_cur=4; KI=0; KEYS=(Y); tui_dl_cancel
+        echo "gone: $([ -e "$local_dl_dir/Rel.Two-GRP" ] && echo yes || echo no)"
+        rm -rf "$local_dl_dir"'
+    [ "${lines[0]}" = "kept: yes Rel.Two-GRP@ cancelled, what arrived is still there" ]
+    [ "${lines[1]}" = "gone: no" ]
+}
+
+# A destination that was already there when the job was queued is not this
+# session's to remove, however far the transfer got.
+@test "cancelling never offers to delete what was there beforehand" {
+    run stage "$(tree)"$'\n'"$(keys)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        local_dl_dir=$(mktemp -d)
+        mkdir -p "$local_dl_dir/Rel.Two-GRP"
+        tui_dl_enqueue
+        tui_cur=4; KEYS=(Y); tui_dl_cancel
+        echo "$tui_msg | $([ -e "$local_dl_dir/Rel.Two-GRP" ] && echo yes || echo no)"
+        rm -rf "$local_dl_dir"'
+    [ "$output" = "Rel.Two-GRP@ cancelled | yes" ]
+}
+
+@test "progress is a percentage of the expected size, or the bytes themselves" {
+    run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        local_dl_dir=$(mktemp -d)
+        tui_dl_enqueue
+        # 2.7G listed for Rel.Two-GRP is a symlink length, not a size, and it
+        # is a directory besides, so there is no expected figure for it.
+        echo "${TUI_DLEXP[1]}"
+        head -c 2048 /dev/zero > "$local_dl_dir/Rel.Two-GRP"
+        TUI_DLEXP[1]=4096; tui_dl_progress; echo "${TUI_STATUS[1]}"
+        TUI_DLEXP[1]=-1;   tui_dl_progress; echo "${TUI_STATUS[1]}"
+        # A transfer that has reached its (rounded) expected size is still not
+        # done: only the exit status says that.
+        TUI_DLEXP[1]=1024; tui_dl_progress; echo "${TUI_STATUS[1]}"
+        rm -rf "$local_dl_dir"'
+    [ "${lines[0]}" = "-1" ]
+    [ "${lines[1]}" = "50%" ]
+    [ "${lines[2]}" = "2K" ]
+    [ "${lines[3]}" = "99%" ]
+}
+
+@test "a finished transfer is saved as # and everything else as it was" {
+    run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        tui_dl_enqueue
+        TUI_DLSTATE[0]=done; TUI_DLSTATE[1]=failed; TUI_DLSTATE[2]=cancelled
+        tui_save; cut -c1 "$listfile" | tr -d "\n"; echo
+        grep -c . "$listfile"'
+    # Rel.One-GRP holds a selection below it (*), movie.mkv is done (#),
+    # Rel.Two-GRP failed and notes.nfo was cancelled, so both are still "+"
+    # for the parent session to finish.
+    [ "${lines[0]}" = "*#++" ]
+    [ "${lines[1]}" = "4" ]
+}
+
+@test "quitting with transfers in flight says what will be stopped" {
+    run stage "$(tree)"$'\n'"$(keys)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        tui_dl_enqueue
+        tui_draw () { echo "$tui_prompt"; }
+        KEYS=(e); tui_quit_prompt'
+    [[ "$output" == *"2 running and 1 queued will be stopped"* ]]
+}
+
 @test "tab opens a directory and closes it again" {
     run stage "$(tree)"$'\n'"$(keys)"'
         printf -v TAB "\t"
