@@ -9,14 +9,38 @@
 #                     or unset for the UI wherever the terminal supports it
 #    listfile       - where to download list of available files to
 #    logfile        - where lftp mirror writes its transfer log
-#    record         - list of everything that has been successfully downloaded
-#    errors         - where to log errors
-#    verify         - where to store xfer verify logs to verify data once downloaded
+#    lockfile       - one run at a time; this file holds the running pid
+#                     (default /tmp/alftp.lock)
+#    record         - list of everything that has been successfully downloaded,
+#                     one tab-separated "time profile entry status" line per entry
+#                     (default ~/.cache/alftp/alftp.record)
+#    errors         - the same, for entries that did not arrive
+#                     (default ~/.cache/alftp/alftp.errors)
+#    verify         - where checksum=True writes what it verified
+#                     (default ~/.cache/alftp/alftp.verify)
 #    server         - ssh server name
 #    username       - ssh username
 #    port           - ssh port
-#    password       - ssh password
-#    autoUncompress - (True|[unset]) automatically decompress files recursively. Currently only rar supported.
+#    password       - ssh password. If there is no password, no keyfile and no
+#                     gpg_file, alftp asks for one where there is a terminal to ask at
+#    keyfile        - ssh private key for sftp key authentication, instead of a
+#                     password (keyFile= is accepted too)
+#    gpg_file       - path to a gpg-encrypted file of settings (typically just
+#                     'password=...'), decrypted with `gpg --batch --decrypt` at
+#                     startup and evaluated like the rest of the config, so no
+#                     secret has to sit here in plaintext
+#    autoUncompress - (True|False) automatically decompress files recursively.
+#                     Currently only rar supported. Default False; -nu turns it
+#                     off for one run even where this is True
+#    checksum       - (True|False) after each download, write its size and (for a
+#                     single file) its sha256 to $verify. Default False
+#    chmod          - (True|False) apply perms_dirs/perms_files to what was
+#                     downloaded. Default False: content keeps the permissions it
+#                     arrived with
+#    perms_dirs     - three-digit mode for downloaded directories (default 744)
+#    perms_files    - three-digit mode for downloaded files (default 644)
+#    chown          - (True|False) give what was downloaded to $owner. Default False
+#    owner          - user, or user:group, for chown=True
 #    norm           - (True|[unset]) do not remove symlinks when completed
 #    rm_remote      - (True|[unset]) remove files, not just symlinks, once completed
 #    rm_list        - (True|[unset]) remove list file once download is complete
@@ -27,3 +51,9 @@
 #    remote_dl_dir_<profile> - remote directory for that profile only
 # The <profile> suffix is part of a variable name, so characters outside
 # A-Za-z0-9_ become '_' (profile "tv-shows" -> dl_dir_tv_shows). See README.md.
+#
+# NOTE: alftp.src.conf is not a key=value file. Each profile block is eval'd as
+# bash, which is what lets a block contain conditionals -- and also means the
+# file is code, not inert data: anything in it runs with your privileges when
+# alftp starts. Treat it the way you would treat ~/.bashrc, and do not paste
+# profile blocks from anywhere you would not run a script from.

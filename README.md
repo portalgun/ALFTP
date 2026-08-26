@@ -48,6 +48,12 @@ local_dl_dir='~/Downloads/docs/0new'
 
 You'll notice that this is written in bash other than the header.
 The header specifies the argument when calling alftp from command line.
+
+> **`alftp.src.conf` is code, not data.** Each profile block is `eval`'d as bash — that is what
+> lets a block contain the `if` above — so anything in the file runs with your privileges every
+> time alftp starts. Treat it the way you would treat `~/.bashrc`: keep it to yourself
+> (`chmod 600`), and do not paste a profile block from anywhere you would not run a script from.
+
 With this configuration, I can download files/directories from '~/private/data/docs' to '~/Downloads/0new' on host 'dave' by using
 ``` bash
 $ alftp -i docs
@@ -196,6 +202,96 @@ one listing request per subdirectory — before the editor opens. On a directory
 releases that is a moment; on a deep tree it is not. Where a server does report a directory size of
 its own, the `du` total wins, since the server's figure is the size of the directory entry rather
 than of its contents.
+
+## CREDENTIALS
+The password can stay out of the config file. In order of preference:
+
+`keyfile` (or `keyFile`, which is what a hand-written `alftp.src.conf` usually says) points at an
+ssh private key and is passed to lftp as `set sftp:connect-program "ssh -a -x -i <keyfile>"`, for
+sftp key authentication.
+
+`gpg_file` points at a gpg-encrypted file of settings — usually just the one line:
+``` bash
+$ echo 'password=secretpassword' | gpg --encrypt -r you -o ~/.config/alftp/secrets.gpg
+```
+``` bash
+gpg_file="$HOME/.config/alftp/secrets.gpg"
+```
+It is decrypted with `gpg --batch --decrypt` at startup and evaluated exactly the way the rest of
+the config is, so it can carry any setting, not only the password. `--batch` means gpg never takes
+the terminal: an encrypted key has to be unlocked through your agent. Anything that goes wrong —
+no such file, no gpg, no key — stops the run with a message naming the file, rather than falling
+back to whatever credentials happened to be lying around.
+
+Failing all of that, if there is a username, no password and no keyfile, alftp asks for the
+password (`read -s`, nothing echoed) where there is a terminal to ask at. Without one — cron, a
+redirected run — the empty password stands, which is what an anonymous server wants anyway.
+Credentials never appear on a command line: see HOW A RUN CONNECTS below.
+
+## ONE RUN AT A TIME
+A run holds `/tmp/alftp.lock` (set `lockfile` to move it) with its own pid in it, from the moment
+the config checks out until it finishes. A second run that finds a live pid there refuses to start
+and says which process holds it — two runs share one list file and would pick each other's
+selections apart. A lock left behind by a run that was killed is recognised by its pid being gone,
+reported, and taken over.
+
+`Ctrl-C` (or `SIGTERM`/`SIGHUP`) releases the lock, removes the temp files the run created, and
+re-raises the signal, so an interrupted run leaves nothing behind for the next one to trip over.
+
+## PICKING UP WHERE YOU LEFT OFF
+Every run copies the last list file aside before the fresh listing overwrites it. `-c` (or
+`--continue`) reads that copy and starts this run from the selection it holds:
+``` bash
+$ alftp -i docs -c
+```
+Anything you marked last time that is still on the server comes up marked — `+` to download, `-` to
+unlink — anything that has since gone goes with it, and anything new starts unmarked as usual. It
+says how many marks it carried over. Since `mirror -c`/`pget -c` resume rather than restart, that
+makes finishing an interrupted download a matter of running the same command again with `-c`.
+
+`-ns` is the other half of that: it keeps the *previous* list for next time instead of the one this
+run just picked.
+
+## JUST THE LIST
+`-ls` runs everything up to and including the picker, prints the name, size and date of each entry
+you marked, and stops without transferring anything:
+``` bash
+$ alftp -a docs -ls
+```
+
+## AFTER THE DOWNLOAD
+None of this happens unless the config asks for it — what arrives keeps the permissions, owner and
+packaging it came with.
+
+| key | default | |
+| --- | --- | --- |
+| `autoUncompress` | `False` | extract downloaded `.rar` sets (and clean up samples, screens, `.sfv`/`.nfo` and the archives themselves). `-nu` turns it off for one run |
+| `chmod` | `False` | apply the two modes below to what was downloaded |
+| `perms_dirs` | `744` | mode for downloaded directories |
+| `perms_files` | `644` | mode for downloaded files |
+| `chown` | `False` | give what was downloaded to `owner` |
+| `owner` | (unset) | `user` or `user:group` for `chown=True` |
+| `checksum` | `False` | write down what landed (see below) |
+
+Every run also keeps a log of what it did, one tab-separated `time  profile  entry  status` line
+per entry, appended:
+
+| key | default | |
+| --- | --- | --- |
+| `record` | `~/.cache/alftp/alftp.record` | entries that arrived. `-r` suppresses the append |
+| `errors` | `~/.cache/alftp/alftp.errors` | entries that did not |
+| `verify` | `~/.cache/alftp/alftp.verify` | what `checksum=True` wrote down |
+
+Whether an entry arrived is decided locally, by looking for it in the download directory: lftp's own
+output goes to your terminal (and in the single-session path shares it with the picker), so there is
+no success line to read back.
+
+`checksum=True` adds, per entry, the size in bytes and — for a single file — its sha256, so what is
+on disk can be checked later against what was fetched. It deliberately does not compare against the
+size in the listing: the completed directory is full of symlinks, and a server that reports the size
+of the link rather than of the file behind it would make every entry look wrong. lftp's own
+`xfer:verify` is not used either — its `verify-file` helper needs perl modules that are frequently
+missing, and when it fails it takes the transfer down with it.
 
 ## DRY RUN
 To see what a profile would transfer without downloading anything, add `--dry-run` (or `-dr`):
