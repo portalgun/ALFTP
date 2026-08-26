@@ -167,6 +167,7 @@ The far-left column is what will happen to each entry:
 | `x`, `Delete` | mark for deletion — symlink and data both; asks first |
 | `r` / `R` | clear the mark on this entry / on every entry |
 | `t` | show or hide the entries that are already downloaded |
+| `u` | check the remote for changes now |
 | `PgDn` / `PgUp` | move a screen at a time |
 | `0` / `Home`, `G` / `End` | jump to the top / bottom |
 | `a` / `A` | select all / select none — the `-` and `x` marks are left alone |
@@ -221,6 +222,29 @@ rather than guessing:
   a coarse comparison, so it errs towards `i` and opening the directory replaces it with an exact
   answer. Without `--dir-sizes` an unopened directory has no status at all: the size a listing gives
   a directory is the size of the directory entry, which says nothing about its contents.
+
+### Checking the remote for changes
+A listing goes stale while you are picking over it: a release finishes uploading, another one is
+removed. `u` asks the server again without leaving the picker, and `update_interval` in the config
+(in seconds; `0`, the default, is never) does it on a timer.
+
+The check is a background login of its own, so the list stays usable while it runs — you can move
+about, open a directory and change your marks with a check in flight. While one is running the title
+bar carries a turning `[-]` `[\]` `[|]` `[/]`, and that is the only sign of it.
+
+What comes back is merged into the list rather than replacing it. Everything you have done survives:
+
+- an entry that is still there keeps its mark, its status, whether it is open, and **where you put
+  it** if you have reordered the list;
+- an entry that has appeared is added at the end of its sibling group — at the bottom of the list,
+  or at the bottom of the directory it turned up in;
+- an entry that has gone is dropped, **unless you have marked it**, in which case it stays and the
+  footer says how many entries are marked but no longer on the server;
+- a broken symlink that the listing session pruned is not brought back by a check, and one that
+  breaks while you are picking is treated the same way as an entry that has gone.
+
+A check that fails changes nothing at all: the footer says it could not check the remote and the
+list is exactly as it was.
 
 ### Where it lands, and picking up where it left off
 A whole entry mirrors to `<local_dl_dir>/<name>`, as it always has. Anything picked from inside a

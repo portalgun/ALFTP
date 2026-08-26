@@ -99,6 +99,8 @@ What the user picks is a tree. Every node is one index into a set of parallel ar
 
 Selection rules live in `tui_toggle`/`tui_split_ancestor` and are worth reading before changing: a node is selected (state 1) only if no ancestor of it is, so a selected directory means "mirror the whole thing" and its children show `+` by inheritance (`tui_sel_ancestor`) without holding state. Taking one child back out of a whole directory *splits* it — the directory drops to state 0 and every other child is selected in its place — which is what turns one mirror into a list of them. `TUI_SELCNT` counts selected descendants so the `*` marker is O(1) per row rather than a subtree walk per redraw; `tui_set_state` is the only place state changes, precisely so those counters stay right (it maintains `tui_nsel`, `tui_nrm` and `tui_ndel` too).
 
+`u` asks the remote what has changed (`tui_update_now`; see "Checking the remote" below).
+
 The action states are 0 nothing / 1 download `+` / 2 unlink the source symlink `-` / 3 delete the symlink and the data `x`. `d` sets 2 (`tui_mark_remove`, top level only), `x` and `Delete` set 3 (`tui_mark_delete`), `r` clears the entry under the cursor (`tui_clear_mark`) and `R` clears the whole tree (`tui_clear_all`). `a`/`A` deliberately skip anything at state 2 or 3: those are decisions about the remote side, and `R` is the only thing that undoes them wholesale. Note that `tui_clear_subtree` clears *descendants only* — the node itself is a separate `tui_set_state` call.
 
 **Deleting asks first.** `tui_mark_delete` calls `tui_delete_prompt` before it sets state 3, and only `Y` confirms; a cancelled prompt leaves a `$tui_msg` and no mark. Taking the mark off again asks nothing. The prompt is `$tui_prompt` drawn as the footer with the list still behind it, the same mechanism `tui_quit_prompt` uses — it is a single blocking `tui_read_key`, not a loop, so a test drives it with one extra key in `KEYS`.
@@ -107,6 +109,8 @@ The action states are 0 nothing / 1 download `+` / 2 unlink the source symlink `
 
 Things worth knowing before changing it:
 
+- **`tui_loop` does not block for ever.** `tui_read_key` takes `$tui_read_timeout` (set only by `tui_open`, so a caller without a terminal still blocks) and reports in `$TUI_KEYRC` which of the two things happened: `read` answers 1 at EOF and >128 on a timeout, and 2 in `TUI_KEYRC` means "tick", 1 means "the terminal went away". Every caller sets `TUI_KEYRC=1` before calling, so a test's stub that only returns a code still reads as EOF. On a tick the loop runs `tui_tick` and redraws only if `$tui_dirty` says to.
+
 - **Tab costs a login.** `tui_fetch` runs its own `lftp -f` (stdin from `/dev/null`, output to a temp log so it cannot scribble on the screen) because the session that spawned the picker is blocked in its `!`. `TUI_LOADED` means at most one listing per directory per session. A failure sets `$tui_msg` and leaves the directory closed — never fails the run.
 
 - **It must not require `/dev/tty`.** lftp's `!` hands its child the terminal on stdin/stdout but *without* a controlling terminal (`tpgid` is -1), and the single-session path runs the picker exactly there. `tui_open` therefore prefers `/dev/tty` and falls back to fds 0/1; `TUI_IN`/`TUI_OUT` are what the rest of the code reads and writes, and `tui_owns_fd` records whether the fd is ours to close.
@@ -114,6 +118,23 @@ Things worth knowing before changing it:
 - **The order of the columns is `NAME SIZE DATE STATUS`**, and `DATE` gained a width (`tui_datew`) when it stopped being last. Both the header and the rows have a two-branch `printf`: with no status to show, the old three-column form is emitted byte for byte.
 - **Everything starts deselected**, including under `-a`; `a` selects all. `tui_save` writes one line per node that says something, marked `+`/`-`/`x`/`*`/`#`, in `TUI_ORDER` order (which is what carries the priority through to `TYPE`), with nested entries carrying their full relative path — the same format `TYPE` reads and a human can edit, so the two pickers stay interchangeable and `-c`/`-ns` keep working.
 - The pure parts are testable without a terminal: `tui_load`/`tui_save`/`tui_widths`/`tui_key_action`/`tui_move`/`tui_toggle` take their input from globals (`tests/alftp.bats` builds a small tree by hand the way `tui_fetch` would), and `tui_loop` reads keys only through `tui_read_key`, which a test can redefine to pop from an array with `TUI_OUT` pointed at `/dev/null` (see `tests/alftp.bats`). For the parts that do need a terminal — `tput`, `stty`, the alternate screen, escape sequences from real arrow keys — drive the script under a pty (python's `pty` module) rather than trusting it by eye.
+
+## Checking the remote (`tui_tick`, `tui_upd_*`, `update_interval`)
+
+`u` (`tui_update_now`) and the `update_interval` timer both do the same thing: start one background `lftp -f` that re-lists the top level (the completed directory, its `ls -l`, the data directory and its sizes) plus every directory already open in the tree, into temp files from `new_tmp` that are **made once and reused** rather than mktemp'd per check. The generated script sets `cmd:fail-exit yes`, because a `cd` to a directory that has gone otherwise leaves lftp where it was and the listing that follows would describe somewhere else entirely; the top-level listing is written first, so a later command the server will not do costs only itself.
+
+**`tui_tick` is the general idle hook, not an update-specific one.** It fires on every expiry of `tui_read_key`'s timeout — about five times a second, from `tui_loop` and from `tui_quit_prompt`/`tui_delete_prompt`, which read a key of their own — and never while a keystroke is waiting. It may assume the tree is consistent and that it is the only thing running; it must not block, read a key or draw. Setting `tui_dirty=1` is how it asks for the redraw it is not allowed to do itself. Anything that takes time belongs in a background job a later tick reaps, which is what `tui_upd_start`/`tui_upd_reap` are. Transfer polling hangs off the same hook.
+
+The merge (`tui_upd_merge` → `tui_upd_group` per sibling group) is **in place**, because `TUI_ORDER` is download priority and `tui_save` writes it:
+
+- a surviving entry keeps its node — mark, `TUI_STATUS`, open/closed, and its index in `TUI_ORDER` — and takes only the fresh size and date. It also keeps the kind it was listed with: a path, its children and its local status were all built on that answer.
+- a vanished entry is dropped **unless** `TUI_STATE != 0` or `TUI_SELCNT > 0`; the kept ones are counted into `$tui_upd_kept` and named in the footer. Dropping goes through `tui_upd_drop`, which clears each state with `tui_set_state` (so ancestors' counters stay right) and splices out the whole subtree in one go.
+- a new entry is appended at the **end of its sibling group** — the end of `TUI_ORDER` at the top level, `tui_subtree`'s `$tui_r1` inside a directory — which is the only insertion point that keeps a subtree one contiguous run.
+- the group loops use `tui_upd_k`/`tui_upd_m` rather than `tui_i`: `tui_reindex` and `tui_children` are called from inside them and both use `tui_i` themselves.
+- an empty listing is a check that did not work, not a directory that emptied itself, so `tui_upd_group` returns without touching anything. A whole check that failed sets `$tui_msg` and changes nothing.
+- new top-level entries go through `link_is_broken` (factored out of `VALIDATE_LINKS` with `link_load_data`), so a check does not put back a broken symlink the listing session pruned.
+
+`tui_upd_stop` (from `tui_close`) kills a check still in flight. The spinner is `${tui_spin_frames:tui_spin:1}` in the title bar, advanced by the tick.
 
 ## Conventions specific to this script
 
