@@ -55,6 +55,11 @@
 #                     open. 0 is never; "u" checks whatever this says. The check
 #                     is a background login of its own, so the UI stays usable
 #                     while it runs
+#    concurrent_downloads
+#                   - (count, default 2) how many transfers started from the
+#                     terminal UI with "enter" run at once. Each one is a
+#                     background login of its own; the rest wait in the queue,
+#                     in the order the list has them
 #    norm           - (True|[unset]) do not remove symlinks when completed
 #    rm_remote      - (True|[unset]) remove files, not just symlinks, once completed
 #    rm_list        - (True|[unset]) remove list file once download is complete

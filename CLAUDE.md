@@ -101,6 +101,8 @@ Selection rules live in `tui_toggle`/`tui_split_ancestor` and are worth reading 
 
 `u` asks the remote what has changed (`tui_update_now`; see "Checking the remote" below).
 
+`enter` starts the download queue (`tui_dl_*`; see "The download queue" below) and `c` cancels an entry in it. `space` is the only key that toggles a mark.
+
 The action states are 0 nothing / 1 download `+` / 2 unlink the source symlink `-` / 3 delete the symlink and the data `x`. `d` sets 2 (`tui_mark_remove`, top level only), `x` and `Delete` set 3 (`tui_mark_delete`), `r` clears the entry under the cursor (`tui_clear_mark`) and `R` clears the whole tree (`tui_clear_all`). `a`/`A` deliberately skip anything at state 2 or 3: those are decisions about the remote side, and `R` is the only thing that undoes them wholesale. Note that `tui_clear_subtree` clears *descendants only* — the node itself is a separate `tui_set_state` call.
 
 **Deleting asks first.** `tui_mark_delete` calls `tui_delete_prompt` before it sets state 3, and only `Y` confirms; a cancelled prompt leaves a `$tui_msg` and no mark. Taking the mark off again asks nothing. The prompt is `$tui_prompt` drawn as the footer with the list still behind it, the same mechanism `tui_quit_prompt` uses — it is a single blocking `tui_read_key`, not a loop, so a test drives it with one extra key in `KEYS`.
@@ -135,6 +137,27 @@ The merge (`tui_upd_merge` → `tui_upd_group` per sibling group) is **in place*
 - new top-level entries go through `link_is_broken` (factored out of `VALIDATE_LINKS` with `link_load_data`), so a check does not put back a broken symlink the listing session pruned.
 
 `tui_upd_stop` (from `tui_close`) kills a check still in flight. The spinner is `${tui_spin_frames:tui_spin:1}` in the title bar, advanced by the tick.
+
+## The download queue (`TRANSFERS` section, `tui_dl_*`)
+
+`enter` is **not** a synonym for `space` any more: it queues every `+`-marked node, in `TUI_ORDER` order, and the picker becomes a transfer manager. `space` is the only thing that toggles a mark.
+
+Each transfer is its own background `lftp -f` login — the session that spawned the picker is blocked in its `!` — generated with `open_cmd` + `set_opts` + `set cmd:fail-exit yes` + `cd "$remote_dl_dir"` and **the line `dldr_line`/`dlfl_line` would have emitted for that entry**. That reuse is the point: the `&& rm -f` that drops a completed top-level entry's symlink, the srcs-mode rule that a source directory never has one, `--dry-run`, `-do`/`norm` and `-cl`/`clean` all come along without being restated. `cmd:fail-exit` is what makes failure detectable — the lftp exit status is the only thing that says a transfer worked.
+
+**Data model.** Parallel arrays indexed by job number (`TUI_DLID`, `TUI_DLPATH`, `TUI_DLKIND`, `TUI_DLSTATE`, `TUI_DLPID`, `TUI_DLSCRIPT`, `TUI_DLLOG`, `TUI_DLTARGET`, `TUI_DLPRE`, `TUI_DLEXP`), plus `TUI_DLJOB[node]` = job number **+ 1** (0 means none, which is what makes `${...:-0}` safe under `set -u`). A node is queued at most once. States: `queued` / `running` / `paused` are live, `done` / `failed` / `cancelled` are terminal.
+
+**Priority is not stored.** `tui_dl_prio` reads it off `TUI_POS` every time `tui_dl_sched` runs, which is what makes `Alt`+`j`/`k` re-prioritise a queue that is already moving. `tui_dl_sched` is one rule: everything in the first `concurrent_downloads` places should be running, everything outside them should not — which covers starting a queued job, resuming a paused one, and stopping a running one that something was moved above (`paused`; `mirror -c`/`pget -c` resume it). It runs on **every** tick, so it only re-measures the STATUS column when `tui_dl_moved` says something actually changed.
+
+Other things worth knowing:
+
+- **`tui_dl_expected` is deliberately conservative.** A file's listed size is real (`TUI_RSIZE` at the top level, the data listing inside an opened directory); a *directory's* is the directory entry's size, so the only usable total is `TUI_DUSIZE` (`--dir-sizes`). Without one, `TUI_DLEXP` is `-1` and the column shows transferred bytes rather than a percentage. A running transfer never shows more than `99%`: only the exit status says `done`.
+- **`TUI_DLPRE` is what `c` is allowed to delete.** Whether the destination existed is recorded when the job is *queued* — after the transfer starts the answer is always yes. `tui_dl_cancel` offers `rm -rf` on the target only when `TUI_DLPRE` is 0, and only `Y` confirms.
+- **`tui_dl_cancel` uses `tui_dl_cur`, not `tui_dl_j`.** `tui_confirm` draws, `tui_draw` calls `tui_dl_counts`, and that loops on `tui_dl_j` — so the job number would not survive the question being asked.
+- `tui_confirm <text>` is the general footer yes/no; `tui_delete_prompt` is now one call to it.
+- **`tui_dl_status_keep`** stops `tui_status_scan` talking over the queue's strings; a `done` job is the one exception, because `done` and the scan's `c` are the same fact.
+- **`tui_save` writes a `done` entry as `#`** (`tui_dl_saved_done`), so the parent session does not fetch it again. `-`, `x` and anything unfinished are written exactly as before, and both transfer commands resume, so the parent picks up where the picker stopped.
+- `tui_close` calls `tui_dl_stop_all` + `tui_dl_clean`, so quitting, `Ctrl-C` (`tui_abort`) and the terminal going away all stop every login this session started. `tui_quit_prompt` says how many will be stopped before it happens.
+- `file://` transfers **cannot** be slowed down (`xfer:rate-limit` and `net:limit-total-rate` do not apply to the protocol), so the harness can only cover "enter queues it and the files arrive". The state machine is tested in `tests/alftp.bats` with a `sleep` standing in for the login — a real pid, so `kill -0`, `kill -TERM` and `wait` behave.
 
 ## Conventions specific to this script
 

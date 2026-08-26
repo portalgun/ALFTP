@@ -143,7 +143,7 @@ happens in the terminal UI by default, and in `$editor` where the terminal canno
 - Another.Release-GRP/       2.7G  2026-08-23 14:42
 x Old.Release-GRP/           1.4G  2026-08-20 08:11
   notes.nfo                  2.1K  2026-08-22 09:03
- j/k move  M-j/k order  space pick  tab open  d/x mark  r/R clear  q quit
+ j/k  M-j/k  space pick  enter go  c cancel  tab  d/x  r/R  t  u  q quit
 ```
 The far-left column is what will happen to each entry:
 
@@ -160,7 +160,8 @@ The far-left column is what will happen to each entry:
 | key | |
 | --- | --- |
 | `j` / `k`, `↓` / `↑` | move down / up |
-| `space`, `enter` | toggle the entry under the cursor |
+| `space` | toggle the entry under the cursor |
+| `enter` | start downloading everything marked `+` — see *Downloading from the picker* |
 | `tab` | open a directory, or close it again |
 | `Alt`+`j` / `Alt`+`k`, `Alt`+`↓` / `Alt`+`↑` | move the entry itself down / up — the order is the download order |
 | `d` | mark the source symlink for removal (top-level entries only) |
@@ -168,6 +169,7 @@ The far-left column is what will happen to each entry:
 | `r` / `R` | clear the mark on this entry / on every entry |
 | `t` | show or hide the entries that are already downloaded |
 | `u` | check the remote for changes now |
+| `c` | cancel the queued or downloading entry under the cursor |
 | `PgDn` / `PgUp` | move a screen at a time |
 | `0` / `Home`, `G` / `End` | jump to the top / bottom |
 | `a` / `A` | select all / select none — the `-` and `x` marks are left alone |
@@ -198,6 +200,7 @@ in the directory it would land in:
 | --- | --- |
 | `c` | it is there, complete |
 | `i` | it is there, but smaller than the server's copy |
+| `queued` `NN%` `paused` `done` `failed` `cancelled` | a transfer started from the picker — see below |
 | blank | it is not there, or there is no way to tell |
 
 `t` hides every `c` entry so that only what is left to fetch is on screen, and the title bar says
@@ -222,6 +225,43 @@ rather than guessing:
   a coarse comparison, so it errs towards `i` and opening the directory replaces it with an exact
   answer. Without `--dir-sizes` an unopened directory has no status at all: the size a listing gives
   a directory is the size of the directory entry, which says nothing about its contents.
+
+### Downloading from the picker
+`enter` starts downloading. Everything marked `+` at that moment is queued, top of the list first —
+the order you put them in is the order they are fetched — and the `STATUS` column follows each one
+through:
+
+| status | |
+| --- | --- |
+| `queued` | waiting for a free slot |
+| `NN%` | transferring; `NN` is how much of it is on disk |
+| `12M` | transferring, where there is no reliable size to compare against — how much has arrived |
+| `paused` | started, then stopped again to let something you moved above it go first |
+| `done` | finished |
+| `failed` | the transfer did not finish; the footer says what lftp reported |
+| `cancelled` | you pressed `c` |
+
+`concurrent_downloads` in the config (default `2`) is how many run at once; the rest wait. Each
+transfer is a login of its own — the session that opened the picker is sitting in its `!` waiting for
+you, so it cannot do the transferring — running the same `mirror -c` / `pget -c` the run would have
+used, symlink removal and all. Marks you make *after* pressing `enter` are not queued until you press
+it again, so `enter` is a decision rather than a mode.
+
+**Reordering re-prioritises.** `Alt`+`j`/`Alt`+`k` on a queued entry moves it up the queue, and if
+that pushes a running transfer out of the top `concurrent_downloads` places, the running one stops
+and shows `paused`. It resumes where it left off when it gets a slot back — `mirror -c` and `pget -c`
+make that free. An entry that is already `done` is not affected by being moved.
+
+**`c` cancels** the entry under the cursor, queued or running. If cancelling stopped a transfer that
+had already put files on disk, alftp asks whether to delete them, and only `Y` deletes. It will only
+ever offer to delete what *this session* created: whether the destination existed before the transfer
+started is recorded when the entry is queued, so a release you had already downloaded is never at
+risk.
+
+**Quitting stops what is still running**, and says how much that is before it does. What has finished
+is written to the list file as `#` so the run that follows does not fetch it a second time; anything
+queued, paused, cancelled or failed is written as it always was, so the run finishes the job — and
+because both transfers resume, it picks up exactly where the picker left off.
 
 ### Checking the remote for changes
 A listing goes stale while you are picking over it: a release finishes uploading, another one is

@@ -635,3 +635,33 @@ SNIP
     # The check still landed: the footer says what it found.
     grep -q 'checked:' "$SRV/frames"
 }
+
+# Enter downloads from inside the picker. Everything about a file:// transfer
+# is instantaneous -- xfer:rate-limit does not apply to the protocol, so there
+# is no way to catch one part-finished -- which makes this the end-to-end case
+# only: the queue's own state machine is tested in tests/alftp.bats, where a
+# transfer can be held still.
+@test "enter downloads the marked entry without leaving the picker" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    # space marks the release, enter queues it, two redraws give the transfer
+    # a moment to finish and be reaped, then quit without saving -- so what is
+    # on disk afterwards can only have come from the picker's own login.
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\x20 \r \x0c \x0c q e' --delay 0.6 -- "$ALFTP" -i TV -t -nu
+    [[ "$output" == *"queued 1 entry"* ]]
+    [[ "$output" == *"done"* ]]
+    [[ "$output" == *"nothing selected"* ]]
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+    [ -f "$DL/Rel.One-GRP/CD1/part1.bin" ]
+    # The transfer carried its "&& rm -f" with it, the way the emitters' would.
+    [ ! -e "$SRV/complete/TV/Rel.One-GRP" ]
+    # Nothing else was touched.
+    [ ! -e "$DL/notes.nfo" ]
+    [ -L "$SRV/complete/TV/notes.nfo" ]
+}
