@@ -667,7 +667,9 @@ SNIP
         --keys '\x20 \r \x0c \x0c q e' --delay 0.6 -- "$ALFTP" -i TV -t -nu
     [[ "$output" == *"queued 1 entry"* ]]
     [[ "$output" == *"done"* ]]
-    [[ "$output" == *"nothing selected"* ]]
+    # Everything marked was transferred, so quitting had nothing to ask about
+    # and says what actually happened rather than claiming a saved selection.
+    [[ "$output" == *"1 transfer(s) completed"* ]]
     [ -f "$DL/Rel.One-GRP/movie.mkv" ]
     [ -f "$DL/Rel.One-GRP/CD1/part1.bin" ]
     # The transfer carried its "&& rm -f" with it, the way the emitters' would.

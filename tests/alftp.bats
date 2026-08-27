@@ -921,7 +921,9 @@ SNIP
     run stage "$(tree)"$'\n'"$(keys)"'
         KEYS=(x Y x q e); tui_loop; marks; echo "$tui_ndel $tui_result"'
     [ "${lines[0]}" = "[      ]" ]
-    [ "${lines[1]}" = "0 exit" ]
+    # The mark came off, so there is nothing left to save and quitting asks the
+    # one question rather than three; "q" confirms it.
+    [ "${lines[1]}" = "0 save" ]
 }
 
 @test "Delete marks the same way x does" {
@@ -2023,4 +2025,57 @@ SNIP
     [ "${#screen[@]}" -eq 12 ]
     [[ "${screen[10]}" == *"0 selected"* ]]
     [[ "${screen[11]}" == *"really? (Y/n)"* ]]
+}
+
+@test "quitting only offers to save when saving would do something" {
+    # Nothing marked: there is nothing to save and nothing to abandon, so the
+    # three-way dialog has no question in it. "q" confirms.
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(q); tui_quit_prompt
+        echo "simple=$tui_quit_simple answer=$tui_answer"'
+    [ "$output" = "simple=1 answer=save" ]
+
+    # Something marked and not downloaded: the choice is real again, and "q"
+    # keeps its old meaning of leaving without downloading.
+    run stage "$(tree)"$'\n'"$(keys)"'
+        tui_cur=0; tui_toggle
+        KEYS=(q); tui_quit_prompt
+        echo "simple=$tui_quit_simple answer=$tui_answer"'
+    [ "$output" = "simple=0 answer=exit" ]
+}
+
+@test "an entry already downloaded does not count as something to save" {
+    run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        tui_dl_enqueue
+        tui_pending && echo "pending-before" || echo "nothing-before"
+        # Mark every queued transfer finished, the way tui_dl_reap would.
+        for (( j = 0; j < tui_dl_n; j++ )); do
+            TUI_DLSTATE[j]=done; TUI_STATUS[${TUI_DLID[j]}]=done
+        done
+        tui_pending && echo "pending-after" || echo "nothing-after"'
+    # Marked and unfinished is something to save; marked and finished is not.
+    [ "${lines[0]}" = "pending-before" ]
+    [ "${lines[1]}" = "nothing-after" ]
+}
+
+@test "an empty listing still opens, and its keys do nothing rather than break" {
+    listfile=$(mktemp); listfile2=$(mktemp)
+    : > "$listfile"; : > "$listfile2"
+    run stage 'exec {TUI_OUT}>/dev/null
+        listfile="'"$listfile"'"; listfile2="'"$listfile2"'"; listfile5=""
+        tui_load
+        TUI_LINES=10; TUI_COLS=60; tui_rows_calc; remote_dl_dir=/remote
+        KI=0
+        tui_read_key () {
+            if (( KI >= ${#KEYS[@]} )); then return 1; fi
+            TUI_KEY=${KEYS[KI]}; KI=$(( KI + 1 )); return 0
+        }
+        printf -v TAB "\t"
+        # Every key that wants the entry under the cursor, with no cursor.
+        KEYS=(j k " " "$TAB" d x r G 0 q q); tui_loop
+        echo "N=$TUI_N cur=$tui_cur result=$tui_result"'
+    rm -f "$listfile" "$listfile2"
+    [ "$status" -eq 0 ]
+    # It ran to the quit rather than falling over on an empty array.
+    [ "$output" = "N=0 cur=0 result=save" ]
 }

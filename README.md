@@ -183,7 +183,11 @@ The far-left column is what will happen to each entry:
 | `a` / `A` | select all / select none — the `-` and `x` marks are left alone |
 | `q` / `Esc` | quit, which asks first |
 
-`q` asks `(c)ancel`, `(s)ave and download`, or `(e)xit without downloading`. Cancel puts you back in
+`q` asks `(c)ancel`, `(s)ave and download`, or `(e)xit without downloading` — but only when there
+is something to decide. If nothing is marked, or everything marked has already been transferred
+from inside the picker, saving and not saving amount to the same thing, so it just asks
+`(c)ancel` or `(q)uit`. An empty listing opens the picker as usual rather than dropping you back
+at the shell: `u` can ask the remote again from in there. Cancel puts you back in
 the list; save writes your selection to the list file and the download starts; exit leaves the list
 file empty, so nothing is downloaded and the run ends. `Ctrl-C` does the same as exit.
 

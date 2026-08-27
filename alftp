@@ -244,7 +244,7 @@ tui_open_flag=0
 tui_namew=0; tui_sizew=0; tui_pathw=0; tui_namefld=0; tui_metaw=0
 tui_sizedw=0; tui_datedw=0; tui_statusdw=0
 tui_hsz=""; tui_hu=1; tui_hs=""; tui_hw=0; tui_hf=0
-tui_bar=""
+tui_bar=""; tui_quit_simple=0; tui_donecnt=0
 tui_saved_stty=""
 tui_saved_int=""; tui_saved_term=""; tui_saved_winch=""
 tui_nodes=0; tui_new_id=0; tui_stripped=""; tui_mark=""; tui_anc=-1
@@ -2658,11 +2658,12 @@ tui_move () {
         pgup)   tui_cur=$(( tui_cur - TUI_ROWS )) ;;
         pgdn)   tui_cur=$(( tui_cur + TUI_ROWS )) ;;
     esac
-    if (( tui_cur < 0 )); then
-        tui_cur=0
-    fi
     if (( tui_cur > TUI_N - 1 )); then
         tui_cur=$(( TUI_N - 1 ))
+    fi
+    # Last, not first: with an empty listing the clamp above sets -1.
+    if (( tui_cur < 0 )); then
+        tui_cur=0
     fi
     tui_scroll
 }
@@ -4289,8 +4290,33 @@ tui_toggle_open () {
 
 # q asks before it does anything irreversible. Drawn as the footer of the
 # normal screen, so the list stays visible behind the question.
+# Whether saving would ask the parent session to do anything at all: an entry
+# still marked for download that this session did not already finish, or any
+# unlink or delete. When there is nothing, quitting is just quitting -- there is
+# no choice to offer between saving and not, and the three-way dialog only asks
+# the user to think about a distinction that has no effect.
+tui_pending () {
+    if (( tui_nrm > 0 )) || (( tui_ndel > 0 )); then
+        return 0
+    fi
+    for tui_id in ${TUI_ORDER[@]+"${TUI_ORDER[@]}"}; do
+        if (( TUI_STATE[tui_id] == 1 )) && ! tui_dl_saved_done "$tui_id"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 tui_quit_prompt () {
-    tui_prompt="quit: (c)ancel   (s)ave and download   (e)xit without downloading"
+    tui_quit_simple=0
+    if tui_pending; then
+        tui_prompt="quit: (c)ancel   (s)ave and download   (e)xit without downloading"
+    else
+        # Nothing marked that is not already done, so there is nothing to save
+        # and nothing to abandon: ask the one question that is left.
+        tui_quit_simple=1
+        tui_prompt="quit: (c)ancel   (q)uit"
+    fi
     # Leaving stops every transfer that has not finished, which is worth saying
     # before it happens rather than after.
     if tui_dl_busy; then
@@ -4309,11 +4335,21 @@ tui_quit_prompt () {
             tui_answer="exit"
             break
         fi
-        case $TUI_KEY in
-            c|C|$'\e')     tui_answer=cancel ;;
-            s|S)           tui_answer=save ;;
-            e|E|q|Q)       tui_answer="exit" ;;
-        esac
+        if (( tui_quit_simple == 1 )); then
+            # Quitting here writes the listing back rather than emptying it:
+            # with nothing left to carry out the two are the same to the parent
+            # session, and the list is worth more kept than thrown away.
+            case $TUI_KEY in
+                c|C|$'\e')            tui_answer=cancel ;;
+                q|Q|y|Y|e|E|$'\n'|$'\r') tui_answer=save ;;
+            esac
+        else
+            case $TUI_KEY in
+                c|C|$'\e')     tui_answer=cancel ;;
+                s|S)           tui_answer=save ;;
+                e|E|q|Q)       tui_answer="exit" ;;
+            esac
+        fi
     done
     tui_prompt=""
 }
@@ -4354,6 +4390,17 @@ tui_loop () {
         done
         tui_msg=""
         tui_key_action "$TUI_KEY"
+        # Everything here reads the entry under the cursor, and with an empty
+        # listing there is no cursor to read: TUI_VIS has no element to index.
+        # The listing being empty is a normal state now -- "u" is the way out of
+        # it -- so these simply do nothing rather than being unreachable.
+        if (( TUI_N == 0 )); then
+            case $tui_action in
+                toggle|cancelxfer|open|movedn|moveup|unlink|delete|clear)
+                    tui_action=ignore
+                    ;;
+            esac
+        fi
         case $tui_action in
             up|down|top|bottom|pgup|pgdn)
                 tui_move
@@ -4595,10 +4642,9 @@ tui_select () {
     if [[ $continue_prev == True ]]; then
         tui_apply_marks
     fi
-    if (( TUI_N == 0 )); then
-        echo "alftp: the listing is empty, nothing to pick."
-        return 0
-    fi
+    # An empty listing is still worth opening: "u" can ask the remote again
+    # from in here, and being shown an empty directory is a better answer than
+    # being dropped back at the shell with a line of text.
     if ! tui_open; then
         tui_why="cannot open the terminal"
         return 1
@@ -4608,14 +4654,33 @@ tui_select () {
     tui_close
     if [[ $tui_result == save ]]; then
         tui_save
-        tui_scratch="alftp: saved $tui_nsel selection(s)"
-        if (( tui_nrm > 0 )); then
-            tui_scratch="$tui_scratch, $tui_nrm unlink(s)"
+        if tui_pending; then
+            tui_scratch="alftp: saved $tui_nsel selection(s)"
+            if (( tui_nrm > 0 )); then
+                tui_scratch="$tui_scratch, $tui_nrm unlink(s)"
+            fi
+            if (( tui_ndel > 0 )); then
+                tui_scratch="$tui_scratch, $tui_ndel deletion(s)"
+            fi
+            echo "$tui_scratch to $listfile."
+        else
+            # Nothing for the parent session to carry out. Say which kind of
+            # nothing it is, rather than claiming a selection was saved when
+            # what was saved is a list of things already done.
+            tui_donecnt=0
+            for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
+                if [[ ${TUI_DLSTATE[tui_dl_j]} == "done" ]]; then
+                    tui_donecnt=$(( tui_donecnt + 1 ))
+                fi
+            done
+            if (( tui_donecnt > 0 )); then
+                echo "alftp: $tui_donecnt transfer(s) completed, nothing left to download."
+            elif (( TUI_N == 0 )); then
+                echo "alftp: the listing is empty, nothing to pick."
+            else
+                echo "alftp: nothing selected."
+            fi
         fi
-        if (( tui_ndel > 0 )); then
-            tui_scratch="$tui_scratch, $tui_ndel deletion(s)"
-        fi
-        echo "$tui_scratch to $listfile."
     else
         : > "$listfile"
         echo "alftp: nothing selected."
