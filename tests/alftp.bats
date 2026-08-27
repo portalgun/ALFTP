@@ -773,7 +773,9 @@ SNIP
         rm -rf "$local_dl_dir"'
     [ "${lines[0]}" = "-1" ]
     [ "${lines[1]}" = "50%" ]
-    [ "${lines[2]}" = "2K" ]
+    # Human sizes are written the way lftp's -h and ls -h write them, so a
+    # directory's byte count in this column reads like the sizes beside it.
+    [ "${lines[2]}" = "2.0K" ]
     [ "${lines[3]}" = "99%" ]
 }
 
@@ -1892,4 +1894,40 @@ SNIP
         tui_draw > /dev/null 2>&1
         tui_fit "${TUI_NAME[0]}" "$tui_namefld"; echo "${#tui_fitted} <= $tui_namefld"'
     [ "${lines[0]}" = "$(echo "${lines[0]}" | awk -F" <= " "{print (\$1 <= \$2) ? \$0 : \"OVERFLOW\"}")" ]
+}
+
+@test "byte counts are written the way the listing writes them" {
+    run stage 'for b in 11 999 1500 2048 4000000 4123456789 45000000000; do
+                   tui_human "$b"; printf "%s " "$tui_hsz"
+               done; echo'
+    # One decimal below ten of a unit and none above, matching "cls -h", so a
+    # size the walk counted exactly sits in the SIZE column looking like every
+    # other size rather than like a raw number.
+    [ "$output" = "11 999 1.4K 2.0K 3.8M 3.8G 41G " ]
+}
+
+@test "a directory's total is shown humanised but compared exactly" {
+    run stage "$(tree)"'
+        remote_dl_dir=/complete/TV; data_dir=/data/; dirname=TV
+        TUI_RECKIDS[/data/TV/Rel.One-GRP]="CD1"
+        TUI_RECSIZE[/data/TV/Rel.One-GRP]=4000000
+        tui_rec_sizes
+        echo "shown=${TUI_SIZE[0]} exact=${TUI_DUSIZE[Rel.One-GRP]}"'
+    # The SIZE column gets 3.8M; the arithmetic keeps every byte, because the
+    # completeness check and the download percentage both divide by it.
+    [ "$output" = "shown=3.8M exact=4000000" ]
+}
+
+@test "a nested directory gets a percentage, not a byte count" {
+    run stage "$(tree)"'
+        remote_dl_dir=/complete/TV; data_dir=/data/; dirname=TV
+        # node 3 is CD1/, one level down, which has no du entry of its own.
+        TUI_RECSIZE[/data/TV/Rel.One-GRP/CD1]=4000000
+        tui_dl_expected 3; echo "nested=$tui_dl_exp"
+        unset "TUI_RECSIZE[/data/TV/Rel.One-GRP/CD1]"
+        tui_dl_expected 3; echo "without=$tui_dl_exp"'
+    # With the walk's figure it can show a percentage; without it, -1 means
+    # "show the bytes transferred instead", which is the old behaviour.
+    [ "${lines[0]}" = "nested=4000000" ]
+    [ "${lines[1]}" = "without=-1" ]
 }

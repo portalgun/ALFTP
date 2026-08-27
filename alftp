@@ -243,6 +243,7 @@ tui_cur=0; tui_top=0; tui_nsel=0; tui_nrm=0; tui_ndel=0; tui_resized=0
 tui_open_flag=0
 tui_namew=0; tui_sizew=0; tui_pathw=0; tui_namefld=0; tui_metaw=0
 tui_sizedw=0; tui_datedw=0; tui_statusdw=0
+tui_hsz=""; tui_hu=1; tui_hs=""; tui_hw=0; tui_hf=0
 tui_saved_stty=""
 tui_saved_int=""; tui_saved_term=""; tui_saved_winch=""
 tui_nodes=0; tui_new_id=0; tui_stripped=""; tui_mark=""; tui_anc=-1
@@ -2106,6 +2107,31 @@ tui_load_sizes () {
 # never equality. A plain byte count is exact and gets no tolerance at all.
 # $tui_bytes comes back -1 for anything unrecognised, which is the answer that
 # leaves the status empty instead of inventing one.
+# Bytes to the same shape lftp's "cls -h" gives them, so a directory total the
+# walk counted exactly reads like the sizes beside it rather than like a raw
+# number -- which, next to a human-readable byte count in the STATUS column,
+# looked like the two columns had been swapped. One decimal below ten of a
+# unit, none above, and anything under a kilobyte as itself.
+tui_human () {
+    if (( $1 >= 1073741824 )); then
+        tui_hu=1073741824; tui_hs=G
+    elif (( $1 >= 1048576 )); then
+        tui_hu=1048576; tui_hs=M
+    elif (( $1 >= 1024 )); then
+        tui_hu=1024; tui_hs=K
+    else
+        printf -v tui_hsz '%d' "$1"
+        return 0
+    fi
+    tui_hw=$(( $1 / tui_hu ))
+    if (( tui_hw < 10 )); then
+        tui_hf=$(( ($1 % tui_hu) * 10 / tui_hu ))
+        printf -v tui_hsz '%d.%d%s' "$tui_hw" "$tui_hf" "$tui_hs"
+    else
+        printf -v tui_hsz '%d%s' "$tui_hw" "$tui_hs"
+    fi
+}
+
 tui_size_bytes () {
     tui_bytes=-1
     tui_tol=0
@@ -3439,7 +3465,14 @@ tui_rec_sizes () {
         if [[ -z ${TUI_RECKIDS[$link_path]+x} ]] || [[ -z $tui_rec_sz ]]; then
             continue
         fi
-        TUI_SIZE[tui_rec_id]=$tui_rec_sz
+        # Displayed the way every other size is; TUI_DUSIZE keeps the exact
+        # count, which is what the comparisons want.
+        if [[ $tui_rec_sz =~ ^[0-9]+$ ]]; then
+            tui_human "$tui_rec_sz"
+            TUI_SIZE[tui_rec_id]=$tui_hsz
+        else
+            TUI_SIZE[tui_rec_id]=$tui_rec_sz
+        fi
         if (( TUI_DEPTH[tui_rec_id] == 0 )); then
             tui_strip_class "${TUI_NAME[tui_rec_id]}"
             TUI_DUSIZE[$tui_stripped]=$tui_rec_sz
@@ -3743,15 +3776,8 @@ tui_dl_counts () {
 # expected size is known and a percentage would be an invention, so it is the
 # transferred figure itself and nothing more.
 tui_dl_human () {
-    if (( $1 >= 1073741824 )); then
-        printf -v tui_dl_sz '%dG' $(( $1 / 1073741824 ))
-    elif (( $1 >= 1048576 )); then
-        printf -v tui_dl_sz '%dM' $(( $1 / 1048576 ))
-    elif (( $1 >= 1024 )); then
-        printf -v tui_dl_sz '%dK' $(( $1 / 1024 ))
-    else
-        printf -v tui_dl_sz '%dB' "$1"
-    fi
+    tui_human "$1"
+    tui_dl_sz=$tui_hsz
 }
 
 # How big the entry is expected to be locally once it has arrived, in
@@ -3763,11 +3789,19 @@ tui_dl_human () {
 tui_dl_expected () {
     tui_dl_exp=-1
     if (( TUI_ISDIR[$1] == 1 )); then
-        if ! tui_has_du "$1"; then
+        # The walk counts every directory it covered, at any depth and to the
+        # byte, so a nested directory gets a real percentage too instead of
+        # falling back to a byte count that reads like a size.
+        tui_strip_class "${TUI_PATH[$1]}"
+        link_entry_path "$tui_stripped"
+        if [[ -n ${TUI_RECSIZE[$link_path]:-} ]]; then
+            tui_size_bytes "${TUI_RECSIZE[$link_path]}"
+        elif tui_has_du "$1"; then
+            tui_strip_class "${TUI_NAME[$1]}"
+            tui_size_bytes "${TUI_DUSIZE[$tui_stripped]}"
+        else
             return 0
         fi
-        tui_strip_class "${TUI_NAME[$1]}"
-        tui_size_bytes "${TUI_DUSIZE[$tui_stripped]}"
     else
         tui_size_bytes "${TUI_SIZE[$1]}"
     fi
