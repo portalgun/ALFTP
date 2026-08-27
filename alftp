@@ -265,6 +265,7 @@ tui_srcs_out=""
 TUI_STATUS=(); TUI_LSTAT=(); TUI_ACC=(); TUI_HASKID=()
 TUI_LPATH=(); TUI_LHAVE=()
 declare -A TUI_RSIZE=(); declare -A TUI_LSIZE=(); declare -A TUI_DUSIZE=()
+declare -A TUI_LALLOC=(); tui_lalloc=""
 tui_chain=(); tui_kids=(); tui_kidsnew=()
 
 # The check for remote changes. It is a background lftp writing fresh listings
@@ -2174,6 +2175,38 @@ tui_local_sizes () {
             TUI_LSIZE[$tui_lpath]=$tui_lbytes
         fi
     done < <(printf '%s\0' "${tui_dulist[@]}" | du -sb --files0-from=- 2> /dev/null)
+    # And what is actually on disk, which for an interrupted chunked download
+    # is a great deal less than what it claims: pget -n writes its chunks at
+    # their own offsets, so the file reaches its full apparent size long before
+    # the data is there, and comparing that against the remote size would call
+    # a mostly-empty file complete. See tui_local_short.
+    unset TUI_LALLOC
+    declare -gA TUI_LALLOC=()
+    while IFS=$'\t' read -r tui_lbytes tui_lpath; do
+        if [[ -n $tui_lpath ]] && [[ -n $tui_lbytes ]]; then
+            TUI_LALLOC[$tui_lpath]=$tui_lbytes
+        fi
+    done < <(printf '%s\0' "${tui_dulist[@]}" | du -s --block-size=1 --files0-from=- 2> /dev/null)
+}
+
+# Whether what is on disk is so far short of what the entry claims that it can
+# only be a transfer that has not finished. Deliberately a wide margin rather
+# than an exact comparison: a filesystem that compresses stores a complete file
+# in less space than it takes up, and calling a finished download incomplete is
+# a worse answer than letting a nearly-finished one through -- mirror -c and
+# pget -c both cost nothing on a file that turns out to be complete after all.
+tui_local_short () {
+    tui_lalloc=${TUI_LALLOC[$1]:-}
+    if [[ -z $tui_lalloc ]] || [[ ! $tui_lalloc =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if (( $2 <= 0 )); then
+        return 1
+    fi
+    if (( tui_lalloc < $2 / 10 * 9 )); then
+        return 0
+    fi
+    return 1
 }
 
 # Whether a directory has a recursive total to be judged against. Only the top
@@ -2208,7 +2241,8 @@ tui_compare_size () {
     if [[ -z $tui_lbytes ]]; then
         return 0
     fi
-    if (( tui_lbytes + tui_tol >= tui_bytes )); then
+    if (( tui_lbytes + tui_tol >= tui_bytes )) \
+       && ! tui_local_short "${TUI_LPATH[$1]}" "$tui_bytes"; then
         tui_stat=c
     else
         tui_stat=i
@@ -3979,11 +4013,22 @@ tui_dl_sched () {
 }
 
 # What has arrived. One du for every running transfer at once rather than a
-# fork each: du -sb answers for a file and for a directory alike, and says
-# nothing at all about a destination that is not there yet, which reads as
-# nothing transferred. Only ever a percentage where there is a real expected
-# size to divide by (see tui_dl_expected); everywhere else the figure itself,
-# because a percentage of an unknown is a guess dressed up as a fact.
+# fork each: it answers for a file and for a directory alike, and says nothing
+# at all about a destination that is not there yet, which reads as nothing
+# transferred. Only ever a percentage where there is a real expected size to
+# divide by (see tui_dl_expected); everywhere else the figure itself, because a
+# percentage of an unknown is a guess dressed up as a fact.
+#
+# It measures what is *allocated*, not the apparent size, and that is the whole
+# point of the flags. pget -n 5 fetches five chunks at once and writes each at
+# its own offset, so the file is a sparse one until the last of them lands:
+# writing near the end makes the apparent size jump to nearly the full figure
+# within seconds while almost none of the data is there. Measured against a
+# range-serving HTTP server, three seconds into a 120 MB transfer, du
+# --apparent-size said 97,200,000 bytes and the blocks actually on disk came to
+# 6,017,024 -- 81% against the true 5%. mirror inherits the same behaviour
+# through mirror:use-pget-n. Allocation is rounded up to a block per file,
+# which is a rounding error rather than a lie.
 tui_dl_progress () {
     tui_dl_targets=()
     for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
@@ -4000,7 +4045,7 @@ tui_dl_progress () {
         if [[ -n $tui_dl_line ]] && [[ -n $tui_dl_bytes ]]; then
             TUI_DLSIZE[$tui_dl_line]=$tui_dl_bytes
         fi
-    done < <(printf '%s\0' "${tui_dl_targets[@]}" | du -sb --files0-from=- 2> /dev/null)
+    done < <(printf '%s\0' "${tui_dl_targets[@]}" | du -s --block-size=1 --files0-from=- 2> /dev/null)
     for (( tui_dl_j = 0; tui_dl_j < tui_dl_n; tui_dl_j++ )); do
         if [[ ${TUI_DLSTATE[tui_dl_j]} != running ]]; then
             continue

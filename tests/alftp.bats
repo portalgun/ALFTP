@@ -764,18 +764,21 @@ SNIP
         # 2.7G listed for Rel.Two-GRP is a symlink length, not a size, and it
         # is a directory besides, so there is no expected figure for it.
         echo "${TUI_DLEXP[1]}"
-        head -c 2048 /dev/zero > "$local_dl_dir/Rel.Two-GRP"
-        TUI_DLEXP[1]=4096; tui_dl_progress; echo "${TUI_STATUS[1]}"
-        TUI_DLEXP[1]=-1;   tui_dl_progress; echo "${TUI_STATUS[1]}"
+        # Well above a filesystem block: what is measured is the space
+        # allocated, which is rounded up to a block per file, so toy sizes
+        # would be all rounding.
+        head -c 2097152 /dev/zero > "$local_dl_dir/Rel.Two-GRP"
+        TUI_DLEXP[1]=4194304; tui_dl_progress; echo "${TUI_STATUS[1]}"
+        TUI_DLEXP[1]=-1;      tui_dl_progress; echo "${TUI_STATUS[1]}"
         # A transfer that has reached its (rounded) expected size is still not
         # done: only the exit status says that.
-        TUI_DLEXP[1]=1024; tui_dl_progress; echo "${TUI_STATUS[1]}"
+        TUI_DLEXP[1]=1048576; tui_dl_progress; echo "${TUI_STATUS[1]}"
         rm -rf "$local_dl_dir"'
     [ "${lines[0]}" = "-1" ]
     [ "${lines[1]}" = "50%" ]
     # Human sizes are written the way lftp's -h and ls -h write them, so a
     # directory's byte count in this column reads like the sizes beside it.
-    [ "${lines[2]}" = "2.0K" ]
+    [ "${lines[2]}" = "2.0M" ]
     [ "${lines[3]}" = "99%" ]
 }
 
@@ -1930,4 +1933,58 @@ SNIP
     # "show the bytes transferred instead", which is the old behaviour.
     [ "${lines[0]}" = "nested=4000000" ]
     [ "${lines[1]}" = "without=-1" ]
+}
+
+@test "progress counts what is on disk, not the size a sparse file claims" {
+    # pget -n 5 writes five chunks at their own offsets, so until the last one
+    # lands the file is full of holes and its apparent size is nearly the whole
+    # figure. Measured against a range-serving HTTP server, three seconds into a
+    # 120 MB transfer, --apparent-size said 81% and the blocks on disk said 5%.
+    # A file with 4 KiB written at the far end reproduces that shape exactly.
+    dl=$(mktemp -d)
+    dd if=/dev/zero of="$dl/Rel.Two-GRP" bs=4096 count=1 seek=255 \
+        > /dev/null 2>&1
+    apparent=$(du -sb "$dl/Rel.Two-GRP" | cut -f1)
+    allocated=$(du -s --block-size=1 "$dl/Rel.Two-GRP" | cut -f1)
+    if (( allocated >= apparent )); then
+        rm -rf "$dl"
+        skip "this filesystem does not make sparse files"
+    fi
+    run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        local_dl_dir="'"$dl"'"
+        tui_dl_enqueue
+        TUI_DLEXP[1]=1048576
+        tui_dl_progress
+        echo "${TUI_STATUS[1]}"'
+    rm -rf "$dl"
+    # 4 KiB of 1 MiB is 0%, not the 99% the apparent size would have claimed.
+    [ "${lines[0]}" = "0%" ]
+}
+
+@test "a sparse part-download is not mistaken for a complete one" {
+    # The other half of the chunked-download problem: an interrupted pget -n
+    # leaves a file whose apparent size is already the full figure, so comparing
+    # that against the remote size called it complete -- and "t" would then hide
+    # it. What is allocated decides.
+    dl=$(mktemp -d)
+    dd if=/dev/zero of="$dl/notes.nfo" bs=4096 count=1 seek=255 > /dev/null 2>&1
+    if (( $(du -s --block-size=1 "$dl/notes.nfo" | cut -f1) >= \
+          $(du -sb "$dl/notes.nfo" | cut -f1) )); then
+        rm -rf "$dl"
+        skip "this filesystem does not make sparse files"
+    fi
+    lf=$(mktemp); lf2=$(mktemp); lf5=$(mktemp)
+    printf '%s\n' 'notes.nfo   1.0M  2026-08-23 14:42' > "$lf"
+    printf '%s\n' 'notes.nfo' > "$lf2"
+    printf '%s\n' '     1.0M 2026-08-23 14:42 notes.nfo' > "$lf5"
+    run stage 'exec {TUI_OUT}>/dev/null
+               listfile="'"$lf"'"; listfile2="'"$lf2"'"; listfile5="'"$lf5"'"
+               local_dl_dir="'"$dl"'"
+               tui_load; tui_status_scan; echo "sparse=${TUI_LSTAT[0]}"
+               head -c 1048576 /dev/zero > "'"$dl"'/notes.nfo"
+               tui_status_scan; echo "solid=${TUI_LSTAT[0]}"'
+    rm -rf "$dl" "$lf" "$lf2" "$lf5"
+    [ "${lines[0]}" = "sparse=i" ]
+    # ... and a file that really is there is still complete.
+    [ "${lines[1]}" = "solid=c" ]
 }
