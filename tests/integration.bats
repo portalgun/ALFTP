@@ -811,3 +811,25 @@ COUNTER
     [[ "$output" == *"kept-find"* ]]
     [[ "$output" == *"dirs=0"* ]]
 }
+
+@test "a download started in the picker is still unrarred, chmodded and recorded" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\nchmod=True\nperms_dirs=755\nperms_files=640\n' \
+        "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    # space marks the release, enter transfers it inside the picker, then quit.
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\x20 \r \x0c \x0c q q' --delay 0.8 -- "$ALFTP" -i TV -t -nu
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+    # The picker does none of this itself: it falls to the parent session,
+    # which is why a finished transfer is saved as "=" and not "#".
+    [ "$(stat -c '%a' "$DL/Rel.One-GRP")" = "755" ]
+    [ "$(stat -c '%a' "$DL/Rel.One-GRP/movie.mkv")" = "640" ]
+    [[ "$(cat "$home/.cache/alftp/alftp.record")" == *"Rel.One-GRP"*"downloaded"* ]]
+    # ... and the parent did not fetch it a second time.
+    [[ "$output" != *"Access failed"* ]]
+}

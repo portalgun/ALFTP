@@ -188,7 +188,7 @@ clean=""; data=""; norm=""; nounrar=""; dry_run=""
 print_ls=""; rm_list=""; rm_remote=""; no_append=""
 sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
 profile=""; profilevar=""; override=""
-LINESD=""; LINESF=""; LINESR=""; oldfile=""; listfile2=""; dirname=""
+LINESO_BUILT=""; LINESD=""; LINESF=""; LINESR=""; oldfile=""; listfile2=""; dirname=""
 rawline=""; unlink_ok=""
 # LINESX holds the entries marked for deletion -- the symlink *and* the data
 # behind it -- in the same form as LINESR. LINESO is the whole download in the
@@ -4559,11 +4559,15 @@ tui_save () {
             continue
         fi
         if tui_dl_saved_done "$tui_id"; then
-            # Downloaded here already: the parent session must not fetch it a
-            # second time. Everything else the queue did -- cancelled, failed,
-            # or never started -- is written as it always was, so the parent
-            # finishes what this did not.
-            tui_mark="#"
+            # Downloaded here already. "=" is not "#": the parent session must
+            # not fetch it a second time, but it must still unrar it, set its
+            # permissions and write it to the record, none of which the picker
+            # does. TYPE puts an "=" into LINESD/LINESF, which is what
+            # POST_PROCESS walks, and leaves it out of LINESO, which is what
+            # emits transfers. Everything else the queue did -- cancelled,
+            # failed, or never started -- is written as it always was, so the
+            # parent finishes what this did not.
+            tui_mark="="
         else
             case ${TUI_STATE[tui_id]} in
                 3) tui_mark="x" ;;
@@ -4860,7 +4864,10 @@ marked_entries () {
             line = $0
             if (line ~ /^[ \t]*$/) { next }
             mark = substr(line, 1, 1)
-            if (mark == "#" || mark == "*") { next }
+            # "=" is a transfer the previous session finished. It is not a
+            # mark the user made, and carrying it over would post-process the
+            # same download twice.
+            if (mark == "#" || mark == "*" || mark == "=") { next }
             if (mark == "+" || mark == "-") { line = substr(line, 2) }
             else { mark = "+" }
             name = stripname(line)
@@ -4943,6 +4950,7 @@ strip_columns () {
 # because that order is the priority the user set (see DLXFER).
 TYPE () {
         LINESO=""
+        LINESO_BUILT=1
         LIST=$(awk '
             {
                 line = $0
@@ -4951,6 +4959,7 @@ TYPE () {
                 act = "get"
                 if (substr(line, 1, 1) == "-") { act = "rm"; line = substr(line, 2) }
                 else if (substr(line, 1, 1) == "x") { act = "del"; line = substr(line, 2) }
+                else if (substr(line, 1, 1) == "=") { act = "post"; line = substr(line, 2) }
                 else if (substr(line, 1, 1) == "+") { line = substr(line, 2) }
                 print act "\t" line
             }
@@ -4978,10 +4987,14 @@ TYPE () {
             if [[ ${line%/} == */* ]]; then
                 if [[ $line == */ ]]; then
                     add_line LINESD "$(echo "${line%/}" | sed 's|\s$|&SsS|')"
-                    add_order dir "$(echo "${line%/}" | sed 's|\s$|&SsS|')"
+                    if [[ $act != post ]]; then
+                        add_order dir "$(echo "${line%/}" | sed 's|\s$|&SsS|')"
+                    fi
                 else
                     add_line LINESF "$(echo "$line" | sed 's|\s$|&SsS|')"
-                    add_order file "$(echo "$line" | sed 's|\s$|&SsS|')"
+                    if [[ $act != post ]]; then
+                        add_order file "$(echo "$line" | sed 's|\s$|&SsS|')"
+                    fi
                 fi
                 continue
             fi
@@ -4991,8 +5004,12 @@ TYPE () {
 
             add_line LINESD "$lined"
             add_line LINESF "$linef"
-            add_order dir "$lined"
-            add_order file "$linef"
+            # "=" is already on disk: post-processing wants it, the transfer
+            # list does not.
+            if [[ $act != post ]]; then
+                add_order dir "$lined"
+                add_order file "$linef"
+            fi
         done <<< "$LIST"
 }
 
@@ -5218,9 +5235,16 @@ dlfl_line () {
 # all the files. A caller that filled LINESD/LINESF by hand and left LINESO
 # empty gets the old grouped order, which is exactly what it asked for.
 DLXFER () {
+    # An empty LINESO means one of two different things. If TYPE built it, the
+    # list simply had nothing to transfer -- every entry was already downloaded
+    # here ("=") or was not wanted -- and emitting from LINESD/LINESF would
+    # fetch all of it again. If TYPE never ran, the caller filled LINESD/LINESF
+    # by hand (POST_PROCESS and several tests do) and those are all there is.
     if [[ -z $LINESO ]]; then
-        DLDR
-        DLFL
+        if [[ $LINESO_BUILT != 1 ]]; then
+            DLDR
+            DLFL
+        fi
         return 0
     fi
     while IFS=$'\t' read -r xfer_kind xfer_path; do

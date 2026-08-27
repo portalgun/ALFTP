@@ -161,6 +161,7 @@ The far-left column is what will happen to each entry:
 | `-` | leave it, but remove the source symlink from the remote directory |
 | `x` | delete it: the source symlink *and* the data behind it |
 | `*` | a directory you have picked *part* of — the parts are the `+` lines under it |
+| `=` | already transferred from inside the picker — it is not fetched again, but it is still unrarred, has its permissions applied and is written to the record |
 | blank | leave it alone |
 
 **Everything starts deselected** — `a` selects the lot if that is what you want, `A` clears it again.

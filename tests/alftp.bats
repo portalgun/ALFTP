@@ -782,16 +782,17 @@ SNIP
     [ "${lines[3]}" = "99%" ]
 }
 
-@test "a finished transfer is saved as # and everything else as it was" {
+@test "a finished transfer is saved as = and everything else as it was" {
     run stage "$(tree)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
         tui_dl_enqueue
         TUI_DLSTATE[0]=done; TUI_DLSTATE[1]=failed; TUI_DLSTATE[2]=cancelled
         tui_save; cut -c1 "$listfile" | tr -d "\n"; echo
         grep -c . "$listfile"'
-    # Rel.One-GRP holds a selection below it (*), movie.mkv is done (#),
-    # Rel.Two-GRP failed and notes.nfo was cancelled, so both are still "+"
-    # for the parent session to finish.
-    [ "${lines[0]}" = "*#++" ]
+    # Rel.One-GRP holds a selection below it (*), movie.mkv is done (=) -- not
+    # "#", because the parent must still post-process it -- and Rel.Two-GRP
+    # failed while notes.nfo was cancelled, so both are still "+" for the
+    # parent session to finish.
+    [ "${lines[0]}" = "*=++" ]
     [ "${lines[1]}" = "4" ]
 }
 
@@ -2078,4 +2079,49 @@ SNIP
     [ "$status" -eq 0 ]
     # It ran to the quit rather than falling over on an empty array.
     [ "$output" = "N=0 cur=0 result=save" ]
+}
+
+@test "an = entry is post-processed but not transferred again" {
+    listfile=$(mktemp); listfile2=$(mktemp)
+    printf '%s\n' '=Rel.One-GRP@          4.1G  2026-08-23 17:10' \
+                  '+notes.nfo             2.1K  2026-08-22 09:03' > "$listfile"
+    printf '%s\n' 'Rel.One-GRP/' 'notes.nfo' > "$listfile2"
+    run stage 'listfile="'"$listfile"'"; listfile2="'"$listfile2"'"; TYPE
+               echo "D=[$LINESD]"; echo "F=[$LINESF]"
+               echo "O=[$(printf "%s" "$LINESO" | tr "\t" "|")]"'
+    rm -f "$listfile" "$listfile2"
+    # POST_PROCESS walks LINESD/LINESF, so the finished entry has to be there:
+    # that is what unrars it, sets its permissions and records it.
+    [ "${lines[0]}" = "D=[Rel.One-GRP]" ]
+    [ "${lines[1]}" = "F=[notes.nfo]" ]
+    # LINESO is what emits transfers, and it has only the entry still wanted.
+    [ "${lines[2]}" = "O=[file|notes.nfo]" ]
+}
+
+@test "nothing left to transfer emits nothing, but a hand-filled list still works" {
+    # TYPE ran and found nothing to fetch: emitting from LINESD would fetch
+    # everything a second time.
+    run stage 'LINESO_BUILT=1; LINESO=""; LINESD="Rel.One-GRP"; LINESF="notes.nfo"
+               local_dl_dir=/dl; DLXFER; echo "[end]"'
+    [ "$output" = "[end]" ]
+    # TYPE never ran, so LINESD/LINESF are all there is -- POST_PROCESS and
+    # several tests rely on this.
+    run stage 'LINESO=""; LINESD=""; LINESF="notes.nfo"
+               local_dl_dir=/dl; DLXFER'
+    [[ "$output" == *'pget -c -n 5 "notes.nfo"'* ]]
+}
+
+@test "-c does not carry a finished transfer into the next run" {
+    old=$(mktemp)
+    printf '%s\n' '=Rel.One-GRP@   4.1G  2026-08-23 17:10' \
+                  '+notes.nfo      2.1K  2026-08-22 09:03' \
+                  '-Rel.Two-GRP@   2.7G  2026-08-22 09:03' > "$old"
+    run stage 'marked_entries "'"$old"'"'
+    rm -f "$old"
+    # The "=" was this tool's own bookkeeping, not a mark the user made;
+    # carrying it over would post-process the same download twice.
+    [ "${#lines[@]}" -eq 2 ]
+    [[ "$output" != *"Rel.One-GRP"* ]]
+    [[ "$output" == *"notes.nfo"* ]]
+    [[ "$output" == *"Rel.Two-GRP"* ]]
 }
