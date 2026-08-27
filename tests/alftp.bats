@@ -1988,3 +1988,39 @@ SNIP
     # ... and a file that really is there is still complete.
     [ "${lines[1]}" = "solid=c" ]
 }
+
+@test "the status bar is the second line from the bottom, messages below it" {
+    out=$(mktemp)
+    run stage "$(tree)"'
+        exec {TUI_OUT}>"'"$out"'"
+        TUI_LINES=12; TUI_COLS=70; tui_rows_calc
+        tui_msg="something happened"
+        tui_draw'
+    mapfile -t screen < "$out"
+    rm -f "$out"
+    # One line per row of the terminal: header, TUI_ROWS of list, bar, message.
+    [ "${#screen[@]}" -eq 12 ]
+    # The top line is the column header, not the bar.
+    [[ "${screen[0]}" == *"NAME"* ]]
+    [[ "${screen[0]}" == *"SIZE"* ]]
+    [[ "${screen[0]}" != *"selected"* ]]
+    # The bar is second from the bottom ...
+    [[ "${screen[10]}" == *"alftp"* ]]
+    [[ "${screen[10]}" == *"0 selected"* ]]
+    # ... and the message is the last line, below it.
+    [[ "${screen[11]}" == *"something happened"* ]]
+}
+
+@test "a prompt replaces the message line and leaves the bar alone" {
+    out=$(mktemp)
+    run stage "$(tree)"'
+        exec {TUI_OUT}>"'"$out"'"
+        TUI_LINES=12; TUI_COLS=70; tui_rows_calc
+        tui_prompt="really? (Y/n)"
+        tui_draw'
+    mapfile -t screen < "$out"
+    rm -f "$out"
+    [ "${#screen[@]}" -eq 12 ]
+    [[ "${screen[10]}" == *"0 selected"* ]]
+    [[ "${screen[11]}" == *"really? (Y/n)"* ]]
+}

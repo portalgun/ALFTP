@@ -244,6 +244,7 @@ tui_open_flag=0
 tui_namew=0; tui_sizew=0; tui_pathw=0; tui_namefld=0; tui_metaw=0
 tui_sizedw=0; tui_datedw=0; tui_statusdw=0
 tui_hsz=""; tui_hu=1; tui_hs=""; tui_hw=0; tui_hf=0
+tui_bar=""
 tui_saved_stty=""
 tui_saved_int=""; tui_saved_term=""; tui_saved_winch=""
 tui_nodes=0; tui_new_id=0; tui_stripped=""; tui_mark=""; tui_anc=-1
@@ -1565,8 +1566,9 @@ tui_size () {
     tui_rows_calc
 }
 
-# Rows left for the list once the title, the column header and the footer have
-# had their line each.
+# Rows left for the list once the column header, the status bar and the message
+# line have had their line each. The header is the top line; the bar and the
+# message line are the bottom two.
 tui_rows_calc () {
     TUI_ROWS=$(( TUI_LINES - 3 ))
     if (( TUI_ROWS < 1 )); then
@@ -2496,7 +2498,11 @@ tui_draw () {
     fi
     printf -v tui_line ' %s%*s%s ' "$tui_left" "$tui_pad" "" "$tui_right"
     tui_fit "$tui_line" "$TUI_COLS"
-    tui_out="${t_home}${t_rev}${tui_fitted}${t_sgr0}${t_el}"$'\n'
+    # Held back rather than drawn here: the bar belongs on the second line from
+    # the bottom, immediately above the message line, so that both of the
+    # things that change while the picker sits there are next to each other and
+    # in the same place every time.
+    tui_bar="${t_rev}${tui_fitted}${t_sgr0}${t_el}"
 
     # Column header, lined up with the two-column selection gutter.
     if (( tui_statusw > 0 )); then
@@ -2507,7 +2513,7 @@ tui_draw () {
             "$tui_sizedw" "SIZE" "$tui_datedw" "DATE"
     fi
     tui_fit "$tui_line" "$TUI_COLS"
-    tui_out+="${t_bold}${tui_fitted}${t_sgr0}${t_el}"$'\n'
+    tui_out="${t_home}${t_bold}${tui_fitted}${t_sgr0}${t_el}"$'\n'
 
     for (( tui_i = tui_top; tui_i < tui_top + TUI_ROWS; tui_i++ )); do
         if (( tui_i < TUI_N )); then
@@ -2544,6 +2550,8 @@ tui_draw () {
             tui_out+="${t_el}"$'\n'
         fi
     done
+
+    tui_out+="${tui_bar}"$'\n'
 
     if [[ -n $tui_prompt ]]; then
         tui_fit "$tui_prompt" "$TUI_COLS"

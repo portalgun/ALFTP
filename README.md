@@ -134,17 +134,25 @@ happens in the terminal UI by default, and in `$editor` where the terminal canno
 
 ### The terminal UI
 ```
- alftp  /remote/dir                   2 selected, 1 to unlink, 1 to delete
-  NAME                       SIZE  DATE
-* Some.Release.2026-GRP/     4.1G  2026-08-23 17:10
-    CD1/                     2.0G  2026-08-23 17:10
-+   CD2/                     2.0G  2026-08-23 17:10
-+   release.nfo              2.1K  2026-08-23 17:10
-- Another.Release-GRP/       2.7G  2026-08-23 14:42
-x Old.Release-GRP/           1.4G  2026-08-20 08:11
-  notes.nfo                  2.1K  2026-08-22 09:03
+  NAME                                 SIZE  DATE              STATUS
+* Some.Release.2026-GRP/               4.1G  2026-08-23 17:10
+    CD1/                               2.0G  2026-08-23 17:10       c
++   CD2/                               2.0G  2026-08-23 17:10      37%
++   release.nfo                        2.1K  2026-08-23 17:10
+- Another.Release-GRP/                 2.7G  2026-08-23 14:42
+x Old.Release-GRP/                     1.4G  2026-08-20 08:11
+  notes.nfo                            2.1K  2026-08-22 09:03       i
+
+ alftp  /remote/dir      2 selected, 1 to unlink, 1 to delete  completed=T
  j/k  M-j/k  space pick  enter go  c cancel  tab  d/x  r/R  t  u  q quit
 ```
+The column headings are the top line. The **status bar is always the second line from the
+bottom** — the remote directory, what is marked, how many transfers are running, and whether
+completed entries are being shown — and the line below it is where messages, key hints and
+questions appear. Both of the things that change while you sit in the picker are therefore in the
+same place every time. `SIZE`, `DATE` and `STATUS` are pinned to the right-hand edge, so the name
+column takes up whatever slack a wide terminal leaves.
+
 The far-left column is what will happen to each entry:
 
 | | |
