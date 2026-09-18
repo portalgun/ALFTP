@@ -34,15 +34,36 @@
 #                     'password=...'), decrypted with `gpg --batch --decrypt` at
 #                     startup and evaluated like the rest of the config, so no
 #                     secret has to sit here in plaintext
-#    autoUncompress - (True|False) automatically decompress files recursively.
-#                     Currently only rar supported. Default False; -nu turns it
-#                     off for one run even where this is True
+#    autoUncompress - (True|False) automatically decompress what was downloaded.
+#                     Default False; -nu turns it off for one run even where
+#                     this is True. The kinds it knows are rar, zip, 7z, tar
+#                     (including .tar.gz/.tgz, .tar.bz2/.tbz2, .tar.xz/.txz,
+#                     .tar.zst/.tzst) and the single-file compressors gz, bz2,
+#                     xz and zst. Each needs its own tool installed -- unrar,
+#                     unzip, 7z, tar, gzip, bzip2, xz, zstd -- and a kind whose
+#                     tool is missing is stepped over with a line to $errors.
+#    uncompress_exclude
+#                   - kinds autoUncompress must leave packed, named as above and
+#                     separated by spaces or commas, e.g. "zip, 7z". Default
+#                     empty, which unpacks every kind it can
+#                     A downloaded directory is unpacked into itself and its
+#                     archives are then deleted; an archive downloaded as an
+#                     entry of its own is unpacked into a directory named after
+#                     it and the archive is kept. Only the volume a set opens at
+#                     is unpacked (.rar, or part01 of a .partNN.rar set) --
+#                     unrar finds the rest of the set itself
 #    checksum       - (True|False) after each download, write its size and (for a
 #                     single file) its sha256 to $verify. Default False
 #    chmod          - (True|False) apply perms_dirs/perms_files to what was
 #                     downloaded. Default False: content keeps the permissions it
-#                     arrived with
-#    perms_dirs     - three-digit mode for downloaded directories (default 744)
+#                     arrived with. Whatever autoUncompress unpacked is walked
+#                     by the same pass, so it gets these settings as well
+#    perms_dirs     - three-digit mode for downloaded directories (default 744).
+#                     Archives get this too: .rar and its .rNN parts, .zip, .7z,
+#                     .tar and its compressed forms, .gz, .bz2, .xz. An archive
+#                     holds other files rather than being one, so it counts as a
+#                     directory here -- at the top level and at any depth inside
+#                     a downloaded directory
 #    perms_files    - three-digit mode for downloaded files (default 644)
 #    chown          - (True|False) give what was downloaded to $owner. Default False
 #    owner          - user, or user:group, for chown=True
@@ -55,6 +76,16 @@
 #                     open. 0 is never; "u" checks whatever this says. The check
 #                     is a background login of its own, so the UI stays usable
 #                     while it runs
+#    confirm_quit    - (True|False, default True) ask before leaving the terminal
+#                     UI. False quits on one keystroke in the one case where
+#                     the question has nothing in it: nothing marked that has
+#                     not already been transferred, nothing to unlink or
+#                     delete, and no transfer still running. A quit that would
+#                     throw work away asks whatever this is set to
+#    line_numbers    - (True|False, default True) show a line-number gutter down
+#                     the left of the terminal UI. Each row says how far it is
+#                     from the cursor; the row under the cursor says which line
+#                     it is, which is the number "G" takes
 #    recursive_listing
 #                   - (True|False, default True) list the whole data directory
 #                     once, in the background, when the terminal UI opens.

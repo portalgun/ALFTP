@@ -461,6 +461,20 @@ SNIP
     [ "${lines[2]}" = "[/dl/TV] []" ]
 }
 
+@test "local_dir_for expands a dl_dir whose tilde was quoted in the config" {
+    run stage "HOME=/home/u; local_dl_dir='~/dl'; local_dl_dir_films='~/films'
+               local_dir_for 'Rel.One-GRP'; echo \"[\$local_dir]\"
+               srcs_mode=True; local_dl_dir='~'
+               local_dir_for 'films/Film-GRP'; echo \"[\$local_dir]\"
+               local_dir_for 'TV/Rel'; echo \"[\$local_dir]\"
+               local_dl_dir='~bob/dl'; local_dir_for 'TV/Rel'; echo \"[\$local_dir]\""
+    # du and [ -e ] do not expand a tilde, so a literal one measures nothing.
+    [ "${lines[0]}" = "[/home/u/dl]" ]
+    [ "${lines[1]}" = "[/home/u/films]" ]
+    [ "${lines[2]}" = "[/home/u]" ]
+    [ "${lines[3]}" = "[~bob/dl]" ]
+}
+
 @test "a whole src mirrors into its own directory, not into a copy of itself" {
     run stage 'srcs_mode=True; local_dl_dir=/dl; local_dl_dir_films=/mnt/films
                LINESD="films"; DLDR'
@@ -565,6 +579,174 @@ SNIP
     [ "${lines[1]}" = "one=[i]" ]
 }
 
+# In the completed directory every entry is a symlink and the size column
+# measures the *link*, not what is behind it: a release symlink lists as the
+# length of its target path. That figure used to be shown, and -- far worse --
+# compared against what was on disk. A symlink's length is a small number, so
+# anything at all in the local directory cleared it and the entry read as
+# already downloaded.
+@test "a symlink's own length is never used as the entry's size" {
+    dir=$(mktemp -d)
+    mkdir -p "$dir/Rel.One-GRP"
+    head -c 4096 /dev/zero > "$dir/Rel.One-GRP/movie.mkv"
+    # Part of a download: far more than the 23 its symlink measures, far less
+    # than the file behind it.
+    head -c 4096 /dev/zero > "$dir/notes.nfo"
+    list=$(mktemp); list2=$(mktemp)
+    # What the completed directory really lists: the length of each target.
+    printf '%s\n' 'Rel.One-GRP@     25  2026-08-23 17:10' \
+                  'notes.nfo@       23  2026-08-22 09:03' > "$list"
+    printf '%s\n' 'Rel.One-GRP/' 'notes.nfo' > "$list2"
+    run stage 'exec {TUI_OUT}>/dev/null
+        listfile="'"$list"'"; listfile2="'"$list2"'"; listfile5=""; listfile3=""
+        local_dl_dir="'"$dir"'"
+        declare -gA LINK_TARGET=([Rel.One-GRP]=../../data/TV/Rel.One-GRP \
+                                 [notes.nfo]=../../data/TV/notes.nfo)
+        tui_load
+        echo "size=[${TUI_SIZE[0]}][${TUI_SIZE[1]}]"
+        echo "status=[${TUI_STATUS[0]}][${TUI_STATUS[1]}] w=$tui_statusw"'
+    rm -rf "$dir" "$list" "$list2"
+    # Nothing is known about either size, so neither is shown ...
+    [ "${lines[0]}" = "size=[][]" ]
+    # ... and nothing is claimed about either. notes.nfo in particular is a
+    # part-downloaded file, and it used to read "c" here: 4096 bytes on disk is
+    # more than the 23 the symlink measures, so the comparison called it done.
+    [ "${lines[1]}" = "status=[][] w=0" ]
+}
+
+@test "a real file in the completed directory keeps its listed size" {
+    dir=$(mktemp -d)
+    printf '%s' 0123456789 > "$dir/notes.nfo"
+    list=$(mktemp); list2=$(mktemp)
+    printf '%s\n' 'notes.nfo       10  2026-08-22 09:03' > "$list"
+    printf '%s\n' 'notes.nfo' > "$list2"
+    # No LINK_TARGET entry: the server did not list this one as a symlink, so
+    # its size is its own and the completeness check can still use it.
+    run stage 'exec {TUI_OUT}>/dev/null
+        listfile="'"$list"'"; listfile2="'"$list2"'"; listfile5=""; listfile3=""
+        local_dl_dir="'"$dir"'"
+        declare -gA LINK_TARGET=()
+        tui_load; echo "[${TUI_SIZE[0]}][${TUI_STATUS[0]}]"'
+    rm -rf "$dir" "$list" "$list2"
+    [ "$output" = "[10][c]" ]
+}
+
+@test "the data directory's size wins over the symlink's, as before" {
+    dir=$(mktemp -d)
+    printf '%s' 0123456789 > "$dir/notes.nfo"
+    list=$(mktemp); list2=$(mktemp); list5=$(mktemp)
+    printf '%s\n' 'notes.nfo@      23  2026-08-22 09:03' > "$list"
+    printf '%s\n' 'notes.nfo' > "$list2"
+    printf '%s\n' '      10 notes.nfo' > "$list5"
+    run stage 'exec {TUI_OUT}>/dev/null
+        listfile="'"$list"'"; listfile2="'"$list2"'"
+        listfile5="'"$list5"'"; listfile3=""
+        local_dl_dir="'"$dir"'"
+        declare -gA LINK_TARGET=([notes.nfo]=../../data/TV/notes.nfo)
+        tui_load; echo "[${TUI_SIZE[0]}][${TUI_STATUS[0]}]"'
+    rm -rf "$dir" "$list" "$list2" "$list5"
+    [ "$output" = "[10][c]" ]
+}
+
+# "?" replaced the cut-down list of bindings the footer used to carry -- three
+# abbreviations of the same thing, each of which had to be kept in step with
+# tui_key_action by hand.
+@test "? is the key that opens the window" {
+    run stage 'tui_key_action "?"; echo "$tui_action"'
+    [ "$output" = "help" ]
+}
+
+@test "? opens the window and any other key shuts it" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        TUI_COLS=80; TUI_LINES=24; tui_rows_calc
+        KEYS=("?"); tui_loop; echo "open=$tui_help_open top=$tui_help_top"
+        KI=0; KEYS=(z); tui_loop; echo "open=$tui_help_open"'
+    [ "${lines[0]}" = "open=1 top=0" ]
+    [ "${lines[1]}" = "open=0" ]
+}
+
+# The key that closes the window is spent doing so. Shutting a window and
+# marking an entry for deletion with the same keystroke is not what anyone
+# means by it.
+@test "the key that closes the window does not also act on the list" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        TUI_COLS=80; TUI_LINES=24; tui_rows_calc
+        tui_cur=0
+        KEYS=("?" x " "); tui_loop
+        echo "open=$tui_help_open state=${TUI_STATE[0]} nsel=$tui_nsel ndel=$tui_ndel"'
+    # x shut the window and marked nothing; the space after it is the first key
+    # the list sees, and it is the one that marked.
+    [ "$output" = "open=0 state=1 nsel=1 ndel=0" ]
+}
+
+@test "the window scrolls, and stops at either end of itself" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        TUI_COLS=80; TUI_LINES=24; tui_rows_calc
+        KEYS=("?"); tui_loop
+        tui_help_geom
+        n=${#TUI_HELP[@]}; h=$tui_helph
+        KI=0; KEYS=(j j j); tui_loop; tui_help_geom; echo "down3=$tui_help_top"
+        KI=0; KEYS=(k k k k k k); tui_loop; tui_help_geom; echo "up=$tui_help_top"
+        KI=0; KEYS=(G); tui_loop; tui_help_geom; echo "end=$(( tui_help_top == n - h ))"
+        KI=0; KEYS=(0); tui_loop; tui_help_geom; echo "home=$tui_help_top"
+        echo "still-open=$tui_help_open"'
+    [ "${lines[0]}" = "down3=3" ]
+    # Scrolling up past the top stops there rather than going negative.
+    [ "${lines[1]}" = "up=0" ]
+    # G lands on the last screenful, not past it.
+    [ "${lines[2]}" = "end=1" ]
+    [ "${lines[3]}" = "home=0" ]
+    # None of the scrolling keys shut it.
+    [ "${lines[4]}" = "still-open=1" ]
+}
+
+@test "the window is as wide as its widest line and centred in the terminal" {
+    run stage "$(tree)"'
+        TUI_COLS=100; TUI_LINES=40; tui_rows_calc; tui_help_geom
+        w=0; for l in "${TUI_HELP[@]}"; do
+            if (( ${#l} > w )); then w=${#l}; fi
+        done
+        echo "w=$(( tui_helpw == w + 2 )) x=$(( tui_helpx == (100 - tui_helpw) / 2 ))"
+        echo "h=$(( tui_helph == ${#TUI_HELP[@]} ))"
+        # A terminal with no room for all of it shows as much as it has.
+        TUI_LINES=10; tui_rows_calc; tui_help_geom
+        echo "clipped=$(( tui_helph == TUI_ROWS ))"'
+    # A blank column each side of the text, and centred on what is left.
+    [ "${lines[0]}" = "w=1 x=1" ]
+    [ "${lines[1]}" = "h=1" ]
+    [ "${lines[2]}" = "clipped=1" ]
+}
+
+# Every width is worked out on plain strings and the escapes go on last, which
+# is what keeps a row the width it says it is -- tui_fit measures with ${#1}.
+@test "a row with the window over it is still one terminal wide" {
+    run stage "$(tree)"'
+        TUI_COLS=60; TUI_LINES=24; tui_rows_calc; tui_help_geom
+        printf -v row "%-*s" 60 "abcdefghij"
+        tui_help_row "$row" "KEY"
+        # The escapes come off, and what is left is what the terminal shows.
+        plain=${tui_line//$'"'"'\033'"'"'\[[0-9]*m/}
+        plain=${plain//$'"'"'\033'"'"'\[m/}
+        echo "${#plain}"
+        echo "[${plain:tui_helpx:tui_helpw}]"'
+    # Same width as the row that went in.
+    [ "${lines[0]}" = "60" ]
+    # The window text sits where the geometry says, a blank column each side.
+    [[ "${lines[1]}" == "[ KEY "* ]]
+    [[ "${lines[1]}" == *" ]" ]]
+}
+
+@test "the footer says how to reach the keys instead of listing them" {
+    run stage "$(tree)"'
+        TUI_COLS=120; TUI_LINES=12; tui_rows_calc; tui_widths
+        exec {TUI_OUT}>&1
+        tui_draw'
+    # The three cut-down lists are gone; one line points at the window.
+    [[ "$output" == *"? keys"* ]]
+    [[ "$output" != *"r/R clear"* ]]
+    [[ "$output" != *"M-j/k order"* ]]
+}
+
 @test "t hides what is complete, and shows it again" {
     run stage "$(tree)"$'\n'"$(keys)"'
         TUI_STATUS[1]=c; TUI_STATUS[2]=c; tui_status_width
@@ -649,12 +831,150 @@ keys () {
 SNIP
 }
 
-@test "space toggles the entry under the cursor, q then s saves" {
+# A count typed before a motion, the way vi takes one. The tree has six
+# visible rows: 0 Rel.One-GRP@ 1 CD1/ 2 movie.mkv 3 movie.nfo 4 Rel.Two-GRP@
+# 5 notes.nfo.
+@test "a count repeats a motion, and runs out at the ends of the list" {
     run stage "$(tree)"$'\n'"$(keys)"'
-        KEYS=(" " j " " q s); tui_loop
+        KEYS=(2 j); tui_loop; echo "$tui_cur"
+        tui_cur=5; KI=0; KEYS=(3 k); tui_loop; echo "$tui_cur"
+        # Further than there is list: the clamp is what stops it, not the count.
+        KI=0; KEYS=(9 9 j); tui_loop; echo "$tui_cur"
+        KI=0; KEYS=(9 9 k); tui_loop; echo "$tui_cur"'
+    [ "${lines[0]}" = "2" ]
+    [ "${lines[1]}" = "2" ]
+    [ "${lines[2]}" = "5" ]
+    [ "${lines[3]}" = "0" ]
+}
+
+@test "a count is spent on the key that follows it and on no other" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        # 2j moves two; the j after it moves one, not two again.
+        KEYS=(2 j j); tui_loop; echo "$tui_cur"'
+    [ "$output" = "3" ]
+}
+
+@test "gg goes to the first line, and 0 still does too" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        tui_cur=4; KEYS=(g g); tui_loop; echo "$tui_cur"
+        tui_cur=4; KI=0; KEYS=(0); tui_loop; echo "$tui_cur"'
+    [ "${lines[0]}" = "0" ]
+    [ "${lines[1]}" = "0" ]
+}
+
+# A count's own digits include 0 once one is being typed, which is the only
+# way "10j" can work while "0" on its own still means the first line.
+@test "0 is a count digit only when a count is already being typed" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        # 10j: further than the list goes, so it lands on the last row rather
+        # than on row 1, which is where a "0" read as "top" would have left it.
+        KEYS=(1 0 j); tui_loop; echo "$tui_cur"'
+    [ "$output" = "5" ]
+}
+
+@test "a count sends G and gg to that line, without one they are the ends" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(3 G); tui_loop; echo "$tui_cur"
+        KI=0; KEYS=(2 g g); tui_loop; echo "$tui_cur"
+        KI=0; KEYS=(G); tui_loop; echo "$tui_cur"'
+    # Counted, they are line numbers and the rows are numbered from 1.
+    [ "${lines[0]}" = "2" ]
+    [ "${lines[1]}" = "1" ]
+    [ "${lines[2]}" = "5" ]
+}
+
+# "gx" reaching "x" would ask to delete the entry under the cursor, so a "g"
+# followed by anything else does nothing at all.
+@test "g followed by anything but g does nothing" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        tui_cur=2; KEYS=(g x); tui_loop
+        echo "$tui_cur ${TUI_STATE[4]} $tui_ndel [$tui_prompt]"'
+    [ "$output" = "2 0 0 []" ]
+}
+
+@test "Esc takes back a count half typed instead of quitting" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        printf -v ESC "\033"
+        KEYS=(2 "$ESC" j); tui_loop; echo "$tui_cur [$tui_count]"'
+    # The 2 was dropped, so the j that follows moves one line.
+    [ "$output" = "1 []" ]
+}
+
+@test "a count moves a node that many places" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        tui_cur=1; KEYS=(2 $'"'"'\ej'"'"'); tui_loop
+        names'
+    # CD1/ was the first of the three children; two moves down put it last.
+    [ "$output" = "[Rel.One-GRP@ movie.mkv movie.nfo CD1/ Rel.Two-GRP@ notes.nfo]" ]
+}
+
+# The gutter down the left: how far each row is from the cursor, except the
+# cursor's own row, which says where in the list it is.
+@test "the line numbers are relative, and absolute under the cursor" {
+    run stage "$(tree)"'
+        TUI_COLS=80; tui_cur=2; tui_widths; tui_name_field
+        g=""; for ((i = 0; i < TUI_N; i++)); do tui_row_number "$i"; g="$g[$tui_gut]"; done
+        echo "$g w=$tui_gutw"'
+    [ "$output" = "[ 2 ][ 1 ][ 3 ][ 1 ][ 2 ][ 3 ] w=3" ]
+}
+
+@test "line_numbers=False leaves the gutter out and gives the name the room" {
+    run stage "$(tree)"'
+        TUI_COLS=80; tui_widths
+        tui_name_field; tui_row_number 0; on=$tui_namefld
+        line_numbers=False
+        tui_name_field; tui_row_number 0
+        echo "off=[$tui_gut] w=$tui_gutw wider=$(( tui_namefld - on ))"'
+    # No gutter, and the three columns it took go back to the name.
+    [ "$output" = "off=[] w=0 wider=3" ]
+}
+
+@test "space toggles the entry under the cursor, q then s saves" {
+    # Space also steps down, so the cursor is on CD1/ when the second space
+    # splits the directory it was given whole -- one row further on than the
+    # same two keystrokes used to reach.
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(" " " " q s); tui_loop
         marks; echo "$tui_nsel $tui_result"'
     [ "${lines[0]}" = "[* ++  ]" ]
     [ "${lines[1]}" = "2 save" ]
+}
+
+@test "space toggles and moves down, and stops on the last entry" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        KEYS=(" " " "); tui_loop
+        echo "$tui_cur"
+        tui_cur=5; KI=0; KEYS=(" "); tui_loop
+        echo "$tui_cur ${TUI_STATE[5]}"'
+    # Two spaces from the top leave the cursor on the third row.
+    [ "${lines[0]}" = "2" ]
+    # On the last row it toggles and stays: there is nowhere below to go.
+    [ "${lines[1]}" = "5 1" ]
+}
+
+@test "shift-space toggles and moves up, and stops on the first entry" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        SS=$'"'"'\e[32;2u'"'"'
+        tui_cur=3; KEYS=("$SS" "$SS"); tui_loop
+        echo "$tui_cur"
+        tui_clear_all
+        tui_cur=0; KI=0; KEYS=("$SS"); tui_loop
+        echo "$tui_cur ${TUI_STATE[0]}"'
+    # Two shift-spaces from the fourth row leave the cursor on the second.
+    [ "${lines[0]}" = "1" ]
+    # On the first row it toggles and stays.
+    [ "${lines[1]}" = "0 1" ]
+}
+
+# Neither protocol is turned on by the script, so a terminal may send either
+# spelling of shift+space depending on what it has been asked for.
+@test "both spellings of shift-space map to toggling upwards" {
+    run stage 'tui_key_action " "; echo "$tui_action"
+               tui_key_action $'"'"'\e[32;2u'"'"'; echo "$tui_action"
+               tui_key_action $'"'"'\e[27;2;32~'"'"'; echo "$tui_action"'
+    [ "${lines[0]}" = "toggledn" ]
+    [ "${lines[1]}" = "toggleup" ]
+    [ "${lines[2]}" = "toggleup" ]
 }
 
 # Enter used to be a synonym for space. It starts the download queue now, and
@@ -948,8 +1268,8 @@ SNIP
 
 @test "r clears the mark under the cursor, subtree and all" {
     run stage "$(tree)"$'\n'"$(keys)"'
-        KEYS=(" " r); tui_loop; marks; echo "$tui_nsel"
-        KI=0; KEYS=(j j " " k k r); tui_loop; marks; echo "$tui_nsel"'
+        KEYS=(" " k r); tui_loop; marks; echo "$tui_nsel"
+        KI=0; KEYS=(j j " " k k k r); tui_loop; marks; echo "$tui_nsel"'
     [ "${lines[0]}" = "[      ]" ]
     [ "${lines[1]}" = "0" ]
     # The "*" on the directory is its child's selection; r on the child's
@@ -1269,6 +1589,319 @@ SNIP
     rm -rf "$d"
 }
 
+# An archive holds other files rather than being one, so chmod treats it as a
+# directory. Every part of a multipart set counts, not just the first.
+@test "is_archive knows an archive from an ordinary file" {
+    run stage 'for n in a.rar A.RAR a.part01.rar a.r00 a.r15 a.zip a.z01 a.7z \
+                        a.tar a.tar.gz a.tgz a.tar.bz2 a.tar.xz a.gz a.xz \
+                        a.mkv a.nfo a.sfv rar a.rarely a.r a.txt; do
+                   if is_archive "$n"; then echo "$n yes"; else echo "$n no"; fi
+               done'
+    [[ "$output" == *"a.rar yes"* ]]
+    [[ "$output" == *"A.RAR yes"* ]]
+    [[ "$output" == *"a.part01.rar yes"* ]]
+    [[ "$output" == *"a.r00 yes"* ]]
+    [[ "$output" == *"a.r15 yes"* ]]
+    [[ "$output" == *"a.zip yes"* ]]
+    [[ "$output" == *"a.z01 yes"* ]]
+    [[ "$output" == *"a.tar.gz yes"* ]]
+    # Not archives, including the names that look like one at a glance.
+    [[ "$output" == *"a.mkv no"* ]]
+    [[ "$output" == *"a.nfo no"* ]]
+    [[ "$output" == *"a.sfv no"* ]]
+    [[ "$output" == *"rar no"* ]]
+    [[ "$output" == *"a.rarely no"* ]]
+    [[ "$output" == *"a.r no"* ]]
+}
+
+@test "an archive downloaded on its own takes the directory permissions" {
+    d=$(mktemp -d)
+    touch "$d/Rel.rar" "$d/movie.mkv"
+    chmod 600 "$d/Rel.rar" "$d/movie.mkv"
+    run stage 'chmod=True; perms_dirs=755; perms_files=640
+               apply_perms "'"$d"'/Rel.rar"; apply_perms "'"$d"'/movie.mkv"'
+    # The archive is a container: it gets perms_dirs even though it is a file.
+    [ "$(stat -c '%a' "$d/Rel.rar")" = "755" ]
+    [ "$(stat -c '%a' "$d/movie.mkv")" = "640" ]
+    rm -rf "$d"
+}
+
+@test "an archive inside a downloaded directory takes them too, at any depth" {
+    d=$(mktemp -d)
+    mkdir -p "$d/CD1"
+    touch "$d/movie.mkv" "$d/Rel.rar" "$d/CD1/Rel.r00" "$d/CD1/part1.bin"
+    chmod 600 "$d/movie.mkv" "$d/Rel.rar" "$d/CD1/Rel.r00" "$d/CD1/part1.bin"
+    chmod 700 "$d" "$d/CD1"
+    run stage 'chmod=True; perms_dirs=755; perms_files=640; apply_perms "'"$d"'"'
+    [ "$(stat -c '%a' "$d")" = "755" ]
+    [ "$(stat -c '%a' "$d/CD1")" = "755" ]
+    [ "$(stat -c '%a' "$d/movie.mkv")" = "640" ]
+    [ "$(stat -c '%a' "$d/CD1/part1.bin")" = "640" ]
+    # Both parts of the set, one of them a directory deep.
+    [ "$(stat -c '%a' "$d/Rel.rar")" = "755" ]
+    [ "$(stat -c '%a' "$d/CD1/Rel.r00")" = "755" ]
+    rm -rf "$d"
+}
+
+# unrar finds the rest of a set itself, so only one volume of it is ever
+# unpacked. Every volume arrives as its own top-level entry, and without this
+# each of them would unpack the whole set again.
+@test "only the volume a set opens at counts as an entry point" {
+    run stage 'for n in a.rar A.RAR a.part01.rar a.part001.rar a.part1.rar \
+                        a.zip a.7z a.7z.001 a.tar a.tar.gz a.gz \
+                        a.part02.rar a.part10.rar a.r00 a.r01 \
+                        a.z01 a.7z.002 a.mkv a.nfo; do
+                   if archive_first_volume "$n"; then echo "$n yes"; else echo "$n no"; fi
+               done'
+    # Anything that is not multipart opens itself.
+    [[ "$output" == *"a.rar yes"* ]]
+    [[ "$output" == *"A.RAR yes"* ]]
+    [[ "$output" == *"a.part01.rar yes"* ]]
+    [[ "$output" == *"a.part001.rar yes"* ]]
+    [[ "$output" == *"a.part1.rar yes"* ]]
+    [[ "$output" == *"a.zip yes"* ]]
+    [[ "$output" == *"a.7z yes"* ]]
+    [[ "$output" == *"a.7z.001 yes"* ]]
+    [[ "$output" == *"a.tar yes"* ]]
+    [[ "$output" == *"a.tar.gz yes"* ]]
+    [[ "$output" == *"a.gz yes"* ]]
+    # The rest of a set, and things that are not archives at all.
+    [[ "$output" == *"a.part02.rar no"* ]]
+    [[ "$output" == *"a.part10.rar no"* ]]
+    [[ "$output" == *"a.r00 no"* ]]
+    [[ "$output" == *"a.r01 no"* ]]
+    [[ "$output" == *"a.z01 no"* ]]
+    [[ "$output" == *"a.7z.002 no"* ]]
+    [[ "$output" == *"a.mkv no"* ]]
+    [[ "$output" == *"a.nfo no"* ]]
+}
+
+# A stand-in for unrar that writes what a release looks like when it comes out
+# of one, into whatever directory it is run from.
+unrar_stub() {
+    cat <<'SNIP'
+    mkdir -p "$STUBDIR"
+    PATH="$STUBDIR:$PATH"
+    cat > "$STUBDIR/unrar" <<'STUB'
+#!/usr/bin/env bash
+mkdir -p sample
+printf 'movie\n' > movie.mkv
+printf 'info\n'  > release.nfo
+printf 'junk\n'  > sample/small.mkv
+STUB
+    chmod +x "$STUBDIR/unrar"
+SNIP
+}
+
+@test "archive_kind names the kind, compound suffixes first" {
+    run stage 'for n in a.rar a.r00 a.zip a.z01 a.7z a.7z.002 a.tar a.tar.gz \
+                        a.tgz a.tar.bz2 a.tar.xz a.txz a.tar.zst a.gz a.bz2 \
+                        a.xz a.zst a.mkv a.nfo a.r a.rarely; do
+                   if archive_kind "$n"; then echo "$n=$arch_kind"; else echo "$n=none"; fi
+               done'
+    [[ "$output" == *"a.rar=rar"* ]]
+    [[ "$output" == *"a.r00=rar"* ]]
+    [[ "$output" == *"a.zip=zip"* ]]
+    [[ "$output" == *"a.z01=zip"* ]]
+    [[ "$output" == *"a.7z=7z"* ]]
+    [[ "$output" == *"a.7z.002=7z"* ]]
+    # A .tar.gz is a tar, not a gz -- unpacking it as a gz would leave a .tar
+    # sitting there. The compound suffixes have to be tested first for that.
+    [[ "$output" == *"a.tar.gz=tar"* ]]
+    [[ "$output" == *"a.tgz=tar"* ]]
+    [[ "$output" == *"a.tar.bz2=tar"* ]]
+    [[ "$output" == *"a.tar.xz=tar"* ]]
+    [[ "$output" == *"a.tar.zst=tar"* ]]
+    # ... and on their own they are what they say.
+    [[ "$output" == *"a.gz=gz"* ]]
+    [[ "$output" == *"a.bz2=bz2"* ]]
+    [[ "$output" == *"a.xz=xz"* ]]
+    [[ "$output" == *"a.zst=zst"* ]]
+    [[ "$output" == *"a.mkv=none"* ]]
+    [[ "$output" == *"a.r=none"* ]]
+    [[ "$output" == *"a.rarely=none"* ]]
+}
+
+@test "archive_basename takes off the whole suffix, compound or multipart" {
+    run stage 'for n in X.rar X.part01.rar X.7z.001 X.zip X.tar X.tar.gz \
+                        X.tgz X.tar.bz2 X.tar.zst X.txt.gz; do
+                   archive_basename "$n"; echo "$n -> $arch_base"
+               done'
+    [[ "$output" == *"X.rar -> X"* ]]
+    [[ "$output" == *"X.part01.rar -> X"* ]]
+    [[ "$output" == *"X.7z.001 -> X"* ]]
+    [[ "$output" == *"X.tar.gz -> X"* ]]
+    [[ "$output" == *"X.tar.bz2 -> X"* ]]
+    [[ "$output" == *"X.tar.zst -> X"* ]]
+    # A .gz of one file keeps the name it had before it was compressed.
+    [[ "$output" == *"X.txt.gz -> X.txt"* ]]
+}
+
+@test "uncompress_exclude blacklists by kind, on spaces or commas" {
+    run stage 'for x in "" "zip" "zip 7z" "zip,7z" " ZIP , 7z " "rar"; do
+                   uncompress_exclude=$x
+                   out=""
+                   for k in rar zip 7z tar gz; do
+                       if archive_enabled "$k"; then out="$out $k"; fi
+                   done
+                   echo "[$x] ->$out"
+               done'
+    [ "${lines[0]}" = "[] -> rar zip 7z tar gz" ]
+    [ "${lines[1]}" = "[zip] -> rar 7z tar gz" ]
+    [ "${lines[2]}" = "[zip 7z] -> rar tar gz" ]
+    [ "${lines[3]}" = "[zip,7z] -> rar tar gz" ]
+    # Whitespace and case are not the user's problem.
+    [ "${lines[4]}" = "[ ZIP , 7z ] -> rar tar gz" ]
+    [ "${lines[5]}" = "[rar] -> zip 7z tar gz" ]
+}
+
+@test "a blacklist naming something that is not a kind says so" {
+    dl=$(mktemp -d)
+    run stage 'local_dl_dir="'"$dl"'"; record=/dev/null; errors=/dev/null
+               uncompress_exclude="zip, rarr, 7z"; LINESF=""; LINESD=""
+               POST_PROCESS'
+    [[ "$output" == *"no such archive kind: rarr"* ]]
+    # Only the one that is wrong.
+    [[ "$output" != *"no such archive kind: zip"* ]]
+    [[ "$output" != *"no such archive kind: 7z"* ]]
+    rm -rf "$dl"
+}
+
+@test "a compressed single file lands beside the archive, not in a directory" {
+    d=$(mktemp -d)
+    printf 'the contents\n' > "$d/notes.txt"
+    gzip -c "$d/notes.txt" > "$d/report.txt.gz"
+    rm -f "$d/notes.txt"
+    run stage 'errors=/dev/null
+        UNPACK_FILE "'"$d"'/report.txt.gz"; echo "out=${unpack_out#'"$d"'/}"'
+    [ "$output" = "out=report.txt" ]
+    # One file, named the way gzip names it, and no directory holding one thing
+    # of the same name.
+    [ "$(cat "$d/report.txt")" = "the contents" ]
+    [ ! -d "$d/report.txt" ]
+    [ -f "$d/report.txt.gz" ]
+    rm -rf "$d"
+}
+
+@test "a compressed file does not write over something already there" {
+    d=$(mktemp -d); err=$(mktemp)
+    printf 'new\n' > "$d/keep.txt"
+    gzip -c "$d/keep.txt" > "$d/keep.txt.gz"
+    printf 'do not lose me\n' > "$d/keep.txt"
+    run stage 'errors="'"$err"'"; profile=TV
+        UNPACK_FILE "'"$d"'/keep.txt.gz"; echo "out=[$unpack_out]"'
+    [ "$output" = "out=[]" ]
+    [ "$(cat "$d/keep.txt")" = "do not lose me" ]
+    [[ "$(cat "$err")" == *"in the way"* ]]
+    rm -rf "$d" "$err"
+}
+
+@test "a kind with no tool installed is stepped over and said once" {
+    d=$(mktemp -d); err=$(mktemp)
+    printf 'x\n' > "$d/Some.zip"
+    # A PATH holding date and nothing else: unzip is not installed as far as
+    # this is concerned, while log_event still has what it needs to say so.
+    mkdir -p "$d/onlybin"
+    ln -s "$(command -v date)" "$d/onlybin/date"
+    run stage 'errors="'"$err"'"; profile=TV
+        keep=$PATH; PATH="'"$d"'/onlybin"
+        if archive_tool zip; then echo "found"; else echo "none"; fi
+        UNPACK_FILE "'"$d"'/Some.zip"; echo "out=[$unpack_out]"
+        PATH=$keep'
+    [ "${lines[0]}" = "none" ]
+    [ "${lines[1]}" = "out=[]" ]
+    [[ "$(cat "$err")" == *"no tool for zip archives"* ]]
+    [ -f "$d/Some.zip" ]
+    rm -rf "$d" "$err"
+}
+
+@test "an archive of its own unpacks into a directory named after it" {
+    d=$(mktemp -d)
+    printf 'archive\n' > "$d/Some.Release-GRP.rar"
+    run stage "STUBDIR=$d/bin"$'\n'"$(unrar_stub)"'
+        errors=/dev/null
+        here=$PWD
+        UNPACK_FILE "'"$d"'/Some.Release-GRP.rar"
+        echo "out=${unpack_out#'"$d"'/}"
+        [ "$PWD" = "$here" ] && echo same || echo moved'
+    [ "${lines[0]}" = "out=Some.Release-GRP" ]
+    # The cd is kept in a subshell here as much as in UNPACK_DIR.
+    [ "${lines[1]}" = "same" ]
+    [ -f "$d/Some.Release-GRP/movie.mkv" ]
+    # Tidied the same way a release directory is.
+    [ ! -e "$d/Some.Release-GRP/release.nfo" ]
+    [ ! -e "$d/Some.Release-GRP/sample" ]
+    # The archive itself stays: it is the entry the listing and the record
+    # name, and POST_PROCESS would otherwise report it as never having arrived.
+    [ -f "$d/Some.Release-GRP.rar" ]
+    rm -rf "$d"
+}
+
+@test "a set unpacks once, from its first volume only" {
+    d=$(mktemp -d)
+    printf 'archive\n' > "$d/Set-GRP.part01.rar"
+    printf 'archive\n' > "$d/Set-GRP.part02.rar"
+    run stage "STUBDIR=$d/bin"$'\n'"$(unrar_stub)"'
+        errors=/dev/null
+        UNPACK_FILE "'"$d"'/Set-GRP.part01.rar"; echo "one=${unpack_out#'"$d"'/}"
+        UNPACK_FILE "'"$d"'/Set-GRP.part02.rar"; echo "two=[$unpack_out]"'
+    # Part one names the set without its volume suffix; part two does nothing.
+    [ "${lines[0]}" = "one=Set-GRP" ]
+    [ "${lines[1]}" = "two=[]" ]
+    [ -f "$d/Set-GRP/movie.mkv" ]
+    rm -rf "$d"
+}
+
+@test "an unpacking that fails leaves nothing behind and says so" {
+    d=$(mktemp -d); err=$(mktemp)
+    printf 'not an archive\n' > "$d/Broken-GRP.rar"
+    run stage 'mkdir -p "'"$d"'/bin"
+        printf "#!/bin/sh\nexit 1\n" > "'"$d"'/bin/unrar"
+        chmod +x "'"$d"'/bin/unrar"
+        PATH="'"$d"'/bin:$PATH"
+        errors="'"$err"'"; profile=TV
+        UNPACK_FILE "'"$d"'/Broken-GRP.rar"; echo "out=[$unpack_out]"'
+    [ "$output" = "out=[]" ]
+    # No empty directory left looking as though something had come out of it.
+    [ ! -e "$d/Broken-GRP" ]
+    [ -f "$d/Broken-GRP.rar" ]
+    [[ "$(cat "$err")" == *"could not be unpacked"* ]]
+    rm -rf "$d" "$err"
+}
+
+@test "an archive whose name is already taken by a file is left alone" {
+    d=$(mktemp -d); err=$(mktemp)
+    printf 'archive\n' > "$d/Some-GRP.rar"
+    printf 'in the way\n' > "$d/Some-GRP"
+    run stage "STUBDIR=$d/bin"$'\n'"$(unrar_stub)"'
+        errors="'"$err"'"; profile=TV
+        UNPACK_FILE "'"$d"'/Some-GRP.rar"; echo "out=[$unpack_out]"'
+    [ "$output" = "out=[]" ]
+    # The file that was there is untouched.
+    [ "$(cat "$d/Some-GRP")" = "in the way" ]
+    [[ "$(cat "$err")" == *"in the way"* ]]
+    rm -rf "$d" "$err"
+}
+
+# UNPACK_DIR has to run from the directory it unpacks into. It used to cd there
+# and stay, so everything after it resolved a relative path against the wrong
+# directory -- apply_perms's target among them, which left a downloaded
+# directory with none of its permissions applied.
+@test "unrarring does not move the process out of the working directory" {
+    d=$(mktemp -d)
+    mkdir -p "$d/Rel.Rar-GRP"
+    touch "$d/Rel.Rar-GRP/archive.rar"
+    run stage 'here=$PWD
+               PATH="'"$d"'/bin:$PATH"
+               mkdir -p "'"$d"'/bin"
+               printf "#!/bin/sh\nexit 0\n" > "'"$d"'/bin/unrar"
+               chmod +x "'"$d"'/bin/unrar"
+               UNPACK_DIR "'"$d"'/Rel.Rar-GRP"
+               [ "$PWD" = "$here" ] && echo same || echo "moved to $PWD"'
+    [ "$output" = "same" ]
+    rm -rf "$d"
+}
+
 @test "POST_PROCESS records what arrived, logs what did not, and verifies" {
     dl=$(mktemp -d); rec=$(mktemp); err=$(mktemp); ver=$(mktemp)
     printf 'four\n' > "$dl/here.nfo"          # five bytes
@@ -1295,16 +1928,16 @@ missing.nfo"; POST_PROCESS'
 @test "unrar runs only when autoUncompress asks for it" {
     dl=$(mktemp -d); mkdir "$dl/Rel.One-GRP"
     run stage 'local_dl_dir="'"$dl"'"; record=""; errors=""; verify=""
-               UNRAR_FUN () { echo "unrar $1"; }
+               UNPACK_DIR () { echo "unrar $1"; }
                LINESD="Rel.One-GRP"; POST_PROCESS'
     [ "$output" = "" ]
     run stage 'local_dl_dir="'"$dl"'"; record=""; errors=""; verify=""
-               autoUncompress=True; UNRAR_FUN () { echo "unrar $1"; }
+               autoUncompress=True; UNPACK_DIR () { echo "unrar $1"; }
                LINESD="Rel.One-GRP"; POST_PROCESS'
     [ "$output" = "unrar $dl/Rel.One-GRP" ]
     # -nu turns it off again even where the config asked for it.
     run stage 'local_dl_dir="'"$dl"'"; record=""; errors=""; verify=""
-               autoUncompress=True; nounrar=True; UNRAR_FUN () { echo "unrar $1"; }
+               autoUncompress=True; nounrar=True; UNPACK_DIR () { echo "unrar $1"; }
                LINESD="Rel.One-GRP"; POST_PROCESS'
     [ "$output" = "" ]
     rm -rf "$dl"
@@ -1869,16 +2502,55 @@ SNIP
 @test "SIZE, DATE and STATUS are pinned to the right-hand edge" {
     run stage "$(tree)"'
         TUI_COLS=80; tui_statusw=0; tui_widths; tui_name_field
-        echo "$(( 2 + tui_namefld + tui_metaw )) $tui_metaw"
+        echo "$(( tui_gutw + 2 + tui_namefld + tui_metaw )) $tui_metaw"
         TUI_COLS=120; tui_name_field
-        echo "$(( 2 + tui_namefld + tui_metaw )) $tui_metaw"'
+        echo "$(( tui_gutw + 2 + tui_namefld + tui_metaw )) $tui_metaw"'
     # The row reaches the right-hand edge exactly, at either width: the
     # metadata block keeps its size and the name column takes up the slack.
-    # (The 2 is the mark gutter.)
+    # (The 2 is the mark gutter; tui_gutw is the line numbers to the left of
+    # it, which take their width off the name column like any other.)
     [ "${lines[0]}" = "80 ${lines[0]#* }" ]
     [ "${lines[1]}" = "120 ${lines[1]#* }" ]
     # ... and the block itself did not change size between the two.
     [ "${lines[0]#* }" = "${lines[1]#* }" ]
+}
+
+# A name longer than the room there is used to be given its full width anyway,
+# which made the row longer than the terminal -- and tui_fit then cut it at the
+# right-hand edge, which is the end SIZE, DATE and STATUS are pinned to. The
+# moment a transfer started and the STATUS column appeared, the columns were
+# pushed off the screen: sizes and statuses that "looked fine until I started
+# downloading".
+@test "a name too long for the row is cut, and the columns are not" {
+    run stage "$(tree)"'
+        N=Some.Long.Release.Name.2026.1080p.WEB-DL.DDP5.1.H.264-GROUPNAME
+        TUI_NAME[0]="$N@"; TUI_SIZE[0]=4.1G; TUI_DATE[0]="2026-08-23 17:10"
+        TUI_COLS=80; TUI_LINES=10; tui_rows_calc; tui_widths
+        tui_cur=0; tui_top=0
+        TUI_STATUS[0]="42%"; tui_status_width
+        tui_name_field
+        echo "row=$(( tui_gutw + 2 + tui_namefld + tui_metaw )) namew=$tui_namew"
+        exec {TUI_OUT}>&1
+        tui_draw' 
+    # The row still ends exactly at the edge, even though the longest name on
+    # its own is wider than the space left for it.
+    [ "${lines[0]}" = "row=80 namew=64" ]
+    # The heading and the row both keep every column, STATUS included.
+    [[ "$output" == *"SIZE"*"DATE"*"STATUS"* ]]
+    [[ "$output" == *"4.1G"*"2026-08-23 17:10"*"42%"* ]]
+    # ... and the name is what gave way.
+    [[ "$output" != *"264-GROUPNAME"* ]]
+}
+
+@test "the name column has a floor, so it never disappears entirely" {
+    run stage "$(tree)"'
+        TUI_COLS=30; tui_statusw=0; tui_widths; tui_name_field
+        echo "$tui_namefld"
+        TUI_COLS=10; tui_name_field; echo "$tui_namefld"'
+    # 30 columns leaves the name nothing once the metadata has its share, and
+    # a name cut to nothing says less than a cut-off date does.
+    [ "${lines[0]}" = "12" ]
+    [ "${lines[1]}" = "12" ]
 }
 
 @test "a column is never narrower than its own heading" {
@@ -2043,6 +2715,59 @@ SNIP
         KEYS=(q); tui_quit_prompt
         echo "simple=$tui_quit_simple answer=$tui_answer"'
     [ "$output" = "simple=0 answer=exit" ]
+}
+
+@test "confirm_quit=False quits without asking when there is nothing to ask" {
+    # No keys at all: reaching tui_read_key would end the loop with "exit", so
+    # an answer of "save" is proof that nothing was read.
+    run stage "$(tree)"$'\n'"$(keys)"'
+        confirm_quit=False
+        KEYS=(); tui_quit_prompt
+        echo "answer=$tui_answer prompt=[$tui_prompt] simple=$tui_quit_simple"'
+    [ "$output" = "answer=save prompt=[] simple=1" ]
+}
+
+# The dangerous direction, and the one the option deliberately does not cover:
+# with something still to carry out, quitting throws it away and still asks.
+@test "confirm_quit=False still asks when there is something to lose" {
+    run stage "$(tree)"$'\n'"$(keys)"'
+        confirm_quit=False
+        tui_cur=0; tui_toggle
+        KEYS=(q); tui_quit_prompt
+        echo "answer=$tui_answer simple=$tui_quit_simple"'
+    [ "$output" = "answer=exit simple=0" ]
+
+    # An unlink or a delete is something to carry out as much as a download is.
+    run stage "$(tree)"$'\n'"$(keys)"'
+        confirm_quit=False
+        tui_cur=0; tui_mark_remove
+        KEYS=(c); tui_quit_prompt
+        echo "answer=$tui_answer simple=$tui_quit_simple"'
+    [ "$output" = "answer=cancel simple=0" ]
+}
+
+# A transfer that is still going keeps its node marked and unfinished, so
+# tui_pending is true and the question -- which says what will be stopped --
+# is asked whatever confirm_quit says.
+@test "confirm_quit=False still asks with a transfer in flight" {
+    run stage "$(tree)"$'\n'"$(keys)"$'\n'"$(fakerun)"$'\n'"$(picked)"'
+        confirm_quit=False
+        tui_dl_enqueue
+        tui_dl_busy && echo busy || echo idle
+        KEYS=(c); tui_quit_prompt
+        echo "answer=$tui_answer simple=$tui_quit_simple"'
+    [ "${lines[0]}" = "busy" ]
+    [ "${lines[1]}" = "answer=cancel simple=0" ]
+}
+
+@test "confirm_quit is only turned off by a plain False" {
+    # tui_select validates it the way it validates every other picker setting:
+    # a typo leaves the confirmation on rather than quietly taking it away.
+    run stage 'confirm_quit=no
+        listfile=$(mktemp); listfile2=$(mktemp); tui_dev_tty=0
+        tui_select > /dev/null 2>&1 || true
+        echo "$confirm_quit"'
+    [ "$output" = "True" ]
 }
 
 @test "an entry already downloaded does not count as something to save" {

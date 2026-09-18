@@ -115,6 +115,121 @@ PICK
     [ ! -e "$DL/notes.nfo" ]
 }
 
+# Space steps down and shift+space steps back up, so two keystrokes from the
+# top mark both entries. This is also the only place the "\e[32;2u" spelling is
+# read by tui_read_key for real: the escape sequence ends on a letter, and "u"
+# is one.
+@test "space and shift-space walk the list as they mark it" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\x20 \e[32;2u q s' --delay 0.5 -- "$ALFTP" -a TV -t -nu
+    # Space took the release and moved onto notes.nfo; shift-space took that
+    # and moved back up, so both are marked and both come across.
+    [[ "$output" == *"2 selection(s)"* ]]
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+    [ -f "$DL/notes.nfo" ]
+}
+
+# The counts and the gutter under a real terminal, where the keys are read one
+# at a time by tui_read_key rather than handed over in an array.
+@test "a count and gg drive the cursor under a real terminal" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    # Two down, mark it, then gg back to the top and mark that too.
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '2 j \x20 g g \x20 q s' --delay 0.4 -- "$ALFTP" -a TV -t -nu -do
+    [[ "$output" == *"2 selection(s)"* ]]
+    # Rel.One-GRP is the first row and notes.nfo the third; the middle row is
+    # the one nothing was asked of.
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+    [ -f "$DL/notes.nfo" ]
+}
+
+@test "the gutter numbers the rows, relative to the one under the cursor" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys 'j q e' --screen --delay 0.4 -- "$ALFTP" -a TV -t -nu -do
+    # Cursor on the second row: 1 above it, its own line number on it, 1 below.
+    [[ "$output" =~ 1[[:space:]]+Rel\.One-GRP@ ]]
+    [[ "$output" =~ 2[[:space:]]+notes\.nfo@ ]]
+}
+
+# "q" on its own, with nothing marked: no prompt is drawn and the picker is
+# gone. The listing is still written back, which is what confirming the
+# question would have done.
+@test "confirm_quit=False leaves the picker on one keystroke" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\nconfirm_quit=False\n' "$SRV/alftp.lock" \
+        >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys 'q' --delay 1.0 -- "$ALFTP" -a TV -t -nu -do
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"(c)ancel"* ]]
+    # Nothing was marked, so nothing came across.
+    [ ! -e "$DL/Rel.One-GRP" ]
+    [ ! -e "$DL/notes.nfo" ]
+}
+
+@test "confirm_quit=False still asks when something is marked" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\nconfirm_quit=False\n' "$SRV/alftp.lock" \
+        >> "$home/.config/alftp/alftp.conf"
+    # Mark the first entry, then q: the three-way question is drawn, and "s"
+    # is what makes the download happen.
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '\x20 q s' --delay 0.5 -- "$ALFTP" -a TV -t -nu -do
+    [[ "$output" == *"(s)ave and download"* ]]
+    [ -f "$DL/Rel.One-GRP/movie.mkv" ]
+}
+
+@test "? shows every binding, and a key takes it away again" {
+    if ! command -v python3 > /dev/null 2>&1; then
+        skip "python3 is needed to drive a pty"
+    fi
+    home=$(srv_home)
+    sed -i '/^picker=/d' "$home/.config/alftp/alftp.conf"
+    printf 'lockfile="%s"\n' "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" TERM=xterm-256color \
+        python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
+        --keys '? j x q e' --delay 0.4 -- "$ALFTP" -a TV -t -nu -do
+    [ "$status" -eq 0 ]
+    # The window was painted, headings and all.
+    [[ "$output" == *"MOVING"* ]]
+    [[ "$output" == *"PICKING"* ]]
+    [[ "$output" == *"mark, then step down"* ]]
+    [[ "$output" == *"j/k to scroll"* ]]
+    # "x" shut it rather than asking to delete the entry under the cursor, and
+    # the run ended with nothing marked.
+    [[ "$output" != *"delete Rel.One-GRP"* ]]
+    [ ! -e "$DL/Rel.One-GRP" ]
+    [ -L "$SRV/complete/TV/Rel.One-GRP" ]
+}
+
 # ---------------------------------------------------------------- audit fixes
 #
 # These run the whole script, so they need a lock file of their own: the real
@@ -220,6 +335,229 @@ perms_files=640' -a TV -q -nu
     [ "$(stat -c '%a' "$DL/Rel.One-GRP")" = "755" ]
     [ "$(stat -c '%a' "$DL/Rel.One-GRP/movie.mkv")" = "640" ]
     [ "$(stat -c '%a' "$DL/Rel.One-GRP/CD1")" = "755" ]
+}
+
+# What comes out of an archive is downloaded content like any other, so the
+# permissions apply to it too. A stand-in for unrar stands in for the real one:
+# what is under test is what alftp does around it, not the unpacking.
+srv_unrar_stub() {
+    mkdir -p "$SRV/bin"
+    cat > "$SRV/bin/unrar" <<'STUB'
+#!/usr/bin/env bash
+# unrar e -n -r -or <dir>
+d=${*: -1}
+mkdir -p "$d/extracted.sub"
+printf 'out\n' > "$d/extracted.mkv"
+printf 'out\n' > "$d/extracted.sub/inner.mkv"
+chmod 600 "$d/extracted.mkv" "$d/extracted.sub/inner.mkv"
+chmod 700 "$d/extracted.sub"
+STUB
+    chmod +x "$SRV/bin/unrar"
+}
+
+# A release delivered as an archive, a loose archive beside it, and a set
+# whose volumes each arrive as a top-level entry of their own.
+srv_archives() {
+    mkdir -p "$SRV/data/TV/Rel.Rar-GRP"
+    printf 'not really rar\n' > "$SRV/data/TV/Rel.Rar-GRP/archive.rar"
+    printf 'keep me\n'        > "$SRV/data/TV/Rel.Rar-GRP/readme.txt"
+    ln -s ../../data/TV/Rel.Rar-GRP "$SRV/complete/TV/Rel.Rar-GRP"
+    for f in loose.rar Set.Rel-GRP.part01.rar Set.Rel-GRP.part02.rar Orphan.r00; do
+        printf 'archive\n' > "$SRV/data/TV/$f"
+        ln -s "../../data/TV/$f" "$SRV/complete/TV/$f"
+    done
+}
+
+# An unrar that writes what a release looks like when it comes out of one,
+# into whatever directory it is run from.
+srv_unrar_file_stub() {
+    mkdir -p "$SRV/bin"
+    cat > "$SRV/bin/unrar" <<'STUB'
+#!/usr/bin/env bash
+mkdir -p sample
+printf 'movie\n' > movie.mkv
+printf 'info\n'  > release.nfo
+printf 'junk\n'  > sample/small.mkv
+echo "$*" >> "$UNRAR_LOG"
+STUB
+    chmod +x "$SRV/bin/unrar"
+}
+
+# Real archives of every kind alftp claims to open, built with the tools that
+# are on the machine. Only rar has no writer here, which is why that one stays
+# a stub -- everything else is unpacked by the real extractor.
+srv_real_archives() {
+    mkdir -p "$SRV/build/Payload-GRP/inner"
+    printf 'movie\n' > "$SRV/build/Payload-GRP/movie.mkv"
+    printf 'deep\n'  > "$SRV/build/Payload-GRP/inner/deep.mkv"
+    ( cd "$SRV/build" && zip -qr "$SRV/data/TV/Zip.Rel-GRP.zip" Payload-GRP )
+    ( cd "$SRV/build" && 7z a -bso0 -bsp0 "$SRV/data/TV/Seven.Rel-GRP.7z" Payload-GRP > /dev/null )
+    ( cd "$SRV/build" && tar -czf "$SRV/data/TV/Tar.Rel-GRP.tar.gz" Payload-GRP )
+    ( cd "$SRV/build" && tar -cJf "$SRV/data/TV/Xz.Rel-GRP.tar.xz" Payload-GRP )
+    printf 'a single file\n' > "$SRV/build/plain.txt"
+    gzip -c "$SRV/build/plain.txt" > "$SRV/data/TV/Gz.Rel-GRP.txt.gz"
+    for f in Zip.Rel-GRP.zip Seven.Rel-GRP.7z Tar.Rel-GRP.tar.gz Xz.Rel-GRP.tar.xz Gz.Rel-GRP.txt.gz; do
+        ln -s "../../data/TV/$f" "$SRV/complete/TV/$f"
+    done
+}
+
+@test "every archive kind is unpacked by its own tool" {
+    srv_real_archives
+    home=$(srv_home)
+    printf 'lockfile="%s"\nautoUncompress=True\nchmod=True\nperms_dirs=755\nperms_files=640\n' \
+        "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" "$ALFTP" -a TV -q
+    [ "$status" -eq 0 ]
+    # Each into a directory named after it, with the paths it was packed with
+    # kept -- a tree flattened into one directory would be a mess.
+    [ -f "$DL/Zip.Rel-GRP/Payload-GRP/movie.mkv" ]
+    [ -f "$DL/Zip.Rel-GRP/Payload-GRP/inner/deep.mkv" ]
+    [ -f "$DL/Seven.Rel-GRP/Payload-GRP/inner/deep.mkv" ]
+    [ -f "$DL/Tar.Rel-GRP/Payload-GRP/inner/deep.mkv" ]
+    [ -f "$DL/Xz.Rel-GRP/Payload-GRP/inner/deep.mkv" ]
+    # A .gz is one compressed file, not a container: it decompresses to one
+    # file beside the archive rather than into a directory of its own. And
+    # ".tar.gz" above went to tar, not to gzip.
+    [ "$(cat "$DL/Gz.Rel-GRP.txt")" = "a single file" ]
+    [ ! -d "$DL/Gz.Rel-GRP.txt" ]
+    # The permissions reach what came out, whichever tool produced it.
+    [ "$(stat -c '%a' "$DL/Zip.Rel-GRP")" = "755" ]
+    [ "$(stat -c '%a' "$DL/Zip.Rel-GRP/Payload-GRP/movie.mkv")" = "640" ]
+    [ "$(stat -c '%a' "$DL/Tar.Rel-GRP/Payload-GRP/inner")" = "755" ]
+    # ... and every archive is kept, with the directory permissions.
+    [ "$(stat -c '%a' "$DL/Zip.Rel-GRP.zip")" = "755" ]
+    [ "$(stat -c '%a' "$DL/Tar.Rel-GRP.tar.gz")" = "755" ]
+}
+
+@test "uncompress_exclude turns one kind off and leaves the rest" {
+    srv_real_archives
+    home=$(srv_home)
+    printf 'lockfile="%s"\nautoUncompress=True\nuncompress_exclude="zip, 7z"\n' \
+        "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" "$ALFTP" -a TV -q
+    [ "$status" -eq 0 ]
+    # Blacklisted: downloaded, kept, not opened.
+    [ -f "$DL/Zip.Rel-GRP.zip" ]
+    [ ! -e "$DL/Zip.Rel-GRP" ]
+    [ -f "$DL/Seven.Rel-GRP.7z" ]
+    [ ! -e "$DL/Seven.Rel-GRP" ]
+    # Everything else carries on as before.
+    [ -f "$DL/Tar.Rel-GRP/Payload-GRP/movie.mkv" ]
+    [ -f "$DL/Xz.Rel-GRP/Payload-GRP/movie.mkv" ]
+}
+
+@test "archives inside a downloaded directory are unpacked too, and removed" {
+    mkdir -p "$SRV/build/Payload-GRP" "$SRV/data/TV/Mixed.Rel-GRP"
+    printf 'movie\n' > "$SRV/build/Payload-GRP/movie.mkv"
+    ( cd "$SRV/build" && zip -qr "$SRV/data/TV/Mixed.Rel-GRP/inner.zip" Payload-GRP )
+    printf 'loose\n' > "$SRV/data/TV/Mixed.Rel-GRP/readme.txt"
+    ln -s ../../data/TV/Mixed.Rel-GRP "$SRV/complete/TV/Mixed.Rel-GRP"
+    home=$(srv_home)
+    printf 'lockfile="%s"\nautoUncompress=True\nchmod=True\nperms_dirs=755\nperms_files=640\n' \
+        "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" "$ALFTP" -a TV -q
+    [ "$status" -eq 0 ]
+    # Unpacked into the directory that held it -- a release directory is where
+    # its own content belongs -- and the archive deleted afterwards, which is
+    # what makes this different from an archive downloaded on its own.
+    [ -f "$DL/Mixed.Rel-GRP/Payload-GRP/movie.mkv" ]
+    [ ! -e "$DL/Mixed.Rel-GRP/inner.zip" ]
+    [ -f "$DL/Mixed.Rel-GRP/readme.txt" ]
+    [ "$(stat -c '%a' "$DL/Mixed.Rel-GRP/Payload-GRP/movie.mkv")" = "640" ]
+}
+
+@test "an archive downloaded on its own is unpacked beside itself" {
+    srv_archives
+    srv_unrar_file_stub
+    home=$(srv_home)
+    printf 'lockfile="%s"\nautoUncompress=True\nchmod=True\nperms_dirs=755\nperms_files=640\n' \
+        "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" PATH="$SRV/bin:$PATH" UNRAR_LOG="$SRV/unrar.log" \
+        "$ALFTP" -a TV -q
+    [ "$status" -eq 0 ]
+    # Into a directory named after the archive, not scattered across the
+    # download directory it shares with every other entry.
+    [ -f "$DL/loose/movie.mkv" ]
+    [ "$(stat -c '%a' "$DL/loose")" = "755" ]
+    [ "$(stat -c '%a' "$DL/loose/movie.mkv")" = "640" ]
+    # Tidied like a release directory, and the archive itself kept.
+    [ ! -e "$DL/loose/sample" ]
+    [ "$(stat -c '%a' "$DL/loose.rar")" = "755" ]
+    # A set is opened once, at its first volume; a stray continuation volume
+    # is not an entry point at all.
+    [ -f "$DL/Set.Rel-GRP/movie.mkv" ]
+    [ ! -e "$DL/Set.Rel-GRP.part02" ]
+    [ ! -e "$DL/Orphan" ]
+    [ "$(grep -c . "$SRV/unrar.log")" = "3" ]
+}
+
+@test "-nu leaves a loose archive packed" {
+    srv_archives
+    srv_unrar_file_stub
+    home=$(srv_home)
+    printf 'lockfile="%s"\nautoUncompress=True\n' "$SRV/alftp.lock" \
+        >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" PATH="$SRV/bin:$PATH" UNRAR_LOG="$SRV/unrar.log" \
+        "$ALFTP" -a TV -q -nu
+    [ "$status" -eq 0 ]
+    [ -f "$DL/loose.rar" ]
+    [ ! -e "$DL/loose" ]
+    [ ! -e "$SRV/unrar.log" ]
+}
+
+@test "what came out of an archive gets the permissions too" {
+    srv_archives
+    srv_unrar_stub
+    home=$(srv_home)
+    printf 'lockfile="%s"\nautoUncompress=True\nchmod=True\nperms_dirs=755\nperms_files=640\nchown=True\nowner=%s\n' \
+        "$SRV/alftp.lock" "$(id -un)" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" PATH="$SRV/bin:$PATH" "$ALFTP" -a TV -q
+    [ "$status" -eq 0 ]
+    # Unpacked into the directory it was downloaded to, and everything that
+    # came out has the permissions -- at the top of it and a level down.
+    [ "$(stat -c '%a' "$DL/Rel.Rar-GRP/extracted.mkv")" = "640" ]
+    [ "$(stat -c '%a' "$DL/Rel.Rar-GRP/extracted.sub")" = "755" ]
+    [ "$(stat -c '%a' "$DL/Rel.Rar-GRP/extracted.sub/inner.mkv")" = "640" ]
+    [ "$(stat -c '%U' "$DL/Rel.Rar-GRP/extracted.mkv")" = "$(id -un)" ]
+    # The loose archive is a container, so it takes the directory permissions.
+    [ "$(stat -c '%a' "$DL/loose.rar")" = "755" ]
+}
+
+# The same run with a relative dl_dir. UNPACK_DIR cd's into what it unpacks, and
+# leaving the process there resolved every path after it against the wrong
+# directory: the content was unpacked into a duplicate of its own path and the
+# permissions were applied to nothing.
+@test "a relative dl_dir survives an unrar" {
+    srv_archives
+    srv_unrar_stub
+    home=$(srv_home)
+    sed -i "s|^dl_dir='.*'|dl_dir='dl'|" "$home/.config/alftp/alftp.src.conf"
+    printf 'lockfile="%s"\nautoUncompress=True\nchmod=True\nperms_dirs=755\nperms_files=640\n' \
+        "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    mkdir -p "$SRV/work/dl"
+    cd "$SRV/work"
+    run env HOME="$home" PATH="$SRV/bin:$PATH" "$ALFTP" -a TV -q
+    [ "$status" -eq 0 ]
+    [ -f "$SRV/work/dl/Rel.Rar-GRP/extracted.mkv" ]
+    # Not dl/Rel.Rar-GRP/dl/Rel.Rar-GRP/, which is where it used to land.
+    [ ! -e "$SRV/work/dl/Rel.Rar-GRP/dl" ]
+    # ... and the permissions reached the directory rather than missing it.
+    [ "$(stat -c '%a' "$SRV/work/dl/Rel.Rar-GRP/readme.txt")" = "640" ]
+    [ "$(stat -c '%a' "$SRV/work/dl/Rel.Rar-GRP/extracted.mkv")" = "640" ]
+}
+
+# With -nu the archive is still there to be chmodded, which is the only way to
+# see what an archive inside a release is given.
+@test "an archive left unpacked still takes the directory permissions" {
+    srv_archives
+    home=$(srv_home)
+    printf 'lockfile="%s"\nchmod=True\nperms_dirs=755\nperms_files=640\n' \
+        "$SRV/alftp.lock" >> "$home/.config/alftp/alftp.conf"
+    run env HOME="$home" "$ALFTP" -a TV -q -nu
+    [ "$status" -eq 0 ]
+    [ "$(stat -c '%a' "$DL/Rel.Rar-GRP/archive.rar")" = "755" ]
+    [ "$(stat -c '%a' "$DL/Rel.Rar-GRP/readme.txt")" = "640" ]
+    [ "$(stat -c '%a' "$DL/loose.rar")" = "755" ]
 }
 
 @test "an x entry loses its symlink and the data behind it" {
@@ -381,7 +719,8 @@ PICK
     # also matches every run that happens at 23 minutes past.
     row=$(printf '%s\n' "$output" | grep -m1 'notes\.nfo@')
     [ -n "$row" ]
-    read -r _name _size _rest <<< "$row"
+    # The line-number gutter comes first, then the name, then the size.
+    read -r _num _name _size _rest <<< "$row"
     [ "$_size" = "11" ]
 }
 
@@ -740,12 +1079,16 @@ COUNTER
         python3 "${BATS_TEST_DIRNAME}/helpers/ptydrive.py" \
         --keys '\x0c \t q e' --delay 1.0 -- "$ALFTP" -i TV -t -nu -do
     [ "$status" -eq 0 ]
-    # Exactly as it behaved before there was a walk: no walk, one login for the
-    # directory, and the symlink's own length back in the size column.
+    # Exactly as it behaved before there was a walk: no walk, and one login for
+    # the directory Tab opened.
     [ ! -f "$SRV/walks" ]
     [ -f "$SRV/fetches" ]
     [[ "$output" == *"movie.mkv"* ]]
-    [[ "$output" =~ Rel\.One-GRP@[[:space:]]+25[[:space:]] ]]
+    # With no walk there is no size for the release, and the column is left
+    # empty: the figure the listing carries is the length of the symlink, and
+    # this used to assert it. See "a symlink's own length is never used as the
+    # entry's size" in tests/alftp.bats -- the name runs straight into the date.
+    [[ "$output" =~ Rel\.One-GRP@[[:space:]]+[0-9][0-9][0-9][0-9]- ]]
 }
 
 @test "srcs mode waits for a src to be opened before walking it" {

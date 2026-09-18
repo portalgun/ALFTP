@@ -134,19 +134,21 @@ happens in the terminal UI by default, and in `$editor` where the terminal canno
 
 ### The terminal UI
 ```
-  NAME                                 SIZE  DATE              STATUS
-* Some.Release.2026-GRP/               4.1G  2026-08-23 17:10
-    CD1/                               2.0G  2026-08-23 17:10       c
-+   CD2/                               2.0G  2026-08-23 17:10      37%
-+   release.nfo                        2.1K  2026-08-23 17:10
-- Another.Release-GRP/                 2.7G  2026-08-23 14:42
-x Old.Release-GRP/                     1.4G  2026-08-20 08:11
-  notes.nfo                            2.1K  2026-08-22 09:03       i
+     NAME                              SIZE  DATE              STATUS
+ 3 * Some.Release.2026-GRP/            4.1G  2026-08-23 17:10
+ 2     CD1/                            2.0G  2026-08-23 17:10       c
+ 1 +   CD2/                            2.0G  2026-08-23 17:10      37%
+ 4 +   release.nfo                     2.1K  2026-08-23 17:10
+ 1 - Another.Release-GRP/              2.7G  2026-08-23 14:42
+ 2 x Old.Release-GRP/                  1.4G  2026-08-20 08:11
+ 3   notes.nfo                         2.1K  2026-08-22 09:03       i
 
  alftp  /remote/dir      2 selected, 1 to unlink, 1 to delete  completed=T
- j/k  M-j/k  space pick  enter go  c cancel  tab  d/x  r/R  t  u  q quit
+ ? keys
 ```
-The column headings are the top line. The **status bar is always the second line from the
+The column headings are the top line and the line numbers are the left-hand one: each row says how
+far it is from the cursor, and the row under the cursor — `release.nfo` above — says which line it
+actually is, which is the number `G` takes. The **status bar is always the second line from the
 bottom** — the remote directory, what is marked, how many transfers are running, and whether
 completed entries are being shown — and the line below it is where messages, key hints and
 questions appear. Both of the things that change while you sit in the picker are therefore in the
@@ -166,10 +168,18 @@ The far-left column is what will happen to each entry:
 
 **Everything starts deselected** — `a` selects the lot if that is what you want, `A` clears it again.
 
+Press `?` for a window listing every one of them, over the top of the list. `j`/`k` scroll it if it
+is taller than the terminal, and any other key takes it away again — the key that closes it is spent
+doing that and does not also act on the list, so `?` then `x` costs you nothing.
+
 | key | |
 | --- | --- |
+| `?` | show every keybinding |
 | `j` / `k`, `↓` / `↑` | move down / up |
-| `space` | toggle the entry under the cursor |
+| a count first | `2j` is two lines down, `3k` three up — see *Counts* |
+| `gg` / `G` | jump to the first / last line; with a count, to that line (`5G`) |
+| `space` | toggle the entry under the cursor, then move down to the next one |
+| `Shift`+`space` | toggle it and move *up* instead — see *Shift+space and your terminal* |
 | `enter` | start downloading everything marked `+` — see *Downloading from the picker* |
 | `tab` | open a directory, or close it again |
 | `Alt`+`j` / `Alt`+`k`, `Alt`+`↓` / `Alt`+`↑` | move the entry itself down / up — the order is the download order |
@@ -180,14 +190,17 @@ The far-left column is what will happen to each entry:
 | `u` | check the remote for changes now |
 | `c` | cancel the queued or downloading entry under the cursor |
 | `PgDn` / `PgUp` | move a screen at a time |
-| `0` / `Home`, `G` / `End` | jump to the top / bottom |
+| `0` / `Home`, `End` | jump to the top / bottom |
 | `a` / `A` | select all / select none — the `-` and `x` marks are left alone |
 | `q` / `Esc` | quit, which asks first |
 
 `q` asks `(c)ancel`, `(s)ave and download`, or `(e)xit without downloading` — but only when there
 is something to decide. If nothing is marked, or everything marked has already been transferred
 from inside the picker, saving and not saving amount to the same thing, so it just asks
-`(c)ancel` or `(q)uit`. An empty listing opens the picker as usual rather than dropping you back
+`(c)ancel` or `(q)uit` — and `confirm_quit=False` in the config skips even that, so `q` leaves
+straight away. It skips only that question: with anything still to carry out — something marked
+and not yet transferred, an unlink, a delete, or a transfer still running — quitting throws work
+away, and that is asked about whatever `confirm_quit` says. An empty listing opens the picker as usual rather than dropping you back
 at the shell: `u` can ask the remote again from in there. Cancel puts you back in
 the list; save writes your selection to the list file and the download starts; exit leaves the list
 file empty, so nothing is downloaded and the run ends. `Ctrl-C` does the same as exit.
@@ -198,12 +211,55 @@ directory is listed once, over a short lftp login of its own — the session tha
 sitting inside its `!` waiting for you, so it cannot do the listing itself. If the server refuses
 that second connection the footer says so and the directory stays closed; nothing else is affected.
 
+`space` moves down to the next entry after it marks one, and `Shift`+`space` moves up, so a run of
+entries can be picked without reaching for `j` between them. On the last entry `space` marks it and
+stays there, as `Shift`+`space` does on the first — neither wraps around.
+
 Inside an open directory you can pick individual entries with `space`. `d` is refused below the top
 level, because the symlink it removes is the top-level entry itself; `x` is not, because the data it
 removes is right there. Picking part of a directory turns it into a `*`, and `space` on a `*` takes the whole
 selection back. `space` on a directory that has nothing picked inside it takes the directory whole
 (its contents then show `+` without being listed separately), and taking any one entry back out of
 it turns it into a `*` with everything else still picked.
+
+### Counts
+Any motion takes a count in front of it, as in vi: `2j` moves two lines down, `3k` three up, `2`
+`Alt`+`j` moves the entry itself down two places, and a count on `PgDn` / `PgUp` is that many
+screens. A count runs out at the ends of the list rather than wrapping, and it belongs to the one
+key that follows it — the next `j` moves one line again.
+
+`gg` and `G` are the exception: a count makes them a line *number* rather than a distance, so `5G`
+goes to the fifth line. Without one they are the first and last lines. `0` and `Home` still go to
+the top too; `0` counts as a digit only once a count is already being typed, which is what lets
+`10j` work.
+
+A count being typed shows in the right of the status bar, as does the `g` waiting for its second
+half. `Esc` takes either back — it only quits the picker when there is nothing pending.
+
+### Line numbers
+The left-hand gutter numbers the rows the way vi's `relativenumber` does: every row says how far it
+is from the cursor, and the row under the cursor says which line it actually is — the number `G`
+takes. `line_numbers=False` in the config leaves it out, and the name column gets the room back.
+
+### Shift+space and your terminal
+Terminals do not send `Shift`+`space` as anything of its own by default — it arrives as a plain
+space, and nothing in the byte stream distinguishes the two — so out of the box `Shift`+`space`
+simply behaves like `space`. Everything else works; you only lose the upward direction.
+
+alftp does not turn on a keyboard protocol to get it, because both of the protocols that would
+report it (kitty's, and xterm's `modifyOtherKeys`) also stop `Ctrl-C` from raising `SIGINT`, and
+`Ctrl-C` is how you abandon a picker session. Instead it accepts either spelling if your terminal
+is asked to send one, which takes a single line in your terminal's own configuration:
+
+| terminal | |
+| --- | --- |
+| Alacritty | `[[keyboard.bindings]]` with `key = "Space"`, `mods = "Shift"`, `chars = "\u001b[32;2u"` |
+| kitty | `map shift+space send_text all \x1b[32;2u` |
+| WezTerm | a `SendString` key binding of `"\x1b[32;2u"` for `Space` with `SHIFT` |
+| xterm | `*vt100.translations: #override Shift <Key>space: string(0x1b) string("[32;2u")` |
+
+The two spellings alftp reads are `\e[32;2u` (the `CSI u` form) and `\e[27;2;32~` (the
+`modifyOtherKeys` form); either will do.
 
 ### What is already downloaded
 Where alftp can work it out, the list carries a `STATUS` column saying whether an entry is already
@@ -232,6 +288,10 @@ rather than guessing:
   the size column is the length of the link itself, so alftp takes a second size listing — of the
   data directory the links point into — and uses that. It is what the `SIZE` column shows for a
   file, too, so the picker no longer reports the length of a symlink as the size of a release.
+  Where no real size is known the column is simply left **empty**, and the entry gets no status:
+  the link's own length is never used as a stand-in. It is a small number that any part-downloaded
+  file is already bigger than, so using it read as "complete" for entries that were nothing of the
+  kind — and `t` then hid them.
 - **A directory** is complete when every entry in it is. `tab` on one is what makes that knowable,
   since only then is there a list of entries to check — and with `recursive_listing` on, which it is
   by default, that list arrives for the whole tree at once and every directory has a real total (see
@@ -497,13 +557,72 @@ $ alftp -a docs -ls
 None of this happens unless the config asks for it — what arrives keeps the permissions, owner and
 packaging it came with.
 
+Unpacking runs before the permissions do, so what came out of an archive is walked by the same pass
+that walks everything else: extracted files and directories get `perms_files`/`perms_dirs` and the
+owner, exactly as if they had been downloaded that way.
+
+There are two shapes an archive arrives in, and they are unpacked differently:
+
+- **Inside a downloaded directory** — a release directory holding `.rar` volumes. The content is
+  extracted into that directory, and the archives are deleted afterwards along with the samples,
+  screens and `.sfv`/`.nfo` files.
+- **As a top-level entry of its own** — a single `Some.Release-GRP.rar` picked out of the listing.
+  It is extracted into a directory named after it (`Some.Release-GRP/`) rather than into the
+  download directory it shares with everything else, and **the archive itself is kept**: it is the
+  entry the listing and the record name, and deleting it would have the run report it as never
+  having arrived. The samples, screens and `.sfv`/`.nfo` inside the new directory are cleaned up
+  exactly as above.
+
+Only the volume a set opens at is unpacked, because the extractor finds the rest of the set itself:
+`.rar` (or `part01` of a `.partNN.rar` set), `.zip`, `.7z` (or `.7z.001`). `.r00`, `.z01`,
+`part02` onwards and `.7z.002` onwards are continuation volumes, so a set whose volumes each arrive
+as their own entry is unpacked once rather than once per volume. If the name the extraction would
+use is already taken, or the unpacking fails, the entry is left as it is and a line goes to
+`errors`.
+
+#### Archive kinds
+| kind | suffixes | tool |
+| --- | --- | --- |
+| `rar` | `.rar`, `.partNN.rar`, `.rNN` | `unrar` |
+| `zip` | `.zip`, `.zNN` | `unzip` |
+| `7z` | `.7z`, `.7z.NNN` | `7z`, `7za` or `7zr` |
+| `tar` | `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`, `.tar.zst`/`.tzst` | `tar` |
+| `gz` | `.gz` | `gzip` |
+| `bz2` | `.bz2` | `bzip2` |
+| `xz` | `.xz` | `xz` |
+| `zst` | `.zst` | `zstd` |
+
+A kind whose tool is not installed is stepped over with a line to `errors`; the download itself is
+unaffected. The compound suffixes win: a `.tar.gz` is a `tar`, not a `gz`.
+
+**`rar` is extracted flat** — the volumes of a set hold one directory's worth of files between them,
+which is the convention scene releases follow and what alftp has always done. **Every other kind
+keeps the paths it was packed with**: a zip or a tarball of a tree flattened into a single directory
+would be a mess, and there is no convention saying otherwise.
+
+**`gz`, `bz2`, `xz` and `zst` on their own are one compressed file, not a container.** They
+decompress to a single file beside the archive — `report.txt.gz` becomes `report.txt` — rather than
+into a directory, and nothing already at that name is written over.
+
+#### Turning a kind off
+`uncompress_exclude` is a blacklist: name the kinds to leave packed and everything else carries on.
+
+``` bash
+uncompress_exclude="zip, 7z"
+```
+
+Those are downloaded and kept as they arrived — and, being archives, they take `perms_dirs` like any
+other. Spaces or commas both separate, and case does not matter. A name that is not one of the kinds
+above turns nothing off, so a line is printed saying so.
+
 | key | default | |
 | --- | --- | --- |
-| `autoUncompress` | `False` | extract downloaded `.rar` sets (and clean up samples, screens, `.sfv`/`.nfo` and the archives themselves). `-nu` turns it off for one run |
-| `chmod` | `False` | apply the two modes below to what was downloaded |
-| `perms_dirs` | `744` | mode for downloaded directories |
-| `perms_files` | `644` | mode for downloaded files |
-| `chown` | `False` | give what was downloaded to `owner` |
+| `autoUncompress` | `False` | unpack what was downloaded and clean up samples, screens and `.sfv`/`.nfo` afterwards. `-nu` turns it off for one run |
+| `uncompress_exclude` | (empty) | archive kinds to leave packed — `rar zip 7z tar gz bz2 xz zst`, spaces or commas between them |
+| `chmod` | `False` | apply the two modes below to what was downloaded, and to whatever was unpacked out of it |
+| `perms_dirs` | `744` | mode for downloaded directories — **and for archives**, which hold other files rather than being one: `.rar` and its `.rNN` parts, `.zip`, `.7z`, `.tar` and its compressed forms, `.gz`, `.bz2`, `.xz`, at the top level or at any depth inside a downloaded directory |
+| `perms_files` | `644` | mode for downloaded files that are not archives |
+| `chown` | `False` | give what was downloaded — unpacked content included — to `owner`. There is no file/directory split here, so an archive needs no special case |
 | `owner` | (unset) | `user` or `user:group` for `chown=True` |
 | `checksum` | `False` | write down what landed (see below) |
 

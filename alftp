@@ -184,7 +184,13 @@ editor=${EDITOR:-vi}
 # genuine typos instead of tripping over options that simply weren't given.
 all_files=""; ind_files=""; quiet=""
 suspend_old=""; just_login=""; continue_prev=""
-clean=""; data=""; norm=""; nounrar=""; dry_run=""
+clean=""; data=""; norm=""; nounrar=""; dry_run=""; perms_f=""
+unpack_out=""; unpack_dir=""
+arch_kind=""; arch_base=""; arch_tool=""; arch_x=""; arch_g=""; arch_plain=""
+arch_setkind=""; arch_setbase=""; arch_f=""
+# Kinds of archive autoUncompress must leave alone: names as archive_kind
+# spells them (rar zip 7z tar gz bz2 xz zst), separated by spaces or commas.
+uncompress_exclude=""
 print_ls=""; rm_list=""; rm_remote=""; no_append=""
 sourceflag=""; destflag=""; nextParam=""; lastParam=""; exitflag=""
 profile=""; profilevar=""; override=""
@@ -243,6 +249,34 @@ tui_cur=0; tui_top=0; tui_nsel=0; tui_nrm=0; tui_ndel=0; tui_resized=0
 tui_open_flag=0
 tui_namew=0; tui_sizew=0; tui_pathw=0; tui_namefld=0; tui_metaw=0
 tui_sizedw=0; tui_datedw=0; tui_statusdw=0
+# The line-number gutter down the left-hand edge: line_numbers is the config
+# key, tui_numw the width of the figures and tui_gutw the whole column
+# including the space after it, 0 when it is off. Both are worked out on every
+# draw, because the width depends on how many rows there are.
+line_numbers=True; tui_numw=0; tui_gutw=0; tui_gut=""
+# The "?" window: every keybinding there is, laid over the list. tui_help_open
+# is what tui_loop reads to know that the keys belong to the window rather than
+# to the list.
+TUI_HELP=(); tui_help_open=0; tui_help_top=0
+tui_helpw=0; tui_helph=0; tui_helpx=0; tui_helpy=0; tui_helpline=""
+tui_helprow=0
+# The narrowest the name column is ever squeezed to. Below this the row is
+# wider than the terminal whatever is done, and a name cut to nothing tells the
+# user less than a cut-off date does.
+tui_minnamew=12
+# Whether "q" asks before it quits. False quits straight away in the one case
+# where the question has nothing in it -- nothing marked that has not already
+# been transferred, nothing to unlink or delete, and no transfer still running.
+# A quit that would throw work away asks whatever this says.
+confirm_quit=True
+# A count typed before a key, the way vi takes one: "2j" is two lines down.
+# tui_count collects the digits, tui_repeat is what the action ends up
+# repeating and tui_counted says whether a count was typed at all -- which "G"
+# and "gg" need, because "go to line 1" and "go to the first line" are the same
+# movement and only the count tells them apart. tui_gpend is the "g" of "gg"
+# waiting for its second half.
+tui_count=""; tui_repeat=1; tui_counted=0; tui_gpend=0
+tui_move_dir=""; tui_rep_i=0
 tui_hsz=""; tui_hu=1; tui_hs=""; tui_hw=0; tui_hf=0
 tui_bar=""; tui_quit_simple=0; tui_donecnt=0
 tui_saved_stty=""
@@ -569,6 +603,9 @@ ARGSB () {
 			local_dl_dir="${!override}"
 		    fi
 		    local_dl_dir=$(echo "$local_dl_dir" | sed "s/@profile/$i/g")
+		    if [[ $local_dl_dir == \~ ]] || [[ $local_dl_dir == \~/* ]]; then
+			local_dl_dir=$HOME${local_dl_dir#\~}
+		    fi
                     destflag=1
 
 		    # Picking a profile settles both ends: an explicit
@@ -1672,11 +1709,27 @@ tui_parse_listing () {
 # directory -- there it gives the size of the directory entry, which says
 # nothing about what is in it. The check for remote changes re-lists the same
 # two directories, so it wants the same substitution.
+# The size to show for a top-level entry, in $tui_sz, which comes in holding
+# whatever the listing said. In the completed directory that figure measures
+# the *symlink*, not what is behind it -- "notes.nfo@" lists as 23 for an 11
+# byte file, and a release symlink lists as the length of its target path -- so
+# where nothing better is known the listing's figure is dropped rather than
+# shown. Empty is the honest answer: it leaves the SIZE column blank and it
+# leaves tui_compare_size with nothing to compare, which is "u", not "c".
+# Keeping it would be worse than useless in both places, because a symlink's
+# length is a small number and every local file is bigger than it -- so a
+# directory with nothing downloaded, and a file with a few bytes of one, would
+# both read as complete and "t" would then hide them.
+# Only an entry the server actually listed as a symlink is treated this way
+# (LINK_TARGET, filled by LOAD_LINKS, which both callers run first): where the
+# completed directory holds real files, their listed size is real too.
 tui_real_size () {
     if [[ -n ${TUI_DUSIZE[$1]:-} ]]; then
         tui_sz=${TUI_DUSIZE[$1]}
     elif (( $2 == 0 )) && [[ -n ${TUI_RSIZE[$1]:-} ]]; then
         tui_sz=${TUI_RSIZE[$1]}
+    elif [[ -n ${LINK_TARGET[$1]+x} ]]; then
+        tui_sz=""
     fi
 }
 
@@ -2422,10 +2475,137 @@ tui_name_field () {
     if (( tui_statusw > 0 )); then
         tui_metaw=$(( tui_metaw + 2 + tui_statusdw ))
     fi
-    tui_namefld=$(( TUI_COLS - 2 - tui_metaw ))
-    if (( tui_namefld < tui_namew )); then
-        tui_namefld=$tui_namew
+    # Wide enough for the largest figure it can hold, which is the same for the
+    # relative offsets and for the absolute number on the cursor's own row:
+    # both stop at the number of rows there are.
+    tui_gutw=0
+    if [[ ${line_numbers,,} == true ]]; then
+        tui_numw=${#TUI_N}
+        if (( tui_numw < 2 )); then
+            tui_numw=2
+        fi
+        tui_gutw=$(( tui_numw + 1 ))
     fi
+    tui_namefld=$(( TUI_COLS - 2 - tui_metaw - tui_gutw ))
+    # Where there is not room for every name in full, the *name* is what gets
+    # cut. It used to be given its full width regardless, which made the row
+    # longer than the terminal and left tui_fit to cut it at the right-hand
+    # edge -- taking SIZE, DATE and STATUS with it, because that is the end
+    # they are pinned to. Long release names made that the ordinary case, and
+    # the moment a transfer started and STATUS appeared the columns were
+    # pushed off the screen. A floor is kept so that a terminal too narrow for
+    # any of this still shows something of the names.
+    if (( tui_namefld < tui_minnamew )); then
+        tui_namefld=$tui_minnamew
+    fi
+}
+
+# The gutter for one row, in $tui_gut: how far it is from the cursor, except on
+# the cursor's own row, which shows where in the list it actually is. Plain
+# text and no escape sequences -- tui_fit measures what it cuts with ${#1}, so
+# anything with an escape in it would be measured wrong and cut in the wrong
+# place.
+tui_row_number () {
+    tui_gut=""
+    if (( tui_gutw == 0 )); then
+        return 0
+    fi
+    if (( $1 == tui_cur )); then
+        printf -v tui_gut '%*s ' "$tui_numw" "$(( $1 + 1 ))"
+    else
+        printf -v tui_gut '%*s ' "$tui_numw" \
+            "$(( $1 > tui_cur ? $1 - tui_cur : tui_cur - $1 ))"
+    fi
+}
+
+# Every keybinding there is, as the "?" window shows them. Built once and kept,
+# because it is the same list every time it is opened.
+#
+# This is the only place the bindings are written down for the user now: the
+# footer used to carry a cut-down list that had to be shortened twice over for
+# narrow terminals, and three abbreviations of the same thing is three things
+# to keep in step with tui_key_action.
+tui_help_build () {
+    if (( ${#TUI_HELP[@]} > 0 )); then
+        return 0
+    fi
+    TUI_HELP=(
+        "MOVING"
+        "  j / k        down / up"
+        "  Down / Up    the same"
+        "  2j  3k       a count repeats a motion"
+        "  gg / G       first / last line"
+        "  5G           line 5; a count is a line number here"
+        "  0 / Home     first line"
+        "  End          last line"
+        "  PgDn / PgUp  a screen at a time"
+        "  M-j / M-k    move the entry itself: this is download order"
+        ""
+        "PICKING"
+        "  space        mark, then step down"
+        "  S-space      mark, then step up"
+        "  a / A        mark all / clear all marks"
+        "  r / R        clear this mark / every mark"
+        "  d            mark the source symlink for removal"
+        "  x / Delete   mark for deletion, data and all -- asks first"
+        ""
+        "DOING"
+        "  enter        download everything marked +"
+        "  c            cancel the transfer under the cursor"
+        "  tab          open or close a directory"
+        "  u            ask the remote what has changed"
+        "  t            show or hide what is already downloaded"
+        "  C-l          redraw"
+        "  q / Esc      quit -- asks first, where there is something to ask"
+        ""
+        "  ?            this window; any other key closes it"
+    )
+}
+
+# Where the "?" window sits and how big it is: wide enough for the longest line
+# it holds, tall enough for as much of it as the rows region can show, and
+# centred in what is left. Recomputed on every draw, because the terminal is as
+# much an input as the content is.
+tui_help_geom () {
+    tui_help_build
+    tui_helpw=0
+    for tui_i in "${TUI_HELP[@]}"; do
+        if (( ${#tui_i} > tui_helpw )); then
+            tui_helpw=${#tui_i}
+        fi
+    done
+    # A blank column each side, so the text does not sit against the edge.
+    tui_helpw=$(( tui_helpw + 2 ))
+    if (( tui_helpw > TUI_COLS )); then
+        tui_helpw=$TUI_COLS
+    fi
+    tui_helph=${#TUI_HELP[@]}
+    if (( tui_helph > TUI_ROWS )); then
+        tui_helph=$TUI_ROWS
+    fi
+    tui_helpx=$(( (TUI_COLS - tui_helpw) / 2 ))
+    tui_helpy=$(( (TUI_ROWS - tui_helph) / 2 ))
+    # Scrolled no further than the last line of it.
+    if (( tui_help_top > ${#TUI_HELP[@]} - tui_helph )); then
+        tui_help_top=$(( ${#TUI_HELP[@]} - tui_helph ))
+    fi
+    if (( tui_help_top < 0 )); then
+        tui_help_top=0
+    fi
+}
+
+# One row of the list with the window laid over the middle of it. $1 is the row
+# as it would have been drawn, padded to the width of the terminal, and $2 the
+# line of the window that belongs on it.
+#
+# The window is reverse video and nothing else -- no border characters. Every
+# width here is worked out on plain strings and the escapes are put on last,
+# which is what keeps the line the width it says it is: tui_fit measures with
+# ${#1}, and it has already run by the time this does.
+tui_help_row () {
+    tui_fit "$2" "$(( tui_helpw - 2 ))"
+    printf -v tui_helpline ' %-*s ' "$(( tui_helpw - 2 ))" "$tui_fitted"
+    tui_line="${1:0:tui_helpx}${t_rev}${tui_helpline}${t_sgr0}${1:tui_helpx + tui_helpw}"
 }
 
 tui_marker () {
@@ -2490,6 +2670,14 @@ tui_draw () {
             tui_right="$tui_right  completed=F"
         fi
     fi
+    # A count being typed, or the "g" waiting for its second half, shown where
+    # vi shows it: it is the only sign that the next key will not do the
+    # ordinary thing.
+    if [[ -n $tui_count ]]; then
+        tui_right="$tui_right  ${tui_count}"
+    elif (( tui_gpend == 1 )); then
+        tui_right="$tui_right  g"
+    fi
     tui_pad=$(( TUI_COLS - ${#tui_left} - ${#tui_right} - 2 ))
     if (( tui_pad < 1 )); then
         tui_fit "$tui_left" $(( TUI_COLS - ${#tui_right} - 3 ))
@@ -2506,25 +2694,32 @@ tui_draw () {
 
     # Column header, lined up with the two-column selection gutter.
     if (( tui_statusw > 0 )); then
-        printf -v tui_line '  %-*s  %*s  %-*s  %*s' "$tui_namefld" "NAME" \
+        printf -v tui_line '%*s  %-*s  %*s  %-*s  %*s' "$tui_gutw" "" \
+            "$tui_namefld" "NAME" \
             "$tui_sizedw" "SIZE" "$tui_datedw" "DATE" "$tui_statusdw" "STATUS"
     else
-        printf -v tui_line '  %-*s  %*s  %-*s' "$tui_namefld" "NAME" \
+        printf -v tui_line '%*s  %-*s  %*s  %-*s' "$tui_gutw" "" \
+            "$tui_namefld" "NAME" \
             "$tui_sizedw" "SIZE" "$tui_datedw" "DATE"
     fi
     tui_fit "$tui_line" "$TUI_COLS"
     tui_out="${t_home}${t_bold}${tui_fitted}${t_sgr0}${t_el}"$'\n'
 
+    if (( tui_help_open == 1 )); then
+        tui_help_geom
+    fi
     for (( tui_i = tui_top; tui_i < tui_top + TUI_ROWS; tui_i++ )); do
         if (( tui_i < TUI_N )); then
             tui_id=${TUI_VIS[tui_i]}
             tui_marker "$tui_id"
+            tui_row_number "$tui_i"
             if (( tui_statusw > 0 )); then
                 # The name is cut to its own field rather than allowed to push
                 # the columns off the right edge, which is where they live now.
                 tui_fit "${TUI_NAME[tui_id]}" \
                     "$(( tui_namefld - TUI_DEPTH[tui_id] * 2 ))"
-                printf -v tui_line '%s %*s%-*s  %*s  %-*s  %*s' "$tui_mark" \
+                printf -v tui_line '%s%s %*s%-*s  %*s  %-*s  %*s' "$tui_gut" \
+                    "$tui_mark" \
                     "$(( TUI_DEPTH[tui_id] * 2 ))" "" \
                     "$(( tui_namefld - TUI_DEPTH[tui_id] * 2 ))" "$tui_fitted" \
                     "$tui_sizedw" "${TUI_SIZE[tui_id]}" \
@@ -2533,21 +2728,40 @@ tui_draw () {
             else
                 tui_fit "${TUI_NAME[tui_id]}" \
                     "$(( tui_namefld - TUI_DEPTH[tui_id] * 2 ))"
-                printf -v tui_line '%s %*s%-*s  %*s  %-*s' "$tui_mark" \
+                printf -v tui_line '%s%s %*s%-*s  %*s  %-*s' "$tui_gut" \
+                    "$tui_mark" \
                     "$(( TUI_DEPTH[tui_id] * 2 ))" "" \
                     "$(( tui_namefld - TUI_DEPTH[tui_id] * 2 ))" "$tui_fitted" \
                     "$tui_sizedw" "${TUI_SIZE[tui_id]}" \
                     "$tui_datedw" "${TUI_DATE[tui_id]}"
             fi
             tui_fit "$tui_line" "$TUI_COLS"
-            if (( tui_i == tui_cur )); then
+            # The window comes first: a row it covers is not also the cursor
+            # row, or the two highlights would fight over the same line.
+            tui_helprow=$(( tui_i - tui_top - tui_helpy ))
+            if (( tui_help_open == 1 )) \
+               && (( tui_helprow >= 0 )) && (( tui_helprow < tui_helph )); then
+                printf -v tui_line '%-*s' "$TUI_COLS" "$tui_fitted"
+                tui_help_row "$tui_line" "${TUI_HELP[tui_help_top + tui_helprow]}"
+                tui_out+="${tui_line}${t_el}"$'\n'
+            elif (( tui_i == tui_cur )); then
                 printf -v tui_line '%-*s' "$TUI_COLS" "$tui_fitted"
                 tui_out+="${t_rev}${tui_line}${t_sgr0}${t_el}"$'\n'
             else
                 tui_out+="${tui_fitted}${t_el}"$'\n'
             fi
         else
-            tui_out+="${t_el}"$'\n'
+            # An empty row still gets the window, so it does not have a hole
+            # in it at the bottom of a short listing.
+            tui_helprow=$(( tui_i - tui_top - tui_helpy ))
+            if (( tui_help_open == 1 )) \
+               && (( tui_helprow >= 0 )) && (( tui_helprow < tui_helph )); then
+                printf -v tui_line '%-*s' "$TUI_COLS" ""
+                tui_help_row "$tui_line" "${TUI_HELP[tui_help_top + tui_helprow]}"
+                tui_out+="${tui_line}${t_el}"$'\n'
+            else
+                tui_out+="${t_el}"$'\n'
+            fi
         fi
     done
 
@@ -2560,12 +2774,12 @@ tui_draw () {
     else
         if [[ -n $tui_msg ]]; then
             tui_line=$tui_msg
-        elif (( TUI_COLS >= 100 )); then
-            tui_line="j/k  M-j/k order  space pick  enter go  c cancel  tab open  d/x mark  r/R clear  t  u  a/A  q quit"
-        elif (( TUI_COLS >= 74 )); then
-            tui_line="j/k  M-j/k  space  enter go  c cancel  tab  d/x  r/R  t  u  q quit"
+        elif (( tui_help_open == 1 )); then
+            tui_line="j/k to scroll, any other key closes this"
         else
-            tui_line="j/k  space  enter  c  tab  d  x  r/R  t  u  q"
+            # The one binding worth a line of its own, because it is the one
+            # that shows the rest.
+            tui_line="? keys"
         fi
         if (( TUI_N > TUI_ROWS )); then
             printf -v tui_line '%s   %s-%s/%s' "$tui_line" \
@@ -2621,6 +2835,15 @@ tui_read_key () {
 # Keys to actions. Both the letter and the escape-sequence spelling of every
 # movement key land here, which is also what makes the mapping testable
 # without a terminal.
+#
+# Shift+space is the one key a terminal does not send by default: the legacy
+# encoding of it is a plain space and nothing distinguishes the two. Both
+# spellings a terminal can be asked to send it in are accepted -- CSI u
+# (kitty's keyboard protocol, "\e[32;2u") and xterm's modifyOtherKeys
+# ("\e[27;2;32~") -- and neither protocol is turned on here, because both of
+# them also stop ctrl+c from raising SIGINT, which is what tui_abort is. A
+# terminal that sends neither leaves shift+space as an ordinary space, which
+# toggles and moves down; nothing else is affected. See README.md.
 tui_key_action () {
     case $1 in
         j|$'\e[B'|$'\eOB')                     tui_action=down ;;
@@ -2631,7 +2854,8 @@ tui_key_action () {
         $'\e[6~')                              tui_action=pgdn ;;
         $'\ej'|$'\e[1;3B')                      tui_action=movedn ;;
         $'\ek'|$'\e[1;3A')                      tui_action=moveup ;;
-        ' ')                                   tui_action=toggle ;;
+        ' ')                                   tui_action=toggledn ;;
+        $'\e[32;2u'|$'\e[27;2;32~')            tui_action=toggleup ;;
         $'\n'|$'\r')                           tui_action=start ;;
         $'\t')                                 tui_action=open ;;
         d)                                     tui_action="unlink" ;;
@@ -2643,20 +2867,100 @@ tui_key_action () {
         R)                                     tui_action=clearall ;;
         a)                                     tui_action=all ;;
         A)                                     tui_action=none ;;
+        '?')                                   tui_action=help ;;
         q|$'\e')                               tui_action=quit ;;
         $'\f')                                 tui_action=redraw ;;
         *)                                     tui_action=ignore ;;
     esac
 }
 
+# $tui_repeat lines rather than one, where a count was typed. The arithmetic
+# is done in one step instead of by repeating the move, so a count far bigger
+# than the list costs nothing -- the clamp below is what stops it either way.
+# With a count "gg" and "G" mean the line with that number, which is the one
+# place the count is a destination and not a distance.
+# The keys that are not an action of their own but change what the next one
+# means: the digits of a count, and the first "g" of "gg". Returns 1 when the
+# key was swallowed and there is nothing else to do with it, 0 when $TUI_KEY
+# should go on to tui_key_action -- which "gg" does, rewritten to the "0" that
+# already means the first line.
+#
+# "0" is a count digit only when a count is already being typed. On its own it
+# keeps the binding it has always had, which is the same one "gg" and "Home"
+# now share.
+#
+# Anything other than "g" after a "g" does nothing at all, deliberately: "gx"
+# reaching "x" would ask to delete the entry under the cursor, and a mistyped
+# motion must not be able to do that.
+tui_key_prefix () {
+    if (( tui_gpend == 1 )); then
+        tui_gpend=0
+        if [[ $TUI_KEY == g ]]; then
+            TUI_KEY=0
+            return 0
+        fi
+        return 1
+    fi
+    if [[ $TUI_KEY == g ]]; then
+        tui_gpend=1
+        return 1
+    fi
+    if [[ $TUI_KEY == [1-9] ]] \
+       || { [[ -n $tui_count ]] && [[ $TUI_KEY == 0 ]]; }; then
+        # Capped, so a leant-on key cannot build a number the arithmetic below
+        # would have to carry about.
+        if (( ${#tui_count} < 6 )); then
+            tui_count="${tui_count}${TUI_KEY}"
+        fi
+        return 1
+    fi
+    # Esc takes back a count half typed rather than quitting the picker; with
+    # nothing pending it still quits.
+    if [[ -n $tui_count ]] && [[ $TUI_KEY == $'\e' ]]; then
+        tui_count=""
+        return 1
+    fi
+    return 0
+}
+
+# Keys while the "?" window is open. It scrolls, and anything else shuts it --
+# a window listing the keys is not a mode to be stuck in, so there is nothing
+# to learn about leaving it. The key that closes it is spent doing so and does
+# not also act on the list: shutting a window and marking an entry with the
+# same keystroke is not what anyone means.
+tui_help_key () {
+    case $1 in
+        j|$'\e[B'|$'\eOB') tui_help_top=$(( tui_help_top + 1 )) ;;
+        k|$'\e[A'|$'\eOA') tui_help_top=$(( tui_help_top - 1 )) ;;
+        $'\e[6~')          tui_help_top=$(( tui_help_top + tui_helph )) ;;
+        $'\e[5~')          tui_help_top=$(( tui_help_top - tui_helph )) ;;
+        0|$'\e[H'|$'\eOH') tui_help_top=0 ;;
+        G|$'\e[F'|$'\eOF') tui_help_top=${#TUI_HELP[@]} ;;
+        *)                 tui_help_open=0 ;;
+    esac
+    # tui_help_geom clamps it, and it is the one thing that knows how much of
+    # the window is on screen.
+    if (( tui_help_top < 0 )); then
+        tui_help_top=0
+    fi
+}
+
 tui_move () {
     case $tui_action in
-        up)     if (( tui_cur > 0 )); then tui_cur=$(( tui_cur - 1 )); fi ;;
-        down)   if (( tui_cur < TUI_N - 1 )); then tui_cur=$(( tui_cur + 1 )); fi ;;
-        top)    tui_cur=0 ;;
-        bottom) tui_cur=$(( TUI_N - 1 )) ;;
-        pgup)   tui_cur=$(( tui_cur - TUI_ROWS )) ;;
-        pgdn)   tui_cur=$(( tui_cur + TUI_ROWS )) ;;
+        up)     tui_cur=$(( tui_cur - tui_repeat )) ;;
+        down)   tui_cur=$(( tui_cur + tui_repeat )) ;;
+        top)    if (( tui_counted == 1 )); then
+                    tui_cur=$(( tui_repeat - 1 ))
+                else
+                    tui_cur=0
+                fi ;;
+        bottom) if (( tui_counted == 1 )); then
+                    tui_cur=$(( tui_repeat - 1 ))
+                else
+                    tui_cur=$(( TUI_N - 1 ))
+                fi ;;
+        pgup)   tui_cur=$(( tui_cur - TUI_ROWS * tui_repeat )) ;;
+        pgdn)   tui_cur=$(( tui_cur + TUI_ROWS * tui_repeat )) ;;
     esac
     if (( tui_cur > TUI_N - 1 )); then
         tui_cur=$(( TUI_N - 1 ))
@@ -4315,6 +4619,18 @@ tui_quit_prompt () {
         # Nothing marked that is not already done, so there is nothing to save
         # and nothing to abandon: ask the one question that is left.
         tui_quit_simple=1
+        # ... or do not ask it at all, where the config says so. The answer is
+        # "save" rather than "exit" for the same reason confirming the question
+        # is: with nothing left for the parent session to carry out the two
+        # amount to the same thing, and the listing is worth more kept than
+        # emptied. Note that this can only be reached when tui_pending is
+        # false, which a running or queued transfer makes true -- so nothing
+        # this skips past could have thrown work away.
+        if [[ ${confirm_quit,,} == false ]]; then
+            tui_answer=save
+            tui_prompt=""
+            return 0
+        fi
         tui_prompt="quit: (c)ancel   (q)uit"
     fi
     # Leaving stops every transfer that has not finished, which is worth saying
@@ -4388,15 +4704,37 @@ tui_loop () {
             fi
             TUI_KEYRC=1
         done
+        # While the "?" window is open the keys are its own, and none of them
+        # reach the list.
+        if (( tui_help_open == 1 )); then
+            tui_msg=""
+            tui_help_key "$TUI_KEY"
+            continue
+        fi
+        # A count, or the first "g" of "gg": the key changes what the next one
+        # does and is not an action itself, so the loop goes back to redraw
+        # (which is where the pending count is shown) and read the next one.
+        if ! tui_key_prefix; then
+            continue
+        fi
         tui_msg=""
         tui_key_action "$TUI_KEY"
+        # The count belongs to this key and to no other, so it is taken and
+        # cleared here whether or not the action turns out to use it.
+        tui_repeat=1
+        tui_counted=0
+        if [[ -n $tui_count ]]; then
+            tui_repeat=$tui_count
+            tui_counted=1
+            tui_count=""
+        fi
         # Everything here reads the entry under the cursor, and with an empty
         # listing there is no cursor to read: TUI_VIS has no element to index.
         # The listing being empty is a normal state now -- "u" is the way out of
         # it -- so these simply do nothing rather than being unreachable.
         if (( TUI_N == 0 )); then
             case $tui_action in
-                toggle|cancelxfer|open|movedn|moveup|unlink|delete|clear)
+                toggledn|toggleup|cancelxfer|open|movedn|moveup|unlink|delete|clear)
                     tui_action=ignore
                     ;;
             esac
@@ -4405,8 +4743,17 @@ tui_loop () {
             up|down|top|bottom|pgup|pgdn)
                 tui_move
                 ;;
-            toggle)
+            toggledn|toggleup)
                 tui_toggle
+                # Toggling walks the list for you: the next entry is nearly
+                # always the one you want next. tui_move clamps, so the last
+                # entry (or the first, going up) simply stays put.
+                if [[ $tui_action == toggledn ]]; then
+                    tui_action=down
+                else
+                    tui_action=up
+                fi
+                tui_move
                 ;;
             start)
                 tui_dl_enqueue
@@ -4417,11 +4764,21 @@ tui_loop () {
             open)
                 tui_toggle_open
                 ;;
-            movedn)
-                tui_move_node down
-                ;;
-            moveup)
-                tui_move_node up
+            movedn|moveup)
+                # A swap of two adjacent siblings each time, so a count is
+                # repetition rather than arithmetic. Bounded by the size of the
+                # list: past that there is nowhere left to swap with.
+                if (( tui_repeat > TUI_N )); then
+                    tui_repeat=$TUI_N
+                fi
+                if [[ $tui_action == movedn ]]; then
+                    tui_move_dir=down
+                else
+                    tui_move_dir=up
+                fi
+                for (( tui_rep_i = 0; tui_rep_i < tui_repeat; tui_rep_i++ )); do
+                    tui_move_node "$tui_move_dir"
+                done
                 ;;
             unlink)
                 tui_mark_remove
@@ -4446,6 +4803,10 @@ tui_loop () {
                 ;;
             none)
                 tui_set_all 0
+                ;;
+            help)
+                tui_help_open=1
+                tui_help_top=0
                 ;;
             redraw)
                 printf '%s' "$t_clear" >&"$TUI_OUT"
@@ -4625,6 +4986,16 @@ tui_select () {
     if [[ ! $concurrent_downloads =~ ^[1-9][0-9]*$ ]]; then
         concurrent_downloads=2
     fi
+    # Anything but a plain False leaves the numbers on: a typo in the config
+    # should not silently change what the screen looks like.
+    if [[ ${line_numbers,,} != false ]]; then
+        line_numbers=True
+    fi
+    # The same rule, and for the same reason: only a plain False turns a
+    # confirmation off.
+    if [[ ${confirm_quit,,} != false ]]; then
+        confirm_quit=True
+    fi
     tui_dl_n=0
     TUI_DLID=(); TUI_DLPATH=(); TUI_DLKIND=(); TUI_DLSTATE=(); TUI_DLPID=()
     TUI_DLSCRIPT=(); TUI_DLLOG=(); TUI_DLTARGET=(); TUI_DLPRE=(); TUI_DLEXP=()
@@ -4790,18 +5161,201 @@ record_result () {
     fi
 }
 
+# Whether a name is an archive: something that holds other files rather than
+# being one. That makes it a directory as far as the permissions are concerned
+# (see apply_perms), whether or not it is ever unpacked. The multipart
+# spellings count too -- a release arrives as .part01.rar, or as .r00, .r01 ...
+# beside the .rar -- because every part of a set is as much a container as the
+# first one is.
+# Which kind of archive a name is, in $arch_kind, empty when it is not one.
+# The kind is the whole vocabulary: it names the tool that opens it, the entry
+# in uncompress_exclude that turns it off, and nothing else in the script has
+# to know one format from another.
+#
+# The compound suffixes are tested first and it matters: ".tar.gz" is a tar,
+# not a gz, and unpacking it as a gz would leave a .tar sitting there.
+archive_kind () {
+    arch_kind=""
+    case ${1,,} in
+        *.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.tar.zst|*.tzst)
+            arch_kind=tar ;;
+        *.rar) arch_kind=rar ;;
+        *.zip) arch_kind=zip ;;
+        *.7z)  arch_kind=7z ;;
+        *.gz)  arch_kind=gz ;;
+        *.bz2) arch_kind=bz2 ;;
+        *.xz)  arch_kind=xz ;;
+        *.zst) arch_kind=zst ;;
+        *)
+            # The continuation volumes of a set. They are archives -- they take
+            # the archive permissions and they are cleaned up with the rest of
+            # their set -- but archive_first_volume will not open one.
+            if [[ ${1,,} =~ \.r[0-9]+$ ]]; then
+                arch_kind=rar
+            elif [[ ${1,,} =~ \.z[0-9]+$ ]]; then
+                arch_kind=zip
+            elif [[ ${1,,} =~ \.7z\.[0-9]+$ ]]; then
+                arch_kind=7z
+            fi
+            ;;
+    esac
+    [[ -n $arch_kind ]]
+}
+
+is_archive () {
+    archive_kind "$1"
+}
+
+# The name the archive would unpack under: its own, with the suffix that makes
+# it an archive taken off. A compound suffix comes off whole, and so does the
+# volume half of a multipart name -- "X.part01.rar" and "X.7z.001" are both X.
+archive_basename () {
+    arch_base=$1
+    case ${arch_base,,} in
+        *.tar.gz|*.tar.bz2|*.tar.xz|*.tar.zst)
+            arch_base=${arch_base%.*}; arch_base=${arch_base%.*} ;;
+        *)
+            if [[ ${arch_base,,} =~ \.part[0-9]+\.rar$ ]] \
+               || [[ ${arch_base,,} =~ \.7z\.[0-9]+$ ]]; then
+                arch_base=${arch_base%.*}; arch_base=${arch_base%.*}
+            else
+                arch_base=${arch_base%.*}
+            fi
+            ;;
+    esac
+}
+
+# Whether this kind may be unpacked at all. uncompress_exclude is the blacklist
+# -- kind names, separated by spaces or commas -- so a format whose extractor
+# is not wanted, or not trusted, can be turned off without turning
+# autoUncompress off for everything.
+archive_enabled () {
+    if [[ -z $uncompress_exclude ]]; then
+        return 0
+    fi
+    for arch_x in ${uncompress_exclude//,/ }; do
+        if [[ ${arch_x,,} == "${1,,}" ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Whether this kind holds many files or just the one. rar, zip, 7z and tar are
+# containers and unpack into a directory; a bare .gz, .bz2, .xz or .zst is a
+# single file that was compressed, and unpacking it means one file beside the
+# archive -- putting that in a directory of its own would be a folder holding
+# one thing with the same name.
+archive_container () {
+    case $1 in
+        rar|zip|7z|tar) return 0 ;;
+    esac
+    return 1
+}
+
+# The tool that opens this kind, in $arch_tool. Fails when it is not installed,
+# which is a thing to say once and step over rather than a reason to stop: the
+# download itself worked.
+archive_tool () {
+    arch_tool=""
+    case $1 in
+        rar) arch_tool=unrar ;;
+        zip) arch_tool=unzip ;;
+        tar) arch_tool=tar ;;
+        gz)  arch_tool=gzip ;;
+        bz2) arch_tool=bzip2 ;;
+        xz)  arch_tool=xz ;;
+        zst) arch_tool=zstd ;;
+        7z)
+            # Whichever of the three is about; they take the same arguments
+            # for what is asked of them here.
+            for arch_x in 7z 7za 7zr; do
+                if command -v "$arch_x" > /dev/null 2>&1; then
+                    arch_tool=$arch_x
+                    break
+                fi
+            done
+            ;;
+    esac
+    if [[ -z $arch_tool ]]; then
+        return 1
+    fi
+    command -v "$arch_tool" > /dev/null 2>&1
+}
+
+# Unpack $2 (an absolute path) into the working directory, which the caller has
+# already moved to. $1 is the kind and $arch_tool the tool for it.
+#
+# rar is extracted flat, which is what it has always done here and what a scene
+# release wants -- the volumes hold one directory's worth of files between
+# them. Every other kind keeps the paths it was packed with: a zip or a tarball
+# of a tree flattened into one directory would be a mess, and unlike rar there
+# is no convention saying otherwise.
+archive_extract () {
+    case $1 in
+        rar) unrar e -or "$2" ;;
+        zip) unzip -o -q "$2" ;;
+        7z)  "$arch_tool" x -y -bso0 -bsp0 "$2" ;;
+        tar) tar -xf "$2" ;;
+        gz|bz2|xz|zst)
+            # One compressed file rather than a container of many, so the
+            # answer is the name without the suffix.
+            arch_plain=${2##*/}
+            arch_plain=${arch_plain%.*}
+            "$arch_tool" -dc -- "$2" > "$arch_plain"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Every volume of the set $1 belongs to, gone. Same directory, same kind, same
+# name once the suffix is off -- which is what makes "X.7z.001", "X.7z.002" one
+# set and "Y.7z.001" another.
+archive_rm_set () {
+    archive_kind "$1" || return 0
+    arch_setkind=$arch_kind
+    archive_basename "$1"
+    arch_setbase=$arch_base
+    while IFS= read -r arch_g; do
+        if archive_kind "$arch_g" && [[ $arch_kind == "$arch_setkind" ]]; then
+            archive_basename "$arch_g"
+            if [[ $arch_base == "$arch_setbase" ]]; then
+                rm -f "$arch_g"
+            fi
+        fi
+    done < <(find "${1%/*}" -maxdepth 1 -type f)
+}
+
 # Downloaded content keeps the permissions and the owner it arrived with unless
 # the config asks for something else: chmod=True applies perms_dirs to
 # directories and perms_files to files, chown=True hands the lot to $owner.
+#
+# An archive takes perms_dirs rather than perms_files: it is a container, and
+# it is the thing the content came in. That holds at any depth, which is why
+# the archives are a second pass over the same tree rather than an exception
+# inside the first -- the one expression that recognises an archive stays in
+# is_archive and is not restated as a find expression.
+#
+# This runs *after* the unpacking wherever both run, so what came out of an archive
+# is walked here like anything else that was downloaded.
 apply_perms () {
     if [[ ${chmod,,} == true ]]; then
         if [[ -d $1 ]]; then
             find "$1" -type d -exec chmod "$perms_dirs" {} +
             find "$1" -type f -exec chmod "$perms_files" {} +
+            while IFS= read -r perms_f; do
+                if is_archive "$perms_f"; then
+                    chmod "$perms_dirs" "$perms_f"
+                fi
+            done < <(find "$1" -type f)
+        elif is_archive "$1"; then
+            chmod "$perms_dirs" "$1"
         else
             chmod "$perms_files" "$1"
         fi
     fi
+    # chown draws no distinction between a file and a directory, so an archive
+    # needs no special case here; -R covers whatever was unpacked.
     if [[ ${chown,,} == true ]] && [[ -n $owner ]]; then
         chown -R "$owner" "$1"
     fi
@@ -4813,6 +5367,15 @@ POST_PROCESS () {
     if [[ $dry_run == True ]] || [[ $clean == True ]]; then
         return 0
     fi
+    # A blacklist naming something that is not a kind turns nothing off, and
+    # silently: worth one line, because the spelling is the whole of what the
+    # setting does.
+    for arch_x in ${uncompress_exclude//,/ }; do
+        case ${arch_x,,} in
+            rar|zip|7z|tar|gz|bz2|xz|zst) ;;
+            *) echo "alftp: uncompress_exclude: no such archive kind: $arch_x" >&2 ;;
+        esac
+    done
     # Where content landed is local_dir_for's question, not $local_dl_dir's:
     # in srcs mode each source directory answers it differently. The SsS
     # sentinel stands in for a trailing space in the name.
@@ -4823,9 +5386,20 @@ POST_PROCESS () {
         line=$(echo "$line" | sed 's|SsS$| |')
         local_target_for "$line"
         record_result "$target" "$line"
-        if [[ -e $target ]]; then
-            apply_perms "$target"
+        if [[ ! -e $target ]]; then
+            continue
         fi
+        # An entry that is itself an archive is unpacked into a directory of
+        # its own, which is downloaded content like any other and takes the
+        # permissions with the rest. The archive stays where it is: it is the
+        # entry the record and the listing name.
+        if [[ ${autoUncompress,,} == true ]] && [[ -z $nounrar ]]; then
+            UNPACK_FILE "$target"
+            if [[ -n $unpack_out ]]; then
+                apply_perms "$unpack_out"
+            fi
+        fi
+        apply_perms "$target"
     done <<< "$LINESF"
     while read -r line; do
         if [[ -z $line ]]; then
@@ -4840,7 +5414,7 @@ POST_PROCESS () {
         # Unpacking is opt-in (autoUncompress), and -nu turns it off for a run
         # even where the config asked for it.
         if [[ ${autoUncompress,,} == true ]] && [[ -z $nounrar ]]; then
-            UNRAR_FUN "$target"
+            UNPACK_DIR "$target"
         fi
         apply_perms "$target"
     done <<< "$LINESD"
@@ -5095,6 +5669,7 @@ local_dir_for () {
     local_dir="$local_dl_dir"
     local_rel=${1%[/@*]}
     if [[ $srcs_mode != True ]]; then
+        local_tilde
         return 0
     fi
     local_src=${local_rel%%/*}
@@ -5104,6 +5679,7 @@ local_dir_for () {
         local_rel=""
     fi
     if [[ -z $local_src ]]; then
+        local_tilde
         return 0
     fi
     # profile_var_name's mapping, inline: this runs once per entry per redraw
@@ -5113,6 +5689,18 @@ local_dir_for () {
         local_dir="${!local_var}"
     fi
     local_dir=${local_dir//@profile/$local_src}
+    local_tilde
+}
+
+# A leading "~" in $local_dir, as $HOME. The config is eval'd, so a dl_dir
+# written quoted -- dl_dir='~/Downloads' -- keeps the tilde literally, and only
+# lftp would ever expand it: the transfer lands in the right place while du,
+# [ -e ] and "!mkdir -p" all look for a directory called "~", which is what
+# left a running download at 0% until it finished. "~user" is left alone.
+local_tilde () {
+    if [[ $local_dir == \~ ]] || [[ $local_dir == \~/* ]]; then
+        local_dir=$HOME${local_dir#\~}
+    fi
 }
 
 # The destination of one entry and the directory it has to exist in, in
@@ -5359,23 +5947,178 @@ function chkrmf () {
     fi
 }
 
-UNRAR_FUN () {
-    pdir="$1"
-    ext='*.rar'
-    cdir=$(find "$pdir" -name "$ext" -exec dirname {} + | sort -u)
-    if [[ -z $cdir ]]; then
+# The tidy-up that follows an extraction, wherever it happened. Shared by both
+# unpacking paths so the two cannot drift: what a release directory is cleaned
+# of is what an archive unpacked on its own is cleaned of. Deliberately not
+# conditional on the extraction having worked -- that is how it has always
+# behaved, and a sample directory is junk whether or not the unpacking did.
+unpack_tidy () {
+    find "$1" -type f \( -name "*.sfv" -o -name "*.nfo" \) -exec rm {} +
+    find "$1" -type d -iname "sample" -exec rm -rf {} +
+    find "$1" -type d -iname "screens" -exec rm -rf {} +
+    find "$1" -type d -empty -delete
+}
+
+# Whether a name is the volume a set is opened at. The extractor finds the rest
+# of a set itself, so only one volume is ever unpacked -- without this, every
+# volume of a set arriving as its own top-level entry would unpack the whole
+# set again. ".r00", ".z01" and ".7z.002" are continuations; of a ".partNN.rar"
+# or ".7z.NNN" set only part one opens it. Everything that is not multipart is
+# an entry point by definition.
+archive_first_volume () {
+    archive_kind "$1" || return 1
+    case $arch_kind in
+        rar)
+            case ${1,,} in
+                *.rar) ;;
+                *) return 1 ;;
+            esac
+            if [[ ${1,,} =~ \.part([0-9]+)\.rar$ ]]; then
+                if (( 10#${BASH_REMATCH[1]} != 1 )); then
+                    return 1
+                fi
+            fi
+            ;;
+        zip)
+            case ${1,,} in
+                *.zip) ;;
+                *) return 1 ;;
+            esac
+            ;;
+        7z)
+            case ${1,,} in
+                *.7z) ;;
+                *)
+                    if [[ ! ${1,,} =~ \.7z\.0*1$ ]]; then
+                        return 1
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+    return 0
+}
+
+# Unpack one archive that was downloaded as an entry in its own right, rather
+# than as part of a directory. Where it went is left in $unpack_out, empty when
+# nothing was unpacked, so POST_PROCESS can give the result its permissions --
+# apply_perms is called on the entry, and the entry here is the archive, not
+# what came out of it.
+#
+# Two things are deliberately different from the directory path. It extracts
+# into a directory named after the archive rather than beside it: a top-level
+# archive sits in $local_dl_dir next to every other download, and "unrar e"
+# there would empty a release out across the lot. And it does not delete the
+# archive afterwards -- the archive is the downloaded entry itself, the thing
+# the record and the listing name, and removing it would have POST_PROCESS
+# report the entry as never having arrived.
+UNPACK_FILE () {
+    unpack_out=""
+    if [[ ! -f $1 ]] || ! archive_first_volume "$1"; then
         return 0
     fi
-    while read -r line; do
-        cd "$line" && \
-        unrar e -n -r -or "$line" && sleep 1 && \
-        find "$line" -type f \( -regex ".*.rar$" -o -regex '.*.r[0-9]+$' \) -exec rm {} +
-        find "$line" -type f \( -name "*.sfv" -o -name "*.nfo" \) -exec rm {} +
-        find "$line" -type d -iname "sample" -exec rm -rf {} +
-        find "$line" -type d -iname "screens" -exec rm -rf {} +
-        find "$line" -type d -empty -delete
+    if ! archive_enabled "$arch_kind"; then
+        return 0
+    fi
+    if ! archive_tool "$arch_kind"; then
+        log_event "$errors" "$1" "not unpacked: no tool for $arch_kind archives"
+        return 0
+    fi
+    archive_basename "$1"
+    unpack_dir=$arch_base
+    # An archive called nothing but its own suffix: not ours to unpack.
+    if [[ -z ${unpack_dir##*/} ]] || [[ $unpack_dir == "$1" ]]; then
+        return 0
+    fi
+    if ! archive_container "$arch_kind"; then
+        # One compressed file. It decompresses to one file beside the archive,
+        # and nothing that is already there is written over.
+        if [[ -e $unpack_dir ]]; then
+            log_event "$errors" "$1" "not unpacked: $unpack_dir is in the way"
+            return 0
+        fi
+        if ( cd "${1%/*}" && archive_extract "$arch_kind" "$1" ); then
+            unpack_out=$unpack_dir
+        else
+            rm -f "$unpack_dir"
+            log_event "$errors" "$1" "could not be unpacked"
+        fi
+        return 0
+    fi
+    if [[ -e $unpack_dir ]] && [[ ! -d $unpack_dir ]]; then
+        log_event "$errors" "$1" "not unpacked: $unpack_dir is in the way"
+        return 0
+    fi
+    mkdir -p "$unpack_dir" || return 0
+    # The subshell is what keeps the cd from leaking, exactly as in UNPACK_DIR.
+    if ( cd "$unpack_dir" && archive_extract "$arch_kind" "$1" ); then
+        unpack_tidy "$unpack_dir"
+        if [[ -d $unpack_dir ]]; then
+            unpack_out=$unpack_dir
+        fi
+    else
+        # Nothing usable came out, so do not leave the directory behind to
+        # look as though something had. rmdir refuses a directory with
+        # anything in it, which is the check that matters.
+        rmdir "$unpack_dir" 2> /dev/null
+        log_event "$errors" "$1" "could not be unpacked"
+    fi
+}
 
-    done <<< "$cdir"
+# Unpack the archives inside a downloaded directory, into the directories that
+# hold them -- a release directory is the place its own content belongs. The
+# archives are deleted afterwards, which is the difference from UNPACK_FILE:
+# here they are packaging inside the entry, not the entry itself.
+UNPACK_DIR () {
+    pdir="$1"
+    # Absolute from here on. Everything below runs from the directory it is
+    # unpacking into, so a relative path would be resolved a second time
+    # against that directory and name something inside it instead.
+    if [[ $pdir != /* ]]; then
+        pdir="$PWD/$pdir"
+    fi
+    # rar first, and as one pass per directory rather than one per archive:
+    # "unrar e -r" opens a whole set, and a set is what a release arrives in.
+    if archive_enabled rar && archive_tool rar; then
+        cdir=$(find "$pdir" -iname '*.rar' -exec dirname {} + | sort -u)
+        while read -r line; do
+            if [[ -z $line ]]; then
+                continue
+            fi
+            # The cd is kept inside a subshell. unrar has to be run from the
+            # directory it extracts into, but leaving the process there breaks
+            # every relative path used afterwards -- apply_perms's among them,
+            # which is how a downloaded directory could end up with none of its
+            # permissions applied and its content unpacked into a duplicate of
+            # its own path.
+            (
+                cd "$line" || exit 0
+                unrar e -n -r -or "$line" && sleep 1 && \
+                find "$line" -type f \( -regex ".*.rar$" -o -regex '.*.r[0-9]+$' \) -exec rm {} +
+            )
+        done <<< "$cdir"
+    fi
+    # Every other kind, one archive at a time: nothing else has rar's notion of
+    # opening every set in a tree from one command, and one at a time is what
+    # lets a set be deleted only when its own extraction worked.
+    while IFS= read -r arch_f; do
+        if ! archive_first_volume "$arch_f" || [[ $arch_kind == rar ]]; then
+            continue
+        fi
+        if ! archive_enabled "$arch_kind"; then
+            continue
+        fi
+        if ! archive_tool "$arch_kind"; then
+            log_event "$errors" "$arch_f" "not unpacked: no tool for $arch_kind archives"
+            continue
+        fi
+        if ( cd "${arch_f%/*}" && archive_extract "$arch_kind" "$arch_f" ); then
+            archive_rm_set "$arch_f"
+        else
+            log_event "$errors" "$arch_f" "could not be unpacked"
+        fi
+    done < <(find "$pdir" -type f)
+    unpack_tidy "$pdir"
 }
 
 ############################################################
